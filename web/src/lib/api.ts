@@ -1246,6 +1246,9 @@ export interface AgentUpdatePayload {
   // Toggle whether chatters using this agent inherit the owner's
   // model + provider configuration. Omit to leave unchanged.
   shareModelConfig?: boolean;
+  // Per-agent cap on tool-loop rounds. 0 clears the override and
+  // falls back through user/system defaults.
+  maxToolIterations?: number;
   // PromptMode selects how heavily the framework system prompt
   // participates: "agent" (full, default), "chatbot" (slim — drops
   // task-delegation / tool-use discipline / workspace-update so

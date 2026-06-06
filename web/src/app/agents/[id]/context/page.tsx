@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -11,8 +13,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Brain, Check, MessageSquare, MessagesSquare, Puzzle } from "lucide-react";
-import { getAgent, updateAgent } from "@/lib/api";
+import { Brain, Check, MessageSquare, MessagesSquare, Puzzle, RotateCcw, Wrench } from "lucide-react";
+import { getAgent, getConfig, updateAgent } from "@/lib/api";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { useAgentName } from "@/hooks/use-agent-name";
 
@@ -41,6 +43,12 @@ export default function AgentContextPage() {
 
   // "" = no override saved; runtime falls back to "agent".
   const [promptMode, setPromptMode] = useState<PromptModeValue>("");
+  // Empty string = no per-agent override; runtime inherits the
+  // merged user/system maxToolIterations default.
+  const [maxToolIterations, setMaxToolIterations] = useState("");
+  const [systemMaxToolIterations, setSystemMaxToolIterations] = useState(20);
+  const [maxToolIterationsSaving, setMaxToolIterationsSaving] = useState(false);
+  const [maxToolIterationsError, setMaxToolIterationsError] = useState<string | null>(null);
   // Per-agent multi-bubble toggle. Applies to every IM channel the
   // agent is bound to. False is the default; null on the wire is
   // treated as false here.
@@ -59,7 +67,18 @@ export default function AgentContextPage() {
     if (!agentId) return;
     setLoading(true);
     try {
-      const agentRec = await getAgent(agentId).catch(() => null);
+      const [agentRec, cfg] = await Promise.all([
+        getAgent(agentId).catch(() => null),
+        getConfig().catch(() => null),
+      ]);
+      const defaultIterations = cfg?.agents?.defaults?.maxToolIterations;
+      setSystemMaxToolIterations(defaultIterations && defaultIterations > 0 ? defaultIterations : 20);
+      setMaxToolIterations(
+        agentRec?.maxToolIterations && agentRec.maxToolIterations > 0
+          ? String(agentRec.maxToolIterations)
+          : "",
+      );
+      setMaxToolIterationsError(null);
       const pm = agentRec?.promptMode || "";
       if (pm === "agent" || pm === "chatbot" || pm === "customize") {
         setPromptMode(pm);
@@ -93,6 +112,58 @@ export default function AgentContextPage() {
       setPromptMode(prev);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const parseMaxToolIterations = () => {
+    const raw = maxToolIterations.trim();
+    if (!raw) return 0;
+    const next = Number(raw);
+    if (!Number.isInteger(next) || next < 1) return null;
+    return next;
+  };
+
+  const handleMaxToolIterationsSave = async () => {
+    const next = parseMaxToolIterations();
+    if (next === null) {
+      setMaxToolIterationsError("Enter a whole number greater than 0, or clear the field to inherit.");
+      return;
+    }
+    setMaxToolIterationsSaving(true);
+    setMaxToolIterationsError(null);
+    try {
+      const resp = await updateAgent(agentId, { maxToolIterations: next });
+      if (resp && (resp.ok === false || resp.error)) {
+        setMaxToolIterationsError(resp.error || "Failed to update max tool iterations");
+        return;
+      }
+      setMaxToolIterations(next > 0 ? String(next) : "");
+      flashSaved();
+    } catch {
+      setMaxToolIterationsError("Failed to update max tool iterations");
+    } finally {
+      setMaxToolIterationsSaving(false);
+    }
+  };
+
+  const handleClearMaxToolIterations = async () => {
+    const prev = maxToolIterations;
+    setMaxToolIterations("");
+    setMaxToolIterationsSaving(true);
+    setMaxToolIterationsError(null);
+    try {
+      const resp = await updateAgent(agentId, { maxToolIterations: 0 });
+      if (resp && (resp.ok === false || resp.error)) {
+        setMaxToolIterations(prev);
+        setMaxToolIterationsError(resp.error || "Failed to clear max tool iterations");
+        return;
+      }
+      flashSaved();
+    } catch {
+      setMaxToolIterations(prev);
+      setMaxToolIterationsError("Failed to clear max tool iterations");
+    } finally {
+      setMaxToolIterationsSaving(false);
     }
   };
 
@@ -217,7 +288,7 @@ export default function AgentContextPage() {
             learns about the chatter. Memory is the USER.md / MEMORY.md
             sections inlined in the system prompt; no{" "}
             <code className="text-[10px]">memory_search</code> escape
-            hatch (it scans logs chatbot mode doesn't write, returns
+            hatch (it scans logs chatbot mode does not write, returns
             empty, and confuses the model). Main reply emits as plain
             text, multi-bubble via the inline split marker. For
             companion / role-play / customer-support bots.
@@ -240,6 +311,74 @@ export default function AgentContextPage() {
             for a minimal example.
           </span>
         </div>
+      </div>
+
+      {/* Tool-loop cap — stored in the same per-agent defaults row as
+          prompt mode so CLI and dashboard edits stay in sync. */}
+      <div className="rounded-lg border border-border bg-card p-5">
+        <div className="flex items-center justify-between gap-2 mb-3">
+          <div className="flex items-center gap-2">
+            <Wrench className="h-4 w-4 text-primary" />
+            <h3 className="font-medium">Tool iteration limit</h3>
+            {maxToolIterations.trim() ? (
+              <Badge className="bg-primary/10 text-primary hover:bg-primary/10 text-[10px]">
+                Override
+              </Badge>
+            ) : (
+              <Badge variant="outline" className="text-[10px]">
+                Inheriting
+              </Badge>
+            )}
+          </div>
+          {maxToolIterations.trim() && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={handleClearMaxToolIterations}
+              disabled={maxToolIterationsSaving}
+            >
+              <RotateCcw className="h-3.5 w-3.5 mr-1" />
+              Clear override
+            </Button>
+          )}
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Input
+            type="number"
+            min={1}
+            step={1}
+            inputMode="numeric"
+            value={maxToolIterations}
+            onChange={(e) => {
+              setMaxToolIterations(e.target.value);
+              setMaxToolIterationsError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") handleMaxToolIterationsSave();
+            }}
+            placeholder={`Inherit (${systemMaxToolIterations})`}
+            disabled={maxToolIterationsSaving}
+            className="max-w-[180px] font-mono text-sm"
+            aria-label="Tool iteration limit"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleMaxToolIterationsSave}
+            disabled={maxToolIterationsSaving}
+          >
+            Save
+          </Button>
+        </div>
+        <p className="text-sm text-muted-foreground mt-3">
+          Caps how many tool-use rounds this agent can run before the
+          runtime forces a final reply. Leave blank to inherit the current
+          default of <code className="text-[11px]">{systemMaxToolIterations}</code>.
+        </p>
+        {maxToolIterationsError && (
+          <p className="text-xs text-destructive mt-2">{maxToolIterationsError}</p>
+        )}
       </div>
 
       {/* Multi-bubble replies — applies to every IM channel. Lives here
