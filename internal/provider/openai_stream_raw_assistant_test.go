@@ -140,6 +140,53 @@ func TestChatStreamRawAssistantIncludesToolCalls(t *testing.T) {
 	}
 }
 
+func TestToAPIMessagesRebuildsReasoningContentFromThinking(t *testing.T) {
+	// Recovered DSML/textual tool calls intentionally clear RawAssistant so
+	// the leaked XML is not replayed. DeepSeek thinking mode still needs the
+	// prior assistant reasoning echoed as reasoning_content on the next call.
+	msgs := []Message{
+		{Role: "user", Content: "hi"},
+		{
+			Role:     "assistant",
+			Content:  "",
+			Thinking: "private chain from provider",
+			ToolCalls: []ToolCall{{
+				ID:   "recovered_0",
+				Type: "function",
+				Function: FunctionCall{
+					Name:      "exec",
+					Arguments: `{"cmd":"true"}`,
+				},
+			}},
+		},
+		{Role: "tool", ToolCallID: "recovered_0", Name: "exec", Content: "ok"},
+	}
+
+	wire := toAPIMessages(msgs)
+	if len(wire) != 3 {
+		t.Fatalf("toAPIMessages returned %d msgs, want 3", len(wire))
+	}
+
+	var assistant struct {
+		Role             string     `json:"role"`
+		ReasoningContent string     `json:"reasoning_content"`
+		ToolCalls        []ToolCall `json:"tool_calls"`
+	}
+	if err := json.Unmarshal(wire[1], &assistant); err != nil {
+		t.Fatalf("assistant wire message is not valid JSON: %v\n---\n%s", err, string(wire[1]))
+	}
+	if assistant.Role != "assistant" {
+		t.Fatalf("assistant.role = %q, want assistant", assistant.Role)
+	}
+	if assistant.ReasoningContent != "private chain from provider" {
+		t.Fatalf("reasoning_content = %q, want Thinking to round-trip\n---\n%s",
+			assistant.ReasoningContent, string(wire[1]))
+	}
+	if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "recovered_0" {
+		t.Fatalf("tool_calls did not round-trip: %+v\n---\n%s", assistant.ToolCalls, string(wire[1]))
+	}
+}
+
 // Avoid an unused import on io when go vet is strict; keep one
 // reference so future edits don't break compile if io is needed.
 var _ = io.EOF
