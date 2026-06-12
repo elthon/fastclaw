@@ -40,7 +40,7 @@ RUN CGO_ENABLED=0 go build \
 
 # --- Stage 3: Runtime ---
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata docker-cli
 COPY --from=go-builder /fastclaw /usr/local/bin/fastclaw
 
 # Default data directory. Override at runtime with FASTCLAW_HOME, but the

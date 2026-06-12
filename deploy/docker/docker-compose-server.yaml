@@ -1,0 +1,62 @@
+##
+## FastClaw — server deployment with pre-loaded Docker images.
+##
+## Expected server directory:
+##   /opt/data/aegis/fastclaw
+##
+## Before starting:
+##   cd /opt/data/aegis/fastclaw
+##   docker load -i fastclaw-images-*.tar.gz
+##   mkdir -p .fastclaw postgres-data
+##
+## Start:
+##   docker compose -f docker-compose-server.yaml up -d
+##
+## Sandbox notes:
+##   The sandbox is started automatically by FastClaw when agent tools need it.
+##   This compose file only enables Docker sandbox mode and mounts the host
+##   Docker socket so FastClaw can create sandbox containers on demand.
+##
+name: fastclaw
+
+services:
+  fastclaw:
+    image: fastclaw/fastclaw:latest
+    restart: unless-stopped
+    ports:
+      - "${FASTCLAW_PORT:-18953}:18953"
+    volumes:
+      - "${FASTCLAW_HOME_HOST:-/opt/data/aegis/fastclaw/.fastclaw}:/data/.fastclaw"
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      FASTCLAW_HOME: "/data/.fastclaw"
+      FASTCLAW_BIND: all
+      FASTCLAW_PORT: "18953"
+
+      FASTCLAW_STORAGE_TYPE: postgres
+      FASTCLAW_STORAGE_DSN: "postgres://fastclaw:${POSTGRES_PASSWORD:-fastclaw-secret}@postgres:5432/fastclaw?sslmode=disable"
+      FASTCLAW_STORAGE_AUTO_MIGRATE: "true"
+
+      FASTCLAW_SANDBOX_ENABLED: "true"
+      FASTCLAW_SANDBOX_BACKEND: docker
+      FASTCLAW_SANDBOX_IMAGE: "${FASTCLAW_SANDBOX_IMAGE:-thinkany/fastclaw-sandbox:latest}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["gateway"]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fastclaw
+      POSTGRES_USER: fastclaw
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-fastclaw-secret}"
+    volumes:
+      - "${POSTGRES_DATA_HOST:-/opt/data/aegis/fastclaw/postgres-data}:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastclaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

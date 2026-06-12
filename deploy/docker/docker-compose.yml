@@ -24,7 +24,11 @@ services:
     ports:
       - "${FASTCLAW_PORT:-18953}:18953"
     volumes:
-      - fastclaw-data:/data/.fastclaw
+      # Docker sandbox runs through the host Docker daemon. Keep FASTCLAW_HOME
+      # at the same absolute path inside and outside the gateway container so
+      # workspace/skill bind mounts resolve correctly for sandbox containers.
+      - "${FASTCLAW_HOME_HOST:-/home/elthon/Repository/fastclaw/deploy/docker/.fastclaw}:${FASTCLAW_HOME_HOST:-/home/elthon/Repository/fastclaw/deploy/docker/.fastclaw}"
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       # Server default timezone (IANA name). This is the LAST fallback in
       # the chain chatter pref → agent default → system default → TZ —
@@ -32,7 +36,7 @@ services:
       # set a timezone get UTC wall clocks and UTC-fired schedules.
       TZ: "${TZ:-Asia/Shanghai}"
       # FASTCLAW_HOME — sqlite db path + sandbox root + skill cache live here
-      FASTCLAW_HOME: /data/.fastclaw
+      FASTCLAW_HOME: "${FASTCLAW_HOME_HOST:-/home/elthon/Repository/fastclaw/deploy/docker/.fastclaw}"
       # Bind to all interfaces so the host port mapping works
       FASTCLAW_BIND: all
       FASTCLAW_PORT: "18953"
@@ -41,10 +45,11 @@ services:
       FASTCLAW_STORAGE_TYPE: postgres
       FASTCLAW_STORAGE_DSN: "postgres://fastclaw:${POSTGRES_PASSWORD:-fastclaw-secret}@postgres:5432/fastclaw?sslmode=disable"
       FASTCLAW_STORAGE_AUTO_MIGRATE: "true"
-      # Sandbox (optional; uncomment to enable)
-      # FASTCLAW_SANDBOX_ENABLED: "true"
-      # FASTCLAW_SANDBOX_BACKEND: docker
-      # FASTCLAW_SANDBOX_IMAGE: python:3.12-slim
+      # Docker sandbox for exec/browser tools. Build this image from
+      # deploy/docker/sandbox; it includes camoufox-cli and Camoufox.
+      FASTCLAW_SANDBOX_ENABLED: "true"
+      FASTCLAW_SANDBOX_BACKEND: docker
+      FASTCLAW_SANDBOX_IMAGE: thinkany/fastclaw-sandbox:latest
     depends_on:
       postgres:
         condition: service_healthy
