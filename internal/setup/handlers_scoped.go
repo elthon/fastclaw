@@ -175,30 +175,32 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(blob, &pc)
 		}
 		out = append(out, map[string]any{
-			"id":        r.ID,
-			"scope":     r.LegacyScope(),
-			"scopeId":   r.LegacyScopeID(),
-			"name":      r.Name,
-			"apiBase":   pc.APIBase,
-			"apiKey":    maskAPIKey(pc.APIKey),
-			"apiType":   pc.APIType,
-			"authType":  pc.AuthType,
-			"models":    pc.Models,
-			"updatedAt": r.UpdatedAt,
+			"id":            r.ID,
+			"scope":         r.LegacyScope(),
+			"scopeId":       r.LegacyScopeID(),
+			"name":          r.Name,
+			"apiBase":       pc.APIBase,
+			"apiKey":        maskAPIKey(pc.APIKey),
+			"apiType":       pc.APIType,
+			"authType":      pc.AuthType,
+			"customHeaders": pc.CustomHeaders,
+			"models":        pc.Models,
+			"updatedAt":     r.UpdatedAt,
 		})
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"providers": out, "scope": sc, "scopeId": scopeID})
 }
 
 type writeProviderRequest struct {
-	Scope    string              `json:"scope"`
-	ScopeID  string              `json:"scopeId"`
-	Name     string              `json:"name"`
-	APIBase  string              `json:"apiBase"`
-	APIKey   string              `json:"apiKey"`
-	APIType  string              `json:"apiType"`
-	AuthType string              `json:"authType"`
-	Models   []config.ModelEntry `json:"models,omitempty"`
+	Scope         string              `json:"scope"`
+	ScopeID       string              `json:"scopeId"`
+	Name          string              `json:"name"`
+	APIBase       string              `json:"apiBase"`
+	APIKey        string              `json:"apiKey"`
+	APIType       string              `json:"apiType"`
+	AuthType      string              `json:"authType"`
+	CustomHeaders map[string]string   `json:"customHeaders,omitempty"`
+	Models        []config.ModelEntry `json:"models,omitempty"`
 }
 
 func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
@@ -222,11 +224,12 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pcfg := config.ProviderConfig{
-		APIBase:  req.APIBase,
-		APIKey:   req.APIKey,
-		APIType:  req.APIType,
-		AuthType: req.AuthType,
-		Models:   req.Models,
+		APIBase:       req.APIBase,
+		APIKey:        req.APIKey,
+		APIType:       req.APIType,
+		AuthType:      req.AuthType,
+		CustomHeaders: req.CustomHeaders,
+		Models:        req.Models,
 	}
 	if err := scope.SaveProviderByScope(r.Context(), s.dataStore, sc, scopeID, req.Name, pcfg); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -270,6 +273,9 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AuthType != "" {
 		pc.AuthType = req.AuthType
+	}
+	if req.CustomHeaders != nil {
+		pc.CustomHeaders = req.CustomHeaders
 	}
 	// `models` is sent as the full desired set on every PUT (the dialog
 	// is the source of truth) — overwrite even when the array is empty so

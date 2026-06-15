@@ -319,11 +319,12 @@ type ModelEntry struct {
 // the JSON shape inside agents.config and as the resolved per-(scope, name)
 // view assembled by the providers resolver.
 type ProviderConfig struct {
-	APIKey   string       `json:"apiKey"`
-	APIBase  string       `json:"apiBase"`
-	APIType  string       `json:"apiType,omitempty"`
-	AuthType string       `json:"authType,omitempty"`
-	Models   []ModelEntry `json:"models,omitempty"`
+	APIKey        string            `json:"apiKey"`
+	APIBase       string            `json:"apiBase"`
+	APIType       string            `json:"apiType,omitempty"`
+	AuthType      string            `json:"authType,omitempty"`
+	CustomHeaders map[string]string `json:"customHeaders,omitempty"`
+	Models        []ModelEntry      `json:"models,omitempty"`
 }
 
 // UnmarshalJSON handles a long-deprecated `api` alias for `apiType`.
@@ -359,9 +360,9 @@ type AgentDefaults struct {
 	// naturally serializes. 0 = unlimited (no cap, current behavior).
 	// Useful when downstream APIs (Brave free tier 1RPS, etc.) can't
 	// take a parallel burst.
-	MaxParallelToolCalls int     `json:"maxParallelToolCalls,omitempty"`
-	Thinking             string  `json:"thinking,omitempty"`
-	PolicyPreset         string  `json:"policy,omitempty"`
+	MaxParallelToolCalls int    `json:"maxParallelToolCalls,omitempty"`
+	Thinking             string `json:"thinking,omitempty"`
+	PolicyPreset         string `json:"policy,omitempty"`
 	// PromptMode lives here so the agent-scope `agents.defaults`
 	// config row (written by CLI and dashboard) round-trips into
 	// ResolvedAgent at userspace assembly time — see
@@ -389,8 +390,8 @@ type AgentDefaults struct {
 // configs table at scope=agent and are merged in via scope.SettingInto
 // during userspace load.
 type AgentEntry struct {
-	ID                   string                     `json:"id"`
-	UserID               string                     `json:"userId,omitempty"`
+	ID     string `json:"id"`
+	UserID string `json:"userId,omitempty"`
 	// Name mirrors agents.name (the operator-given display name) and is
 	// carried through to ResolvedAgent.DisplayName so the system prompt
 	// can stamp a fallback identity line when IDENTITY.md is empty.
@@ -400,12 +401,12 @@ type AgentEntry struct {
 	Temperature          float64                    `json:"temperature,omitempty"`
 	MaxToolIterations    int                        `json:"maxToolIterations,omitempty"`
 	MaxParallelToolCalls int                        `json:"maxParallelToolCalls,omitempty"`
-	Skills            []string                   `json:"skills,omitempty"`
-	MCPServers        map[string]MCPServerConfig `json:"mcpServers,omitempty"`
-	AlwaysLoadSkills  []string                   `json:"alwaysLoadSkills,omitempty"`
-	Thinking          string                     `json:"thinking,omitempty"`
-	Sandbox           SandboxCfg                 `json:"sandbox,omitempty"`
-	PolicyPreset      string                     `json:"policy,omitempty"`
+	Skills               []string                   `json:"skills,omitempty"`
+	MCPServers           map[string]MCPServerConfig `json:"mcpServers,omitempty"`
+	AlwaysLoadSkills     []string                   `json:"alwaysLoadSkills,omitempty"`
+	Thinking             string                     `json:"thinking,omitempty"`
+	Sandbox              SandboxCfg                 `json:"sandbox,omitempty"`
+	PolicyPreset         string                     `json:"policy,omitempty"`
 	// PromptMode selects how heavily the framework system prompt
 	// participates AND which built-in tools the LLM sees. Empty =
 	// "agent" (current default) for backward compatibility. See
@@ -537,12 +538,12 @@ type AgentFileConfig struct {
 	Temperature          float64                    `json:"temperature,omitempty"`
 	MaxToolIterations    int                        `json:"maxToolIterations,omitempty"`
 	MaxParallelToolCalls int                        `json:"maxParallelToolCalls,omitempty"`
-	Workspace         string                     `json:"workspace,omitempty"`
-	Skills            SkillsConfig               `json:"skills,omitempty"`
-	MCPServers        map[string]MCPServerConfig `json:"mcpServers,omitempty"`
-	ToolProviders     map[string]ToolProviderCfg `json:"toolProviders,omitempty"`
-	Tools             map[string]ToolCategoryCfg `json:"tools,omitempty"`
-	Providers         map[string]ProviderConfig  `json:"providers,omitempty"`
+	Workspace            string                     `json:"workspace,omitempty"`
+	Skills               SkillsConfig               `json:"skills,omitempty"`
+	MCPServers           map[string]MCPServerConfig `json:"mcpServers,omitempty"`
+	ToolProviders        map[string]ToolProviderCfg `json:"toolProviders,omitempty"`
+	Tools                map[string]ToolCategoryCfg `json:"tools,omitempty"`
+	Providers            map[string]ProviderConfig  `json:"providers,omitempty"`
 	// PromptMode mirrors AgentEntry.PromptMode at the file-config layer.
 	// Non-empty values override the entry-level setting.
 	PromptMode string `json:"promptMode,omitempty"`
@@ -608,13 +609,13 @@ type ResolvedAgent struct {
 	MaxToolIterations    int
 	MaxParallelToolCalls int
 	Thinking             string
-	Skills            SkillsConfig
-	MCPServers        map[string]MCPServerConfig
-	Sandbox           SandboxCfg
-	PolicyPreset      string
-	ToolProviders     map[string]ToolProviderCfg
-	Tools             map[string]ToolCategoryCfg
-	Providers         map[string]ProviderConfig
+	Skills               SkillsConfig
+	MCPServers           map[string]MCPServerConfig
+	Sandbox              SandboxCfg
+	PolicyPreset         string
+	ToolProviders        map[string]ToolProviderCfg
+	Tools                map[string]ToolCategoryCfg
+	Providers            map[string]ProviderConfig
 	// Admins is the per-channel admin allowlist for write-mode slash
 	// commands. See AgentFileConfig.Admins for semantics + default.
 	Admins map[string][]string

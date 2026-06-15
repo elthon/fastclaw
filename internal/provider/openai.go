@@ -14,9 +14,10 @@ import (
 
 // OpenAIProvider implements the Provider interface for OpenAI-compatible APIs.
 type OpenAIProvider struct {
-	apiKey  string
-	apiBase string
-	client  *http.Client
+	apiKey        string
+	apiBase       string
+	customHeaders map[string]string
+	client        *http.Client
 }
 
 // NewOpenAI creates a new OpenAI-compatible provider. apiBase is taken
@@ -27,10 +28,15 @@ type OpenAIProvider struct {
 // but the resolution path picked up an empty cfg. An empty apiBase now
 // causes calls to fail loudly, which is what we want.
 func NewOpenAI(apiKey, apiBase string) *OpenAIProvider {
+	return NewOpenAIWithHeaders(apiKey, apiBase, nil)
+}
+
+func NewOpenAIWithHeaders(apiKey, apiBase string, headers map[string]string) *OpenAIProvider {
 	return &OpenAIProvider{
-		apiKey:  apiKey,
-		apiBase: NormalizeAPIBase(apiBase, "openai-chat"),
-		client:  newLLMHTTPClient(),
+		apiKey:        apiKey,
+		apiBase:       NormalizeAPIBase(apiBase, "openai-chat"),
+		customHeaders: headers,
+		client:        newLLMHTTPClient(),
 	}
 }
 
@@ -274,6 +280,7 @@ func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, t
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	ApplyCustomHeaders(httpReq.Header, p.customHeaders)
 	return httpReq, nil
 }
 

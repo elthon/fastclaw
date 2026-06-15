@@ -35,6 +35,33 @@ func newLLMHTTPClient() *http.Client {
 	return &http.Client{Transport: tr}
 }
 
+// ApplyCustomHeaders applies operator-configured headers to an outbound LLM
+// request after the provider's default headers have been set. Invalid names
+// and values containing line breaks are ignored so a bad UI/API value cannot
+// poison the request.
+func ApplyCustomHeaders(h http.Header, custom map[string]string) {
+	for k, v := range custom {
+		key := strings.TrimSpace(k)
+		value := strings.TrimSpace(v)
+		if key == "" || value == "" || !validHeaderName(key) || strings.ContainsAny(value, "\r\n") {
+			continue
+		}
+		h.Set(key, value)
+	}
+}
+
+func validHeaderName(name string) bool {
+	for _, r := range name {
+		if r > 127 {
+			return false
+		}
+		if !strings.ContainsRune("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", r) {
+			return false
+		}
+	}
+	return true
+}
+
 // Origin tags a Message that was produced by the runtime rather than a
 // real user / model exchange. Empty means "this came from the user
 // (or the model in response to the user)" — the common case. Hooks
@@ -268,8 +295,12 @@ func SplitProviderModel(s string) (provider, model string) {
 // NewProvider creates a Provider based on apiType.
 // "anthropic-messages" creates an Anthropic provider, anything else creates OpenAI-compatible.
 func NewProvider(apiKey, apiBase, apiType string) Provider {
+	return NewProviderWithHeaders(apiKey, apiBase, apiType, nil)
+}
+
+func NewProviderWithHeaders(apiKey, apiBase, apiType string, headers map[string]string) Provider {
 	if apiType == "anthropic-messages" {
-		return NewAnthropic(apiKey, apiBase)
+		return NewAnthropicWithHeaders(apiKey, apiBase, headers)
 	}
-	return NewOpenAI(apiKey, apiBase)
+	return NewOpenAIWithHeaders(apiKey, apiBase, headers)
 }

@@ -92,6 +92,7 @@ interface ProviderEntry {
   maskedKey: string;   // server-returned masked key for display
   apiType: string;
   authType: string;
+  customHeaders: Record<string, string>;
   models: ModelEntry[];
   // scope tells the row apart from the inherited (system) ones a regular
   // user is allowed to see but not mutate. "system" and "agent" rows
@@ -100,6 +101,31 @@ interface ProviderEntry {
   // the page is mounted inside an agent context (chatter viewing a
   // shared agent whose owner enabled shareModelConfig).
   scope: "system" | "user" | "agent";
+}
+
+type HeaderRow = { key: string; value: string };
+
+function headersToRows(headers?: Record<string, string>): HeaderRow[] {
+  return Object.entries(headers || {}).map(([key, value]) => ({ key, value }));
+}
+
+function buildCustomHeaders(rows: HeaderRow[]): { headers: Record<string, string>; error: string } {
+  const headers: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const key = row.key.trim();
+    const value = row.value.trim();
+    if (!key && !value) continue;
+    if (!key || !value) return { headers: {}, error: "Complete or remove every custom header row." };
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(key)) {
+      return { headers: {}, error: "Header names may only contain RFC token characters." };
+    }
+    const normalized = key.toLowerCase();
+    if (seen.has(normalized)) return { headers: {}, error: `Duplicate header: ${key}` };
+    seen.add(normalized);
+    headers[key] = value;
+  }
+  return { headers, error: "" };
 }
 
 function emptyModel(): ModelEntry {
@@ -171,6 +197,7 @@ export default function ModelsPage() {
   const [formApiKey, setFormApiKey] = useState("");
   const [formApiType, setFormApi] = useState("openai-chat");
   const [formAuthType, setFormAuthType] = useState("api-key");
+  const [formHeaders, setFormHeaders] = useState<HeaderRow[]>([]);
   const [formModels, setFormModels] = useState<ModelEntry[]>([]);
   // Per-model test results keyed by model index in formModels. We test
   // every configured model so the user sees which model IDs the provider
@@ -190,6 +217,7 @@ export default function ModelsPage() {
   const allModelsPassed =
     cleanModelRows.length === 0 ||
     cleanModelRows.every((t) => modelTests[t.idx]?.status === "success");
+  const customHeaderResult = buildCustomHeaders(formHeaders);
 
   // Collect all provider/model options for the default-model dropdown.
   // Dedupe on `provider/modelId` and walk inner→outer scope so the more
@@ -254,6 +282,7 @@ export default function ModelsPage() {
         maskedKey: r.apiKey || "",
         apiType: r.apiType || "openai-chat",
         authType: r.authType || "bearer-token",
+        customHeaders: r.customHeaders || {},
         models: r.models || [],
         scope: sc,
       });
@@ -301,6 +330,7 @@ export default function ModelsPage() {
     setFormApi(PROVIDER_PRESETS["openai"].apiType);
     setFormAuthType(PROVIDER_PRESETS["openai"].authType);
     setFormApiKey("");
+    setFormHeaders([]);
     setFormModels(presetModelRows("openai"));
     setModelTests({});
     setDialogOpen(true);
@@ -316,6 +346,7 @@ export default function ModelsPage() {
     setFormApi(provider.apiType);
     setFormAuthType(provider.authType || "bearer-token");
     setFormApiKey("");
+    setFormHeaders(headersToRows(provider.customHeaders));
     // Saved providers may have models persisted before we shipped the
     // full ModelEntry schema (no cost block, no input array). Layer
     // emptyModel() defaults under the saved data so the dialog always
@@ -362,6 +393,7 @@ export default function ModelsPage() {
       setFormAuthType(cfg.authType);
     }
     setFormName(preset === "custom" ? "" : preset);
+    setFormHeaders([]);
     setFormModels(presetModelRows(preset));
     setModelTests({});
   };
@@ -384,6 +416,8 @@ export default function ModelsPage() {
     const editingRow = editingId
       ? providers.find((p) => p.id === editingId)
       : undefined;
+    const { headers: customHeaders, error: headerError } = buildCustomHeaders(formHeaders);
+    if (headerError) return;
     const useStoredKey = !!editingRow && !formApiKey.trim();
     setBatchTesting(true);
     setModelTests((prev) => {
@@ -399,6 +433,7 @@ export default function ModelsPage() {
                 apiBase: formApiBase,
                 apiType: formApiType,
                 authType: formAuthType,
+                customHeaders,
               })
             : await testProvider({
                 apiBase: formApiBase,
@@ -406,6 +441,7 @@ export default function ModelsPage() {
                 model: id,
                 apiType: formApiType,
                 authType: formAuthType,
+                customHeaders,
               });
           setModelTests((prev) => ({
             ...prev,
@@ -467,6 +503,18 @@ export default function ModelsPage() {
     });
   };
 
+  const handleAddHeader = () => {
+    setFormHeaders((prev) => [...prev, { key: "", value: "" }]);
+  };
+
+  const handleUpdateHeader = (index: number, field: keyof HeaderRow, value: string) => {
+    setFormHeaders((prev) => prev.map((row, i) => (i === index ? { ...row, [field]: value } : row)));
+  };
+
+  const handleRemoveHeader = (index: number) => {
+    setFormHeaders((prev) => prev.filter((_, i) => i !== index));
+  };
+
   const flashSaved = () => {
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
@@ -476,6 +524,8 @@ export default function ModelsPage() {
     const name = formName.toLowerCase().trim().replace(/\s+/g, "-");
     if (!name) return;
     const cleanedModels = formModels.filter((m) => m.id.trim());
+    const { headers: customHeaders, error: headerError } = buildCustomHeaders(formHeaders);
+    if (headerError) return;
     const editingRow = editingId
       ? providers.find((p) => p.id === editingId)
       : undefined;
@@ -490,6 +540,7 @@ export default function ModelsPage() {
           apiKey: formApiKey || undefined,
           apiType: formApiType,
           authType: formAuthType,
+          customHeaders,
           models: cleanedModels,
         });
       } else {
@@ -501,6 +552,7 @@ export default function ModelsPage() {
           apiKey: formApiKey,
           apiType: formApiType,
           authType: formAuthType,
+          customHeaders,
           models: cleanedModels,
         });
       }
@@ -955,6 +1007,56 @@ export default function ModelsPage() {
               </div>
             </div>
 
+            <div className="space-y-3 pt-2 border-t border-border">
+              <div className="flex items-center justify-between">
+                <Label className="text-base">Custom Headers</Label>
+                <Button variant="outline" size="sm" onClick={handleAddHeader}>
+                  <Plus className="h-3 w-3 mr-1.5" />
+                  Add Header
+                </Button>
+              </div>
+              {formHeaders.length === 0 && (
+                <p className="text-sm text-muted-foreground/60 text-center py-3">
+                  No custom headers configured.
+                </p>
+              )}
+              {formHeaders.map((header, idx) => (
+                <div key={idx} className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
+                  <div className="space-y-1">
+                    <Label className="text-xs">Header Name</Label>
+                    <Input
+                      value={header.key}
+                      onChange={(e) => handleUpdateHeader(idx, "key", e.target.value)}
+                      placeholder="X-Provider-Option"
+                      className="font-mono text-xs h-8"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Value</Label>
+                    <Input
+                      value={header.value}
+                      onChange={(e) => handleUpdateHeader(idx, "value", e.target.value)}
+                      placeholder="true"
+                      className="font-mono text-xs h-8"
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 text-destructive hover:text-destructive"
+                    onClick={() => handleRemoveHeader(idx)}
+                    title="Remove header"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ))}
+              {customHeaderResult.error && (
+                <p className="text-xs text-destructive">{customHeaderResult.error}</p>
+              )}
+            </div>
+
             {/* Models Section */}
             <div className="space-y-3 pt-2 border-t border-border">
               <div className="flex items-center justify-between">
@@ -1088,7 +1190,7 @@ export default function ModelsPage() {
             </Button>
             <Button
               onClick={handleSaveProvider}
-              disabled={!formName.trim() || saving || !allModelsPassed}
+              disabled={!formName.trim() || saving || !allModelsPassed || !!customHeaderResult.error}
             >
               {editingName ? "Update" : "Add"}
             </Button>

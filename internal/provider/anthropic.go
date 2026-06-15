@@ -14,20 +14,26 @@ import (
 
 // AnthropicProvider implements the Provider interface for Anthropic Messages API.
 type AnthropicProvider struct {
-	apiKey  string
-	apiBase string
-	client  *http.Client
+	apiKey        string
+	apiBase       string
+	customHeaders map[string]string
+	client        *http.Client
 }
 
 // NewAnthropic creates a new Anthropic Messages API provider.
 func NewAnthropic(apiKey, apiBase string) *AnthropicProvider {
+	return NewAnthropicWithHeaders(apiKey, apiBase, nil)
+}
+
+func NewAnthropicWithHeaders(apiKey, apiBase string, headers map[string]string) *AnthropicProvider {
 	if strings.TrimSpace(apiBase) == "" {
 		apiBase = "https://api.anthropic.com"
 	}
 	return &AnthropicProvider{
-		apiKey:  apiKey,
-		apiBase: NormalizeAPIBase(apiBase, "anthropic-messages"),
-		client:  newLLMHTTPClient(),
+		apiKey:        apiKey,
+		apiBase:       NormalizeAPIBase(apiBase, "anthropic-messages"),
+		customHeaders: headers,
+		client:        newLLMHTTPClient(),
 	}
 }
 
@@ -347,6 +353,7 @@ func (p *AnthropicProvider) buildRequest(ctx context.Context, messages []Message
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", p.apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	ApplyCustomHeaders(httpReq.Header, p.customHeaders)
 	return httpReq, nil
 }
 

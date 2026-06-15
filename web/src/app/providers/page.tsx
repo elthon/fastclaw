@@ -22,6 +22,7 @@ export default function ProvidersPage() {
     apiKey: "",
     apiType: "openai-chat",
     authType: "bearer-token",
+    customHeadersText: "",
   });
 
   const refresh = useCallback(async () => {
@@ -35,16 +36,39 @@ export default function ProvidersPage() {
     if (scope === "system" || scopeId) refresh();
   }, [scope, scopeId, refresh]);
 
+  function parseHeaders(text: string): Record<string, string> | undefined {
+    const trimmed = text.trim();
+    if (!trimmed) return undefined;
+    const parsed = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Custom headers must be a JSON object");
+    }
+    return Object.fromEntries(
+      Object.entries(parsed)
+        .map(([key, value]) => [key.trim(), String(value).trim()])
+        .filter(([key, value]) => key && value),
+    );
+  }
+
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     setError("");
     if (!draft.name) return;
-    const res = await createProvider({ scope, scopeId, ...draft });
+    let customHeaders: Record<string, string> | undefined;
+    try {
+      customHeaders = parseHeaders(draft.customHeadersText);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Invalid custom headers");
+      return;
+    }
+    const { customHeadersText: _customHeadersText, ...providerDraft } = draft;
+    void _customHeadersText;
+    const res = await createProvider({ scope, scopeId, ...providerDraft, customHeaders });
     if (res.error) {
       setError(res.error);
       return;
     }
-    setDraft({ name: "", apiBase: "", apiKey: "", apiType: "openai-chat", authType: "bearer-token" });
+    setDraft({ name: "", apiBase: "", apiKey: "", apiType: "openai-chat", authType: "bearer-token", customHeadersText: "" });
     refresh();
   }
 
@@ -89,6 +113,12 @@ export default function ProvidersPage() {
             <option value="api-key">API Key Header</option>
           </select>
         </div>
+        <textarea
+          value={draft.customHeadersText}
+          onChange={(e) => setDraft({ ...draft, customHeadersText: e.target.value })}
+          placeholder='{ "X-Provider-Option": "true" }'
+          className="min-h-20 w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm"
+        />
         <button type="submit" className="rounded bg-violet-600 px-4 py-2 text-sm">Save</button>
       </form>
 
@@ -101,6 +131,7 @@ export default function ProvidersPage() {
             <th>API Base</th>
             <th>Key</th>
             <th>Type</th>
+            <th>Headers</th>
             <th></th>
           </tr>
         </thead>
@@ -124,6 +155,20 @@ export default function ProvidersPage() {
                 />
               </td>
               <td className="text-xs text-zinc-500">{row.apiType}</td>
+              <td>
+                <textarea
+                  defaultValue={row.customHeaders ? JSON.stringify(row.customHeaders, null, 2) : ""}
+                  onBlur={(e) => {
+                    try {
+                      const customHeaders = parseHeaders(e.target.value) || {};
+                      handleEdit(row, { customHeaders });
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : "Invalid custom headers");
+                    }
+                  }}
+                  className="min-h-16 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs"
+                />
+              </td>
               <td className="text-right">
                 <button onClick={() => handleDelete(row)} className="text-xs text-red-400 hover:underline">delete</button>
               </td>
