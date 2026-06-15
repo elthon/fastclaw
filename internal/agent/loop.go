@@ -20,6 +20,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/mcp"
 	"github.com/fastclaw-ai/fastclaw/internal/privacy"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
+	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
 	"github.com/fastclaw-ai/fastclaw/internal/session"
@@ -118,6 +119,14 @@ type Agent struct {
 	// and hook are simply not registered, so a missing store silently
 	// degrades to "feature off" rather than crashing.
 	goalStore goal.Store
+
+	// projectRuntime, when non-nil, turns this agent into a coding agent:
+	// it can scaffold a project from a template, boot a dev server, and
+	// hand back a preview URL via the start_app_preview / app_preview_logs
+	// tools. Wired by attachProjectRuntimeToAgents at boot. Nil for
+	// ordinary agents, which then never see those tools and keep their
+	// per-chat file isolation. See SetProjectRuntime.
+	projectRuntime *coderuntime.Manager
 }
 
 // SetSandboxPool wires the per-(agent,session) executor pool. Called by
@@ -163,6 +172,24 @@ func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 func (a *Agent) bindSession(ctx context.Context, channel, sessionID, projectID string) {
 	a.registry.SetSessionID(sessionID)
 	a.registry.SetProjectID(projectID)
+	// Coding agents (those with a project runtime wired) treat a project
+	// as ONE shared app tree: file tools address the project root so the
+	// agent's edits land where the dev server serves. Only when actually
+	// inside a project; loose chats and non-coding agents are unaffected.
+	a.registry.SetCodingRootScope(a.projectRuntime != nil && projectID != "")
+	// If this scope already has a running app (a runtime record exists),
+	// redirect file tools into its app subfolder so edits keep landing
+	// where the dev server serves — across turns, not just the turn that
+	// called start_app_preview. EffectiveUserID is the owner here
+	// (chatter is bound later), which is correct for the web-direct case.
+	a.registry.SetCodingSubdir("")
+	if a.projectRuntime != nil {
+		if uid := a.registry.EffectiveUserID(); uid != "" {
+			if _, err := a.projectRuntime.Get(ctx, uid, a.name, projectID, sessionID); err == nil {
+				a.registry.SetCodingSubdir(coderuntime.AppSubdir)
+			}
+		}
+	}
 	a.registry.SetMessageContext(channel, sessionID)
 	if a.sandboxPool == nil {
 		return
@@ -1641,7 +1668,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	if catalog != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: catalog})
 	}
-	messages = append(messages, sess.GetMessages()...)
+	messages = append(messages, a.withMessageTimestamps(sess.GetMessages())...)
 	if a.piiScrubEnabled {
 		messages = privacy.ScrubMessages(messages)
 	}
@@ -1878,7 +1905,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, sessionMsgs...)
+	messages = append(messages, a.withMessageTimestamps(sessionMsgs)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
@@ -2574,7 +2601,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, sessionMsgs...)
+	messages = append(messages, a.withMessageTimestamps(sessionMsgs)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
@@ -2993,6 +3020,12 @@ var chatbotBuiltinAllowlist = []string{
 	// set_timezone keeps "their local time" right for chat (greetings,
 	// "晚安" timing) — chatbots need it as much as full agents do.
 	"set_timezone",
+	// Coding-agent preview tools. Only ever REGISTERED when a project
+	// runtime is wired (SetProjectRuntime), so listing them here is a
+	// harmless no-op for ordinary chat personas and makes the preview
+	// usable regardless of the agent's prompt mode.
+	"start_app_preview",
+	"app_preview_logs",
 }
 
 // builtinAllowForMode returns the built-in tool name allowlist for the
@@ -3023,11 +3056,48 @@ func (a *Agent) WorkspacePath() string {
 // chatter's wall clock; the cron tool runs the same resolution at
 // job-creation time.
 func (a *Agent) chatterLocation(chatterUID string) *time.Location {
+	// USER.md is the chatter-authoritative source: the deployment clock is
+	// UTC and inbound timestamps are UTC, so the only place the chatter's
+	// real timezone lives is what they (or the agent) recorded in their
+	// profile — "东八区", "UTC+8", "Asia/Shanghai". Parse it and let it win
+	// over the DB prefs, so editing USER.md is enough to fix the clock
+	// without also having to run set_timezone.
+	if a.memory != nil {
+		if profile := a.memory.WithUserID(chatterUID).LoadUserFile(); profile != "" {
+			if loc := scope.LocationFromText(profile); loc != nil {
+				return loc
+			}
+		}
+	}
 	if a.dataStore == nil {
 		return time.Local
 	}
 	tz := scope.Timezone(context.Background(), a.dataStore, chatterUID, a.agentID)
 	return scope.LoadLocationOrLocal(tz)
+}
+
+// withMessageTimestamps returns a COPY of msgs where each user message is
+// prefixed with its send time in the chatter's timezone, e.g.
+// "[2026-06-13 22:15 Fri] …". This is what lets the model reason about
+// time across a conversation — tell today from earlier days, and not say
+// "good night" at midday. The originals are never mutated (the prefix is
+// a read-time view for the LLM, not stored history), so the session store
+// stays clean and the next turn doesn't double-prefix. The system prompt
+// (context.go dateLine) tells the model what the bracketed prefix means.
+func (a *Agent) withMessageTimestamps(msgs []provider.Message) []provider.Message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	loc := a.chatterLocation(a.registry.ChatterUserID())
+	out := make([]provider.Message, len(msgs))
+	for i, m := range msgs {
+		if m.Role == "user" && m.Timestamp > 0 && m.Content != "" {
+			t := time.UnixMilli(m.Timestamp).In(loc)
+			m.Content = "[" + t.Format("2006-01-02 15:04 Mon") + "] " + m.Content
+		}
+		out[i] = m
+	}
+	return out
 }
 
 // UpdateConfig updates the agent's runtime config (model, temperature, etc.)
