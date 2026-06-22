@@ -969,6 +969,95 @@ func wechatPollQRStatus(ctx context.Context, qrcode string) (*wechatQRStatusResp
 	return &out, nil
 }
 
+// --- DingTalk ---
+
+type connectDingTalkRequest struct {
+	ClientID       string `json:"clientId"`
+	ClientSecret   string `json:"clientSecret"`
+	RobotCode      string `json:"robotCode"`
+	RequireMention *bool  `json:"requireMention"`
+}
+
+// handleConnectAgentDingTalk persists a DingTalk internal-robot stream
+// credential pair and hot-starts the singleton adapter. DingTalk does not
+// offer a cheap, side-effect-free bot validation endpoint for stream mode,
+// so validation is intentionally light: save the app credentials, start the
+// stream client, and let the adapter logs report upstream auth/subscription
+// failures with the real DingTalk response body.
+func (s *Server) handleConnectAgentDingTalk(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWritable(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	uid, aid, ok := s.resolveChannelBindingScope(w, r, id)
+	if !ok {
+		return
+	}
+
+	var req connectDingTalkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	clientID := strings.TrimSpace(req.ClientID)
+	clientSecret := strings.TrimSpace(req.ClientSecret)
+	robotCode := strings.TrimSpace(req.RobotCode)
+	if robotCode == "" {
+		robotCode = clientID
+	}
+	if clientID == "" || clientSecret == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "clientId and clientSecret required"})
+		return
+	}
+	requireMention := true
+	if req.RequireMention != nil {
+		requireMention = *req.RequireMention
+	}
+	accountID := robotCode
+	if accountID == "" {
+		accountID = clientID
+	}
+
+	cc := config.ChannelConfig{
+		Enabled: true,
+		Accounts: map[string]config.AccountConfig{
+			accountID: {
+				ClientID:       clientID,
+				ClientSecret:   clientSecret,
+				RobotCode:      robotCode,
+				RequireMention: &requireMention,
+			},
+		},
+	}
+	credKey := accountID
+	if err := s.assertChannelCredentialUnique(r, "dingtalk", credKey, "", uid, aid); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := scope.SaveChannel(r.Context(), s.dataStore, uid, aid, "dingtalk", credKey, true, cc); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := s.appendBinding(r, "", "", config.Binding{
+		AgentID: id,
+		Match:   config.Match{Channel: "dingtalk", AccountID: accountID},
+	}); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	s.invalidateOwner(uid, aid)
+	if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), "dingtalk", credKey); rec != nil {
+		s.hotRegisterChannel(*rec)
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"ok":             true,
+		"accountId":      accountID,
+		"clientId":       clientID,
+		"robotCode":      robotCode,
+		"requireMention": requireMention,
+	})
+}
+
 // --- Feishu / Feishu ---
 
 type connectFeishuRequest struct {
@@ -1168,11 +1257,11 @@ func (s *Server) handleConnectAgentLINE(w http.ResponseWriter, r *http.Request) 
 		s.hotRegisterChannel(*rec)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"botUserId":   userID,
-		"botName":     displayName,
-		"basicId":     basicID,
-		"webhookUrl":  lineWebhookPathFor(r, userID),
+		"ok":         true,
+		"botUserId":  userID,
+		"botName":    displayName,
+		"basicId":    basicID,
+		"webhookUrl": lineWebhookPathFor(r, userID),
 	})
 }
 

@@ -2246,8 +2246,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	finalContent := ""
 	finalResp, finalErr := a.streamChatToResponse(ctx, finalMessages, nil)
 	if finalErr == nil {
-		finalContent = finalResp.Content
 		a.meterTokens(ctx, sess.Key(), finalResp.Usage)
+		a.maybeRecoverToolCalls(finalResp)
+		finalContent = finalResp.Content
 	}
 	if finalContent == "" {
 		// Synthesis call itself failed or returned empty — fall back to
@@ -2769,91 +2770,39 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.InboundMessage, messages []provider.Message, sess *session.Session, toolCallCount int, chatterMem *Memory) *provider.StreamReader {
 	capMeta := iterationCapMetadata(a.maxToolIterations)
 	finalMessages := append(messages, capReachedNudge(a.maxToolIterations))
-	sr, err := a.provider.ChatStream(ctx, finalMessages, nil, a.model, a.maxTokens, a.temperature)
+	resp, err := a.provider.Chat(ctx, finalMessages, nil, a.model, a.maxTokens, a.temperature)
+	content := ""
+	var thinking string
+	var rawAssistant json.RawMessage
 	if err != nil {
-		// Streaming endpoint failed — persist+emit a fallback line
-		// with the badge so the user still gets the signal.
-		fallback := fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
-		fallbackMsg := provider.Message{Role: "assistant", Content: fallback, Metadata: capMeta, Timestamp: time.Now().UnixMilli()}
-		sess.Append(fallbackMsg)
-		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": fallback, "metadata": capMeta}})
-		a.runPostTurn(ctx, inboundMsg, append(messages, fallbackMsg), toolCallCount, chatterMem)
-		return a.stringStream(fallback)
+		slog.Error("LLM final delivery failed", "agent", a.name, "error", err)
+	} else {
+		a.meterTokens(ctx, sess.Key(), resp.Usage)
+		a.maybeRecoverToolCalls(resp)
+		content = resp.Content
+		thinking = resp.Thinking
+		rawAssistant = resp.RawAssistant
 	}
-
-	outCh := make(chan provider.StreamChunk, 64)
-	outReader := provider.NewStreamReader(outCh)
-	go func() {
-		defer close(outCh)
-		var full strings.Builder
-		var thinking, thinkingSig string
-		var rawAssistant json.RawMessage
-		var streamUsage provider.Usage
-		for {
-			chunk, ok := sr.Next()
-			if !ok {
-				break
-			}
-			if chunk.Content != "" {
-				full.WriteString(chunk.Content)
-			}
-			if chunk.Thinking != "" {
-				thinking = chunk.Thinking
-			}
-			if chunk.ThinkingSignature != "" {
-				thinkingSig = chunk.ThinkingSignature
-			}
-			if len(chunk.RawAssistant) > 0 {
-				rawAssistant = chunk.RawAssistant
-			}
-			if chunk.Usage.InputTokens > 0 || chunk.Usage.OutputTokens > 0 ||
-				chunk.Usage.CacheReadTokens > 0 || chunk.Usage.CacheCreationTokens > 0 {
-				streamUsage = chunk.Usage
-			}
-			select {
-			case outCh <- chunk:
-			case <-ctx.Done():
-				return
-			}
-		}
-		a.meterTokens(ctx, sess.Key(), streamUsage)
-		content := full.String()
-		if content == "" {
-			content = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
-		}
-		finalMsg := provider.Message{
-			Role:      "assistant",
-			Content:   content,
-			Thinking:  thinking,
-			Metadata:  capMeta,
-			Timestamp: time.Now().UnixMilli(),
-		}
-		switch {
-		case len(rawAssistant) > 0:
-			finalMsg.RawAssistant = rawAssistant
-		case thinking != "":
-			if raw, err := json.Marshal(map[string]string{
-				"type":      "thinking",
-				"thinking":  thinking,
-				"signature": thinkingSig,
-			}); err == nil {
-				finalMsg.RawAssistant = raw
-			}
-		}
-		sess.Append(finalMsg)
-		// Out-of-band content event so SSE subscribers + chat_events
-		// archive carry the cap-reached flag — chunks themselves don't
-		// have a metadata field, so we publish it once here.
-		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{
-			"content":  "",
-			"metadata": capMeta,
-		}})
-		// Fire PostTurn so AutoPersist (and any future PostTurn hook)
-		// runs on the streaming path too — see the no-tool-calls
-		// branch in HandleMessageStream for the rationale.
-		a.runPostTurn(ctx, inboundMsg, append(messages, finalMsg), toolCallCount, chatterMem)
-	}()
-	return outReader
+	if content == "" {
+		content = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
+	}
+	finalMsg := provider.Message{
+		Role:      "assistant",
+		Content:   content,
+		Thinking:  thinking,
+		Metadata:  capMeta,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if len(rawAssistant) > 0 {
+		finalMsg.RawAssistant = rawAssistant
+	}
+	sess.Append(finalMsg)
+	emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{
+		"content":  content,
+		"metadata": capMeta,
+	}})
+	a.runPostTurn(ctx, inboundMsg, append(messages, finalMsg), toolCallCount, chatterMem)
+	return a.stringStream(content)
 }
 
 // extractToolMeta strips a FC_META prefix (if present) from a tool result and

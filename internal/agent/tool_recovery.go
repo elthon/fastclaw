@@ -31,7 +31,17 @@ import (
 // silently papers over genuine prompt/tool-definition bugs that should
 // surface.
 func (a *Agent) maybeRecoverToolCalls(resp *provider.Response) {
-	if resp == nil || resp.HasToolCalls() || resp.Content == "" {
+	if resp == nil || resp.Content == "" {
+		return
+	}
+	if resp.HasToolCalls() {
+		_, residual := recoverToolCallsFromContent(resp.Content)
+		if residual != resp.Content {
+			slog.Info("scrubbed_leaked_tool_tokens",
+				"agent", a.name, "model", a.model)
+			resp.Content = residual
+			resp.RawAssistant = nil
+		}
 		return
 	}
 	recovered, residual := recoverToolCallsFromContent(resp.Content)
@@ -87,13 +97,13 @@ func recoverToolCallsFromContent(content string) ([]provider.ToolCall, string) {
 	// special-token shape (`<|`, `<｜`, `< | DSML`, etc.) so DeepSeek/
 	// Qwen detokenization garbage gets at least scrubbed even when no
 	// real invoke is present to recover.
-	if !strings.Contains(content, "<invoke") && !tagLeakHintRE.MatchString(content) {
+	if !toolCallTextHintRE.MatchString(content) && !tagLeakHintRE.MatchString(content) {
 		return nil, content
 	}
 	// Collapse leaked-token noise (`<｜tool_calls｜>`, `< | | DSML | |
 	// invoke …>`, closing variants) into plain `<tag …>` shapes the
 	// parser already understands. No-op when the content is clean.
-	normalized := leakedTagRE.ReplaceAllString(content, `<${1}${2}${3}>`)
+	normalized := normalizeLeakedToolTags(content)
 
 	matches := invokeRE.FindAllStringSubmatchIndex(normalized, -1)
 	if len(matches) == 0 {
@@ -151,7 +161,7 @@ func recoverToolCallsFromContent(content string) ([]provider.ToolCall, string) {
 //   - tolerates `<invoke>` with no name attribute by demanding a quote-
 //     delimited name= attribute up front; the parser is recovery-only
 //     and a name-less invoke can't be turned into a tool call anyway.
-var invokeRE = regexp.MustCompile(`(?s)<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>`)
+var invokeRE = regexp.MustCompile(`(?s)<(?:antml:)?invoke\s+name="([^"]+)"\s*>(.*?)</(?:antml:)?invoke>`)
 
 // parameterRE matches `<parameter name="key" string="true|false">VALUE</parameter>`.
 // The `string` attribute is the type hint:
@@ -161,21 +171,28 @@ var invokeRE = regexp.MustCompile(`(?s)<invoke\s+name="([^"]+)"\s*>(.*?)</invoke
 // Absent attribute defaults to treating VALUE as a string — that's the
 // safest interpretation when the model omits the hint, and it's what
 // human-readable XML would imply.
-var parameterRE = regexp.MustCompile(`(?s)<parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</parameter>`)
+var parameterRE = regexp.MustCompile(`(?s)<(?:antml:)?parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</(?:antml:)?parameter>`)
 
 // stripRE finds:
 //   - every invoke block (so we can drop it after a successful parse)
 //   - the optional outer <tool_calls> / <function_calls> / <DSML>
 //     wrappers some models add (open AND close tags), so the residual
 //     content doesn't keep a dangling `</tool_calls>`.
-var stripRE = regexp.MustCompile(`(?s)<invoke\s+name="[^"]+"\s*>.*?</invoke>|</?(?:tool_calls|function_calls|DSML)\s*/?>`)
+var stripRE = regexp.MustCompile(`(?s)<(?:antml:)?invoke\s+name="[^"]+"\s*>.*?</(?:antml:)?invoke>|</?(?:antml:)?(?:tool_calls|function_calls|DSML)\s*/?>`)
 
 // tagLeakHintRE flags content worth running the leaked-token normalizer
 // on. We match either a normal `<invoke` (the original recovery
 // trigger) or the leaked special-token prefix shape (`<|`, `<｜`,
 // `</|`, `< | …`, etc.) so DeepSeek/Qwen detokenization garbage that
 // doesn't contain a recoverable <invoke> still gets scrubbed.
+var toolCallTextHintRE = regexp.MustCompile(`<(?:antml:)?invoke`)
+
 var tagLeakHintRE = regexp.MustCompile(`<invoke|<\s*/?\s*[|｜]`)
+
+func normalizeLeakedToolTags(content string) string {
+	normalized := dsmlPipeTagRE.ReplaceAllString(content, `<${1}${2}${3}>`)
+	return leakedTagRE.ReplaceAllString(normalized, `<${1}${2}${3}>`)
+}
 
 // leakedTagRE collapses leaked tool-call delimiters back into the plain
 // `<tag …>` / `</tag>` shape the recovery parser understands. Some
@@ -195,14 +212,17 @@ var tagLeakHintRE = regexp.MustCompile(`<invoke|<\s*/?\s*[|｜]`)
 // it), so we let either noise group consume it.
 //
 // Captures:
-//   $1 = optional `/` for closing tags
-//   $2 = real tag name (invoke / parameter / tool_calls / function_calls / DSML)
-//   $3 = attributes that follow the tag name (e.g. ` name="exec"`)
+//
+//	$1 = optional `/` for closing tags
+//	$2 = real tag name (invoke / parameter / tool_calls / function_calls / DSML)
+//	$3 = attributes that follow the tag name (e.g. ` name="exec"`)
 //
 // Replacement `<${1}${2}${3}>` reconstructs `<invoke name="exec">` etc.
 // Clean inputs like `<DSML>` / `<invoke name="x">` round-trip unchanged
 // because all the noise groups are zero-width.
-var leakedTagRE = regexp.MustCompile(`<(?:[|｜\s]|DSML)*(/?)(?:[|｜\s]|DSML)*(invoke|parameter|tool_calls|function_calls|DSML)([^>]*?)[|｜\s]*>`)
+var dsmlPipeTagRE = regexp.MustCompile(`(?s)<\s*(/?)\s*[|｜]\s*[|｜]\s*DSML\s*[|｜]\s*[|｜]\s*(invoke|parameter|tool_calls|function_calls)([^>]*?)>`)
+
+var leakedTagRE = regexp.MustCompile(`<(?:[|｜\s])*(/?)(?:[|｜\s])*(invoke|parameter|tool_calls|function_calls|DSML)([^>]*?)[|｜\s]*>`)
 
 // parseInvokeParameters walks the parameters inside one invoke body and
 // returns the assembled arguments map. Unknown/malformed parameters are

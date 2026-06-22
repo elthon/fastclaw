@@ -469,6 +469,18 @@ type ChannelConfig struct {
 
 type AccountConfig struct {
 	BotToken string `json:"botToken,omitempty"`
+	// ClientID/ClientSecret are used by platforms whose app credentials
+	// are not token-shaped (DingTalk stream mode, for example).
+	ClientID     string `json:"clientId,omitempty"`
+	ClientSecret string `json:"clientSecret,omitempty"`
+	// RobotCode is the platform-side bot identifier when it differs
+	// from the app/client id. DingTalk often uses the client id as the
+	// robot code for internal bots, but keeping it explicit avoids
+	// another round of field overloading.
+	RobotCode string `json:"robotCode,omitempty"`
+	// RequireMention gates group-chat delivery for adapters that can
+	// tell whether the bot was @mentioned. Nil means adapter default.
+	RequireMention *bool `json:"requireMention,omitempty"`
 	// BaseURL is the per-account API base used by adapters whose
 	// upstream isn't a fixed hostname (e.g. WeChat iLink hands out a
 	// region-specific baseurl on QR confirmation). Empty for

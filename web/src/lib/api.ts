@@ -1804,6 +1804,28 @@ export async function connectAgentFeishu(
   return res.json();
 }
 
+export async function connectAgentDingTalk(
+  agentId: string,
+  clientId: string,
+  clientSecret: string,
+  robotCode: string,
+  requireMention: boolean,
+): Promise<{
+  ok: boolean;
+  accountId?: string;
+  clientId?: string;
+  robotCode?: string;
+  requireMention?: boolean;
+  error?: string;
+}> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/dingtalk`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clientId, clientSecret, robotCode, requireMention }),
+  });
+  return res.json();
+}
+
 export async function disconnectAgentChannel(
   agentId: string,
   type: string,
