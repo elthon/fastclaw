@@ -1523,6 +1523,146 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{"sessions": ag.WebChatSessions()})
 }
 
+// handleChats returns chat sessions scoped by the caller's API key type:
+//   - admin key: all sessions across all users and agents
+//   - user key:  all sessions for agents owned by the key's user
+//   - agent key: all sessions for agents in the key's ACL
+//
+// Session-based callers (browser) get the same scoping as user keys.
+func (s *Server) handleChats(w http.ResponseWriter, r *http.Request) {
+	if s.dataStore == nil {
+		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "no data store"})
+		return
+	}
+	ident, ok := auth.FromContext(r.Context())
+	if !ok {
+		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+
+	// Pagination: ?page=1&pageSize=30 (1-based, defaults to page 1, 30 per page).
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 30
+	}
+
+	// Resolve which agent IDs the caller may see.
+	var agentIDs []string // nil = all (admin)
+	switch {
+	case ident.AuthMethod == "apikey" && ident.APIKeyType == users.APIKeyTypeAdmin:
+		agentIDs = nil // admin sees everything
+	case ident.AuthMethod == "apikey" && ident.APIKeyType == users.APIKeyTypeAgent:
+		agentIDs = ident.APIKeyAgents
+	default:
+		uid := ident.EffectiveUserID()
+		agents, agentsErr := s.dataStore.ListAgents(r.Context(), uid)
+		if agentsErr != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": agentsErr.Error()})
+			return
+		}
+		agentIDs = make([]string, len(agents))
+		for i, a := range agents {
+			agentIDs[i] = a.ID
+		}
+	}
+
+	offset := (page - 1) * pageSize
+	metas, total, err := s.dataStore.ListSessionsPaginated(r.Context(), agentIDs, offset, pageSize)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	ownerCache := map[string]*users.Account{}
+	resolveOwner := func(uid string) *users.Account {
+		if uid == "" {
+			return nil
+		}
+		if a, ok := ownerCache[uid]; ok {
+			return a
+		}
+		a, _ := s.accounts.Get(r.Context(), uid)
+		ownerCache[uid] = a
+		return a
+	}
+	agentCache := map[string]*store.AgentRecord{}
+	resolveAgentRec := func(agentID string) *store.AgentRecord {
+		if agentID == "" {
+			return nil
+		}
+		if a, ok := agentCache[agentID]; ok {
+			return a
+		}
+		a, _ := s.dataStore.GetAgent(r.Context(), agentID)
+		agentCache[agentID] = a
+		return a
+	}
+
+	out := make([]map[string]any, 0, len(metas))
+	for _, m := range metas {
+		ag := resolveAgentRec(m.AgentID)
+		if ag == nil {
+			continue
+		}
+		// Build preview from first user message.
+		adapter := session.NewStoreAdapter(s.dataStore, m.UserID)
+		ws := adapter.BuildWebSession(r.Context(), m)
+		if ws == nil {
+			continue
+		}
+		owner := resolveOwner(m.UserID)
+		entry := map[string]any{
+			"id":           ws.ID,
+			"agentId":      m.AgentID,
+			"agentName":    ag.Name,
+			"userId":       m.UserID,
+			"channel":      ws.Channel,
+			"accountId":    ws.AccountID,
+			"chatId":       ws.ChatID,
+			"projectId":    ws.ProjectID,
+			"title":        ws.Title,
+			"preview":      ws.Preview,
+			"thumbnailUrl": ws.ThumbnailURL,
+			"createdAt":    ws.CreatedAt,
+			"updatedAt":    ws.UpdatedAt,
+		}
+		if ws.ChatterUserID != "" {
+			entry["chatterUserId"] = ws.ChatterUserID
+			if chatter := resolveOwner(ws.ChatterUserID); chatter != nil {
+				if chatter.ExternalID != "" {
+					entry["chatterExternalId"] = chatter.ExternalID
+				}
+				if chatter.DisplayName != "" {
+					entry["chatterDisplayName"] = chatter.DisplayName
+				}
+			}
+		}
+		if owner != nil {
+			entry["ownerUsername"] = owner.Username
+			entry["ownerEmail"] = owner.Email
+			if owner.ExternalID != "" {
+				entry["ownerExternalId"] = owner.ExternalID
+			}
+			if owner.DisplayName != "" {
+				entry["ownerDisplayName"] = owner.DisplayName
+			}
+		}
+		out = append(out, entry)
+	}
+	totalPages := (total + pageSize - 1) / pageSize
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"sessions":  out,
+		"page":      page,
+		"pageSize":  pageSize,
+		"total":     total,
+		"totalPages": totalPages,
+	})
+}
+
 func (s *Server) handleRenameSession(w http.ResponseWriter, r *http.Request) {
 	// Body-or-query for agentId — the frontend sends it in the JSON body
 	// (see renameChatSession in web/src/lib/api.ts), matching the

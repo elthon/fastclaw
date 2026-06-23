@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
@@ -537,7 +538,17 @@ func (s *Server) handleAdminChats(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "no data store"})
 		return
 	}
-	pairs, err := s.dataStore.ListSessionOwnerPairs(r.Context())
+	// Pagination: ?page=1&pageSize=30 (1-based, defaults to page 1, 30 per page).
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 30
+	}
+	offset := (page - 1) * pageSize
+	metas, total, err := s.dataStore.ListSessionsPaginated(r.Context(), nil, offset, pageSize)
 	if err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -566,47 +577,64 @@ func (s *Server) handleAdminChats(w http.ResponseWriter, r *http.Request) {
 		agentCache[agentID] = a
 		return a
 	}
-	out := make([]map[string]any, 0)
-	for _, p := range pairs {
-		ag := resolveAgent(p.AgentID)
+	out := make([]map[string]any, 0, len(metas))
+	for _, m := range metas {
+		ag := resolveAgent(m.AgentID)
 		if ag == nil {
-			// Orphan session row whose agent has been deleted — skip
-			// rather than surfacing a row with a blank Agent column.
 			continue
 		}
-		adapter := session.NewStoreAdapter(s.dataStore, p.UserID)
-		sessions, err := adapter.ListWebSessions(r.Context(), p.AgentID)
-		if err != nil {
+		adapter := session.NewStoreAdapter(s.dataStore, m.UserID)
+		ws := adapter.BuildWebSession(r.Context(), m)
+		if ws == nil {
 			continue
 		}
-		owner := resolveOwner(p.UserID)
-		for _, ws := range sessions {
-			entry := map[string]any{
-				"id":           ws.ID,
-				"agentId":      p.AgentID,
-				"agentName":    ag.Name,
-				"userId":       p.UserID,
-				"channel":      ws.Channel,
-				"accountId":    ws.AccountID,
-				"chatId":       ws.ChatID,
-				"projectId":    ws.ProjectID,
-				"title":        ws.Title,
-				"preview":      ws.Preview,
-				"thumbnailUrl": ws.ThumbnailURL,
-				"createdAt":    ws.CreatedAt,
-				"updatedAt":    ws.UpdatedAt,
-			}
-			if owner != nil {
-				entry["ownerUsername"] = owner.Username
-				entry["ownerEmail"] = owner.Email
-				if owner.DisplayName != "" {
-					entry["ownerDisplayName"] = owner.DisplayName
+		owner := resolveOwner(m.UserID)
+		entry := map[string]any{
+			"id":           ws.ID,
+			"agentId":      m.AgentID,
+			"agentName":    ag.Name,
+			"userId":       m.UserID,
+			"channel":      ws.Channel,
+			"accountId":    ws.AccountID,
+			"chatId":       ws.ChatID,
+			"projectId":    ws.ProjectID,
+			"title":        ws.Title,
+			"preview":      ws.Preview,
+			"thumbnailUrl": ws.ThumbnailURL,
+			"createdAt":    ws.CreatedAt,
+			"updatedAt":    ws.UpdatedAt,
+		}
+		if ws.ChatterUserID != "" {
+			entry["chatterUserId"] = ws.ChatterUserID
+			if chatter := resolveOwner(ws.ChatterUserID); chatter != nil {
+				if chatter.ExternalID != "" {
+					entry["chatterExternalId"] = chatter.ExternalID
+				}
+				if chatter.DisplayName != "" {
+					entry["chatterDisplayName"] = chatter.DisplayName
 				}
 			}
-			out = append(out, entry)
 		}
+		if owner != nil {
+			entry["ownerUsername"] = owner.Username
+			entry["ownerEmail"] = owner.Email
+			if owner.ExternalID != "" {
+				entry["ownerExternalId"] = owner.ExternalID
+			}
+			if owner.DisplayName != "" {
+				entry["ownerDisplayName"] = owner.DisplayName
+			}
+		}
+		out = append(out, entry)
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"sessions": out})
+	totalPages := (total + pageSize - 1) / pageSize
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"sessions":   out,
+		"page":       page,
+		"pageSize":   pageSize,
+		"total":      total,
+		"totalPages": totalPages,
+	})
 }
 
 // --- Admin provisioning (per-user) ---

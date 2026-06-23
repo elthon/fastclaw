@@ -43,7 +43,8 @@ type EnvSandbox struct {
 }
 
 type EnvLog struct {
-	Level string // FASTCLAW_LOG_LEVEL — "debug" / "info" / "warn" / "error"
+	Level string // FASTCLAW_LOG_LEVEL    — "debug" / "info" / "warn" / "error"
+	Debug bool   // FASTCLAW_DEBUG_MODE   — enable verbose debug output (prompt dump, etc.)
 }
 
 // LoadEnv reads the bootstrap configuration from FASTCLAW_* environment
@@ -106,6 +107,9 @@ func LoadEnv() *EnvConfig {
 	if v := os.Getenv("FASTCLAW_LOG_LEVEL"); v != "" {
 		cfg.Log.Level = v
 	}
+	if v := os.Getenv("FASTCLAW_DEBUG_MODE"); v == "true" || v == "1" {
+		cfg.Log.Debug = true
+	}
 	return cfg
 }
 
@@ -146,6 +150,15 @@ func applyObjectStoreEnv(cfg *Config) {
 		cfg.ObjectStore.AliyunIntern = v == "true" || v == "1"
 	}
 }
+
+// debugMode is read once at package init. All debug-gated output in
+// the codebase checks this via DebugMode().
+var debugMode = os.Getenv("FASTCLAW_DEBUG_MODE") == "true" || os.Getenv("FASTCLAW_DEBUG_MODE") == "1"
+
+// DebugMode returns true when FASTCLAW_DEBUG_MODE=true|1. Use this to
+// gate verbose output (prompt dumps, request traces, etc.) that is
+// useful during development but noisy in production.
+func DebugMode() bool { return debugMode }
 
 // ScrubBootSecrets removes credential-bearing env vars from the
 // process environment AFTER bootstrap config has been read. Call once

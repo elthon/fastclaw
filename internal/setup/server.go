@@ -16,6 +16,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/session"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/taskqueue"
@@ -84,7 +85,17 @@ type Server struct {
 	chatEvents *agent.EventHub
 	usage      usage.Meter
 	startedAt  time.Time
+	// runtimeMgr powers the coding-agent project runtime (live dev server
+	// + preview). Optional: nil when the deployment hasn't wired a
+	// sandbox-backed runtime, in which case the /runtime endpoints return
+	// 503 instead of nil-panicking. Set via SetRuntimeManager at boot.
+	runtimeMgr *runtime.Manager
 }
+
+// SetRuntimeManager wires the project runtime manager. Call once at boot
+// after constructing the Server; leaving it unset disables the coding-
+// agent preview endpoints (they 503).
+func (s *Server) SetRuntimeManager(m *runtime.Manager) { s.runtimeMgr = m }
 
 // NewServer creates a setup wizard server on the given port.
 func NewServer(port int) *Server {
@@ -235,6 +246,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/chat", auth(s.handleChat))
 	mux.HandleFunc("POST /api/chat/stream", auth(s.handleChatStream))
 	mux.HandleFunc("POST /api/chat/steer", auth(s.handleChatSteer))
+	mux.HandleFunc("GET /api/chats", auth(s.handleChats))
 	mux.HandleFunc("GET /api/chat/history", auth(s.handleChatHistory))
 	mux.HandleFunc("GET /api/chat/todo", auth(s.handleChatTodo))
 	mux.HandleFunc("GET /api/chat/sessions", auth(s.handleChatSessions))
@@ -278,6 +290,27 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("PATCH /api/agents/{id}/projects/{pid}", auth(s.handleUpdateProject))
 	mux.HandleFunc("DELETE /api/agents/{id}/projects/{pid}", auth(s.handleDeleteProject))
 
+	// Project runtime: the coding-agent "live app" layer on top of a
+	// project — a long-lived dev-server sandbox + preview URL. The
+	// upstream SaaS shell drives a project entirely through these.
+	mux.HandleFunc("GET /api/agents/{id}/projects/{pid}/runtime", auth(s.handleGetRuntime))
+	mux.HandleFunc("POST /api/agents/{id}/projects/{pid}/runtime/up", auth(s.handleRuntimeUp))
+	mux.HandleFunc("POST /api/agents/{id}/projects/{pid}/runtime/sleep", auth(s.handleRuntimeSleep))
+	mux.HandleFunc("POST /api/agents/{id}/projects/{pid}/runtime/wake", auth(s.handleRuntimeWake))
+	mux.HandleFunc("DELETE /api/agents/{id}/projects/{pid}/runtime", auth(s.handleRuntimeStop))
+	mux.HandleFunc("GET /api/agents/{id}/projects/{pid}/preview", auth(s.handleRuntimePreview))
+	// Scope-flexible preview lookup (sessionId or projectId query param) —
+	// lets the chat workspace panel surface an "open preview" entry for the
+	// current chat, including loose chats that have no project.
+	mux.HandleFunc("GET /api/agents/{id}/preview", auth(s.handleScopePreview))
+	// Scope-flexible build/dev log tail — the preview panel polls this while
+	// the app scaffolds so the user sees the live pnpm-install output.
+	mux.HandleFunc("GET /api/agents/{id}/preview/logs", auth(s.handleScopePreviewLogs))
+	// Files the agent changed vs the template baseline (git diff in the
+	// running app) — lets the workspace tree show only this task's output.
+	mux.HandleFunc("GET /api/agents/{id}/changed-files", auth(s.handleChangedFiles))
+	mux.HandleFunc("GET /api/agents/{id}/projects/{pid}/runtime/logs", auth(s.handleRuntimeLogs))
+
 	// Per-agent channels (IM bot bindings)
 	mux.HandleFunc("GET /api/agents/{id}/channels", auth(s.handleListAgentChannels))
 	mux.HandleFunc("POST /api/agents/{id}/channels/telegram", auth(s.handleConnectAgentTelegram))
@@ -289,6 +322,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/agents/{id}/channels/feishu", auth(s.handleConnectAgentFeishu))
 	mux.HandleFunc("POST /api/agents/{id}/channels/dingtalk", auth(s.handleConnectAgentDingTalk))
 	mux.HandleFunc("DELETE /api/agents/{id}/channels/{type}/{accountId}", auth(s.handleDisconnectAgentChannel))
+	mux.HandleFunc("PATCH /api/agents/{id}/channels/{type}/{accountId}", auth(s.handleUpdateAgentChannel))
 
 	// Feishu (飞书) event webhook. UNAUTHENTICATED — Feishu posts here
 	// without a fastclaw bearer token. Per-event security comes from
