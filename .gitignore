@@ -55,6 +55,10 @@ tmp/
 # Deploy instance data (tokens, passwords, local state)
 deploy/docker/instances/
 deploy/docker/.env
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
 deploy/docker/.state/
 deploy/docker/.fastclaw/
 

@@ -35,6 +35,8 @@ func NewManager(servers map[string]config.MCPServerConfig) *Manager {
 		switch cfg.Type {
 		case "http":
 			client = NewHTTPClient(cfg.URL, cfg.Headers)
+		case "sse":
+			client = NewSSEClient(cfg.URL, cfg.Headers)
 		case "stdio":
 			client = NewStdioClient(cfg.Command, cfg.Args, cfg.Env)
 		default:

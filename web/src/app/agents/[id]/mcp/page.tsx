@@ -261,7 +261,7 @@ function MCPEditDialog({
   onSave: (entry: MCPEntry) => Promise<void>;
 }) {
   const [name, setName] = useState("");
-  const [type, setType] = useState<"http" | "stdio">("stdio");
+  const [type, setType] = useState<"http" | "sse" | "stdio">("stdio");
   const [url, setUrl] = useState("");
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
@@ -308,9 +308,9 @@ function MCPEditDialog({
     }
 
     const entry: MCPEntry = { name: trimName, type };
-    if (type === "http") {
+    if (type === "http" || type === "sse") {
       if (!url.trim()) {
-        setError("URL is required for HTTP type");
+        setError(`URL is required for ${type.toUpperCase()} type`);
         return;
       }
       entry.url = url.trim();
@@ -356,23 +356,24 @@ function MCPEditDialog({
 
           <div className="space-y-1.5">
             <Label>Type</Label>
-            <Select value={type} onValueChange={(v) => setType(v as "http" | "stdio")}>
+            <Select value={type} onValueChange={(v) => setType(v as "http" | "sse" | "stdio")}>
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="stdio">stdio</SelectItem>
                 <SelectItem value="http">http</SelectItem>
+                <SelectItem value="sse">sse</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
-          {type === "http" ? (
+          {type === "http" || type === "sse" ? (
             <>
               <div className="space-y-1.5">
                 <Label>URL</Label>
                 <Input
-                  placeholder="https://example.com/mcp"
+                  placeholder={type === "sse" ? "https://example.com/sse" : "https://example.com/mcp"}
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                 />

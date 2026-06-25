@@ -1399,7 +1399,7 @@ export async function listHookPlugins(): Promise<HookPlugin[]> {
 }
 
 export interface MCPServerConfig {
-  type: "http" | "stdio";
+  type: "http" | "sse" | "stdio";
   url?: string;
   headers?: Record<string, string>;
   command?: string;
