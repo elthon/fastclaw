@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -166,14 +167,14 @@ func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 // bindSession wires per-turn session state into the tool registry: the
 // session-scoped sandbox executor (when a pool is configured), the
 // sessionID workspace.Store calls use to namespace artifacts, and the
-// (channel, chatID) bus address so deferred-work tools (create_cron_job)
+// (channel, accountID, chatID) bus address so deferred-work tools (create_cron_job)
 // can stamp it onto persisted rows for later replay. Called at the top
 // of HandleMessage / HandleMessageStream before any tool runs.
 //
 // Mutating the shared registry across concurrent chats would race, but
 // the current invariant is one chat-in-flight per agent — the gateway
 // serializes per-agent turns. Documenting it here in case that changes.
-func (a *Agent) bindSession(ctx context.Context, channel, sessionID, projectID string) {
+func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, projectID string) {
 	a.registry.SetSessionID(sessionID)
 	a.registry.SetProjectID(projectID)
 	// Coding agents (those with a project runtime wired) treat a project
@@ -194,7 +195,7 @@ func (a *Agent) bindSession(ctx context.Context, channel, sessionID, projectID s
 			}
 		}
 	}
-	a.registry.SetMessageContext(channel, sessionID)
+	a.registry.SetMessageContext(channel, accountID, sessionID)
 	if a.sandboxPool == nil {
 		return
 	}
@@ -719,6 +720,14 @@ func (a *Agent) meterTokens(ctx context.Context, sessionKey string, u provider.U
 // HandleMessage path. Providers that don't actually stream still work
 // — they just deliver one big chunk on Done.
 func (a *Agent) streamChatToResponse(ctx context.Context, messages []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+	return a.streamChatToResponseWithOptions(ctx, messages, tools, true)
+}
+
+func (a *Agent) streamChatToResponseQuiet(ctx context.Context, messages []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+	return a.streamChatToResponseWithOptions(ctx, messages, tools, false)
+}
+
+func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []provider.Message, tools []provider.Tool, emitDeltas bool) (*provider.Response, error) {
 	sr, err := a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
 	if err != nil {
 		return nil, err
@@ -738,15 +747,17 @@ func (a *Agent) streamChatToResponse(ctx context.Context, messages []provider.Me
 		}
 		if chunk.Content != "" {
 			contentBuilder.WriteString(chunk.Content)
-			// Push the incremental delta. The web chat panel
-			// appends it to the bubble in progress; consumers
-			// that only know about the legacy `content` event
-			// ignore unknown types and rely on the final
-			// emit (caller's responsibility) instead.
-			emitEvent(ctx, ChatEvent{
-				Type: "content_delta",
-				Data: map[string]any{"delta": chunk.Content},
-			})
+			if emitDeltas {
+				// Push the incremental delta. The web chat panel
+				// appends it to the bubble in progress; consumers
+				// that only know about the legacy `content` event
+				// ignore unknown types and rely on the final
+				// emit (caller's responsibility) instead.
+				emitEvent(ctx, ChatEvent{
+					Type: "content_delta",
+					Data: map[string]any{"delta": chunk.Content},
+				})
+			}
 		}
 		if chunk.Done {
 			toolCalls = chunk.ToolCalls
@@ -1766,6 +1777,50 @@ func (a *Agent) flushLeftoverSteer(sess *session.Session) {
 	}
 }
 
+// llmRetry wraps an LLM call with retry logic for transient errors (network
+// glitches, server 5xx, EOF). Context cancellation / deadline exceeded are
+// treated as terminal — there's no point retrying when the caller has gone
+// away or the deadline has passed. Uses exponential backoff (1s, 4s, 9s)
+// across up to wechatLLMRetryAttempts calls.
+//
+// The label argument is used for structured logging (typically a.name).
+const llmRetryAttempts = 3
+
+func llmRetry(ctx context.Context, label string, fn func(context.Context) (*provider.Response, error)) (*provider.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= llmRetryAttempts; attempt++ {
+		resp, err := fn(ctx)
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("LLM call succeeded after retries",
+					"agent", label, "attempts", attempt)
+			}
+			return resp, nil
+		}
+		lastErr = err
+
+		// Context errors are terminal — don't retry.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+
+		if attempt < llmRetryAttempts {
+			backoff := time.Duration(attempt*attempt) * time.Second // 1s, 4s, 9s
+			slog.Warn("LLM call failed, retrying",
+				"agent", label, "attempt", attempt,
+				"max", llmRetryAttempts, "backoff", backoff, "error", err)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, errors.Join(lastErr, ctx.Err())
+			}
+		}
+	}
+	slog.Error("LLM call failed after all retries",
+		"agent", label, "attempts", llmRetryAttempts, "error", lastErr)
+	return nil, lastErr
+}
+
 // HandleMessage processes an inbound message through the ReAct loop.
 func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) string {
 	// Check for slash commands first. Empty reply means "handled but
@@ -1859,7 +1914,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// + writes get session-scoped paths and (when a sandbox pool is
 	// wired) the executor used by exec/read_file/list_dir is tied to a
 	// session-private container.
-	a.bindSession(ctx, msg.Channel, msg.ChatID, msg.ProjectID)
+	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
 	// Flag whether this turn's chatter is the agent owner / channel
 	// admin. File tools use this to refuse identity-file reads from
 	// regular chatters (SOUL/IDENTITY/BOOTSTRAP/... leak as verbatim
@@ -2029,14 +2084,16 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			})
 		}
 		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
-		resp, err := a.streamChatToResponse(ctx, llmMessages, callTools)
+		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+			return a.streamChatToResponse(ctx, llmMessages, callTools)
+		})
 
 		// Hook: AfterModelCall
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
-			slog.Error("LLM chat failed", "agent", a.name, "error", err)
+			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			return "Sorry, I encountered an error processing your request."
@@ -2045,6 +2102,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
+			if strings.TrimSpace(resp.Content) == "" {
+				emptyMsg := "model returned an empty response"
+				emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": emptyMsg}})
+				emitEvent(ctx, ChatEvent{Type: "done"})
+				return emptyMsg
+			}
 			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
 			sess.Append(asst)
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
@@ -2319,11 +2382,11 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		finalMessages = privacy.ScrubMessages(finalMessages)
 	}
 	finalContent := ""
-	finalResp, finalErr := a.streamChatToResponse(ctx, finalMessages, nil)
+	finalResp, finalErr := a.streamChatToResponseQuiet(ctx, finalMessages, nil)
 	if finalErr == nil {
+		finalContent = scrubLeakedToolCallContent(finalResp.Content)
 		a.meterTokens(ctx, sess.Key(), finalResp.Usage, 0)
 		a.maybeRecoverToolCalls(finalResp)
-		finalContent = finalResp.Content
 	}
 	if finalContent == "" {
 		// Synthesis call itself failed or returned empty — fall back to
@@ -2606,7 +2669,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		prov, mdl := provider.SplitProviderModel(a.model)
 		sess.SetProviderModel(prov, mdl)
 	}
-	a.bindSession(ctx, msg.Channel, msg.ChatID, msg.ProjectID)
+	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
 	a.registry.SetCallerIsAdmin(a.isAdminChatter(msg))
 	a.registry.SetGoalSessionKey(sess.SessionKey())
 	// Per-user file writes (USER.md / MEMORY.md) need to land in the
@@ -2678,13 +2741,15 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		a.hooks.Run(ctx, hcBefore)
 
 		dumpLLMRequest(a.name, a.model, messages, toolDefs)
-		resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+			return a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+		})
 
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
-			slog.Error("LLM chat failed", "agent", a.name, "error", err)
+			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			return a.stringStream("Sorry, I encountered an error processing your request.")
 		}
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)

@@ -182,7 +182,7 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 //
 // Empty default + partial indexes preserve existing query plans for
 // rows written before this column existed. Readers that want the
-// chatter should COALESCE(NULLIF(chatter_user_id,''), user_id) — the
+// chatter should COALESCE(NULLIF(chatter_user_id,”), user_id) — the
 // fallback is exactly right for the web channel (user_id was already
 // the chatter there) and matches the pre-fix behavior on IM (where
 // every chatter was mis-attributed to the channel owner anyway).
@@ -222,7 +222,7 @@ func (d *DBStore) migrateSessionsAddChatterUserID(ctx context.Context) error {
 }
 
 // migrateAgentGoalsAddRouting retrofits channel/account_id/chat_id/
-// project_id onto legacy agent_goals tables. All four default to ''
+// project_id onto legacy agent_goals tables. All four default to ”
 // — pre-existing rows had no continuation infrastructure attached
 // anyway, so the empty value just means "no routing recorded; can't
 // auto-continue this goal" and TryFireContinuation bails safely.
@@ -523,7 +523,7 @@ func (d *DBStore) migrateConfigsAddScopeColumn(ctx context.Context) error {
 // (user_id, agent_id) into a single lookup key: whichever is non-empty
 // wins (they're mutually exclusive for provider/setting rows — the only
 // kinds that remain in configs now that channels have their own table).
-// System rows get scope_id=''.
+// System rows get scope_id=”.
 //
 // Idempotent: skips the ALTER if the column already exists and only
 // backfills rows where scope_id is still empty.
@@ -1441,6 +1441,17 @@ func (d *DBStore) migrationSQL() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions (user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions (expires_at)`,
+		`CREATE TABLE IF NOT EXISTS push_devices (
+			user_id TEXT NOT NULL,
+			token TEXT NOT NULL,
+			platform TEXT NOT NULL DEFAULT 'ios',
+			environment TEXT NOT NULL DEFAULT '',
+			bundle_id TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (user_id, token)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices (user_id)`,
 		// type values: "admin" | "user" | "agent". The default 'agent'
 		// preserves the pre-tier behavior on existing rows — every legacy
 		// key was implicitly an "agent-scoped" key (explicit list in
@@ -2002,7 +2013,8 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM configs WHERE agent_id = %s", d.ph(1)), aid); err != nil {
+			fmt.Sprintf("DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s", d.ph(1), d.ph(2)),
+			aid, "%/"+aid); err != nil {
 			return err
 		}
 	}
@@ -2074,6 +2086,64 @@ func (d *DBStore) DeleteExpiredWebSessions(ctx context.Context, before time.Time
 	_, err := d.db.ExecContext(ctx,
 		fmt.Sprintf(`DELETE FROM web_sessions WHERE expires_at < %s`, d.ph(1)), before)
 	return err
+}
+
+// --- Mobile push devices ---
+
+func (d *DBStore) SavePushDevice(ctx context.Context, dev *PushDeviceRecord) error {
+	if dev == nil {
+		return errors.New("store: push device is nil")
+	}
+	if dev.UserID == "" || dev.Token == "" {
+		return errors.New("store: push device requires user_id and token")
+	}
+	now := time.Now().UTC()
+	if dev.CreatedAt.IsZero() {
+		dev.CreatedAt = now
+	}
+	dev.UpdatedAt = now
+	if d.dialect == "postgres" {
+		_, err := d.db.ExecContext(ctx,
+			`INSERT INTO push_devices (user_id, token, platform, environment, bundle_id, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 ON CONFLICT (user_id, token) DO UPDATE SET
+			   platform=$3, environment=$4, bundle_id=$5, updated_at=$7`,
+			dev.UserID, dev.Token, dev.Platform, dev.Environment, dev.BundleID, dev.CreatedAt, dev.UpdatedAt)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO push_devices (user_id, token, platform, environment, bundle_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (user_id, token) DO UPDATE SET
+		   platform=excluded.platform, environment=excluded.environment, bundle_id=excluded.bundle_id, updated_at=excluded.updated_at`,
+		dev.UserID, dev.Token, dev.Platform, dev.Environment, dev.BundleID, dev.CreatedAt, dev.UpdatedAt)
+	return err
+}
+
+func (d *DBStore) DeletePushDevice(ctx context.Context, userID, token string) error {
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM push_devices WHERE user_id = %s AND token = %s`, d.ph(1), d.ph(2)),
+		userID, token)
+	return err
+}
+
+func (d *DBStore) ListPushDevices(ctx context.Context, userID string) ([]PushDeviceRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT user_id, token, platform, environment, bundle_id, created_at, updated_at FROM push_devices WHERE user_id = %s ORDER BY updated_at DESC`, d.ph(1)),
+		userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]PushDeviceRecord, 0)
+	for rows.Next() {
+		var dev PushDeviceRecord
+		if err := rows.Scan(&dev.UserID, &dev.Token, &dev.Platform, &dev.Environment, &dev.BundleID, &dev.CreatedAt, &dev.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, dev)
+	}
+	return out, rows.Err()
 }
 
 // --- API keys ---
@@ -2221,6 +2291,16 @@ func (d *DBStore) ListAgents(ctx context.Context, ownerUserID string) ([]AgentRe
 	return scanAgents(rows)
 }
 
+func (d *DBStore) ListPublicAgents(ctx context.Context) ([]AgentRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+agentSelectCols+` FROM agents WHERE is_public = TRUE ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAgents(rows)
+}
+
 func (d *DBStore) GetAgent(ctx context.Context, agentID string) (*AgentRecord, error) {
 	row := d.db.QueryRowContext(ctx,
 		fmt.Sprintf(`SELECT `+agentSelectCols+` FROM agents WHERE id = %s`, d.ph(1)), agentID)
@@ -2272,7 +2352,16 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, t := range []string{"agent_files", "sessions", "session_messages", "session_events", "cron_jobs"} {
+	for _, t := range []string{
+		"agent_files",
+		"sessions",
+		"session_messages",
+		"session_events",
+		"cron_jobs",
+		"projects",
+		"project_runtimes",
+		"agent_goals",
+	} {
 		if _, err := tx.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE agent_id = %s`, t, d.ph(1)), agentID); err != nil {
 			return err
@@ -2282,12 +2371,11 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 		fmt.Sprintf(`DELETE FROM apikey_agents WHERE agent_id = %s`, d.ph(1)), agentID); err != nil {
 		return err
 	}
-	// Drop every config row pointing at this agent — owner's official
-	// rows (user_id='', agent_id=X), agent owner's per-agent overrides
-	// (user_id=owner, agent_id=X), and any non-owner per-agent
-	// overrides (user_id=other, agent_id=X).
+	// Drop every config row pointing at this agent — official agent rows
+	// (scope_id=X) and per-user agent overrides (scope_id=user/X).
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM configs WHERE agent_id = %s`, d.ph(1)), agentID); err != nil {
+		fmt.Sprintf(`DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s`, d.ph(1), d.ph(2)),
+		agentID, "%/"+agentID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -2411,8 +2499,10 @@ func (d *DBStore) ListSessions(ctx context.Context, userID, agentID string) ([]S
 	// channel binding in the web dashboard sidebar.
 	rows, err := d.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT session_key, user_id, channel, account_id, chat_id, project_id, title, message_count, updated_at, COALESCE(chatter_user_id,'') FROM sessions
-			WHERE agent_id = %s AND user_id IN (
-				SELECT id FROM users WHERE id = %s OR owner_user_id = %s
+			WHERE agent_id = %s AND (
+				user_id = %s OR user_id IN (
+					SELECT id FROM users WHERE owner_user_id = %s
+				)
 			) ORDER BY updated_at DESC`, d.ph(1), d.ph(2), d.ph(3)),
 		agentID, userID, userID)
 	if err != nil {
@@ -2818,7 +2908,7 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 //
 // Filter is strictly on chatter_user_id (no fallback to user_id). Old
 // rows written before the chatter_user_id column existed have it set
-// to '' and are not counted; those predate per-chatter resolution and
+// to ” and are not counted; those predate per-chatter resolution and
 // folding them in would over-count (they're keyed by channel owner,
 // not the actual chatter). New conversations write chatter_user_id
 // correctly so this is only a concern for sessions migrated from
@@ -3385,9 +3475,9 @@ func (d *DBStore) migrateChannelsFromConfigs(ctx context.Context) error {
 		// Each config row may have multiple accounts in its data JSON.
 		// Extract them and create one channel row per account.
 		var cc struct {
-			BotToken string                       `json:"botToken"`
-			BaseURL  string                       `json:"baseUrl"`
-			Accounts map[string]json.RawMessage   `json:"accounts"`
+			BotToken string                     `json:"botToken"`
+			BaseURL  string                     `json:"baseUrl"`
+			Accounts map[string]json.RawMessage `json:"accounts"`
 		}
 		if blob, merr := json.Marshal(cfg.Data); merr == nil {
 			_ = json.Unmarshal(blob, &cc)

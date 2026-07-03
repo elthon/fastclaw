@@ -168,6 +168,12 @@ type TaskQueueCfg struct {
 	TaskTimeoutSec int `json:"taskTimeoutSec,omitempty"`
 }
 
+// PrefsCfg holds runtime preferences that can be set at system, user, or
+// agent scope. Timezone is an IANA name such as "Asia/Shanghai".
+type PrefsCfg struct {
+	Timezone string `json:"timezone,omitempty"`
+}
+
 // SandboxCfg holds sandbox configuration for an agent.
 //
 // Image is the legacy single-slot image/template/snapshot — read-only
@@ -295,6 +301,7 @@ type Config struct {
 	Memory        MemoryCfg                  `json:"memory,omitempty"`
 	Privacy       PrivacyCfg                 `json:"privacy,omitempty"`
 	SkillsLearner SkillsLearnerCfg           `json:"skillsLearner,omitempty"`
+	Prefs         PrefsCfg                   `json:"prefs,omitempty"`
 }
 
 // ModelCost holds pricing info for a model.

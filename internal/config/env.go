@@ -17,6 +17,7 @@ type EnvConfig struct {
 	Gateway EnvGateway
 	Storage EnvStorage
 	Sandbox EnvSandbox
+	Redis   EnvRedis
 	Log     EnvLog
 }
 
@@ -29,6 +30,15 @@ type EnvStorage struct {
 	Type        string // FASTCLAW_STORAGE_TYPE  — "sqlite" (default) or "postgres"
 	DSN         string // FASTCLAW_STORAGE_DSN   — empty = sqlite at $FASTCLAW_HOME/fastclaw.db
 	AutoMigrate bool   // FASTCLAW_STORAGE_AUTO_MIGRATE — default true
+}
+
+type EnvRedis struct {
+	Enabled  bool   // FASTCLAW_REDIS_ENABLED — enable Redis-backed bus + leases
+	Addr     string // FASTCLAW_REDIS_ADDR    — host:port, e.g. redis:6379
+	Username string // FASTCLAW_REDIS_USERNAME
+	Password string // FASTCLAW_REDIS_PASSWORD
+	DB       int    // FASTCLAW_REDIS_DB
+	Prefix   string // FASTCLAW_REDIS_PREFIX  — key prefix, default "fastclaw"
 }
 
 type EnvSandbox struct {
@@ -74,6 +84,28 @@ func LoadEnv() *EnvConfig {
 	}
 	if v := os.Getenv("FASTCLAW_STORAGE_AUTO_MIGRATE"); v != "" {
 		cfg.Storage.AutoMigrate = v == "true" || v == "1"
+	}
+
+	if v := os.Getenv("FASTCLAW_REDIS_ENABLED"); v != "" {
+		cfg.Redis.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("FASTCLAW_REDIS_ADDR"); v != "" {
+		cfg.Redis.Addr = v
+		cfg.Redis.Enabled = true
+	}
+	if v := os.Getenv("FASTCLAW_REDIS_USERNAME"); v != "" {
+		cfg.Redis.Username = v
+	}
+	if v := os.Getenv("FASTCLAW_REDIS_PASSWORD"); v != "" {
+		cfg.Redis.Password = v
+	}
+	if v := os.Getenv("FASTCLAW_REDIS_DB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Redis.DB = n
+		}
+	}
+	if v := os.Getenv("FASTCLAW_REDIS_PREFIX"); v != "" {
+		cfg.Redis.Prefix = v
 	}
 
 	if v := os.Getenv("FASTCLAW_SANDBOX_ENABLED"); v != "" {
@@ -190,6 +222,7 @@ func ScrubBootSecrets() {
 		"FASTCLAW_OBJECT_STORE_ENDPOINT",
 		"FASTCLAW_OBJECT_STORE_USESSL",
 		"FASTCLAW_OBJECT_STORE_ALIYUN_INTERNAL",
+		"FASTCLAW_REDIS_PASSWORD",
 		"BOXLITE_API_KEY",
 		"E2B_API_KEY",
 	}

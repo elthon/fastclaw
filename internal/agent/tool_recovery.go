@@ -66,6 +66,19 @@ func (a *Agent) maybeRecoverToolCalls(resp *provider.Response) {
 	resp.RawAssistant = nil
 }
 
+// scrubLeakedToolCallContent removes visible DSML / tool-call markup from
+// assistant text that is going to be shown directly to the user. It is used
+// on terminal synthesis paths where we do NOT want to execute any newly
+// recovered calls (for example after the iteration cap has already been hit),
+// but we still must not render raw `< | | DSML | | invoke ...>` garbage.
+func scrubLeakedToolCallContent(content string) string {
+	recovered, residual := recoverToolCallsFromContent(content)
+	if len(recovered) > 0 || residual != content {
+		return strings.TrimSpace(residual)
+	}
+	return content
+}
+
 // recoverToolCallsFromContent parses tool-call attempts that some open-
 // source models (DeepSeek, Qwen variants) emit as XML in the assistant
 // `content` field instead of using the OpenAI Chat Completions

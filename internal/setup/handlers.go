@@ -52,6 +52,9 @@ func (s *Server) loadUserConfig(r *http.Request) (*config.Config, error) {
 			return nil, err
 		}
 	}
+	if err := scope.SettingInto(r.Context(), s.dataStore, scope.PrefsNamespace, uid, "", &cfg.Prefs); err != nil {
+		return nil, err
+	}
 	if provs, err := scope.Providers(r.Context(), s.dataStore, uid, ""); err == nil {
 		for k, v := range provs {
 			cfg.Providers[k] = v
@@ -506,6 +509,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if s.dataStore != nil {
 		_ = scope.SettingInto(r.Context(), s.dataStore, "agents.defaults", "", "", &sysDefaults)
 	}
+	serverTimezone := time.Local.String()
 	// Marshal-then-extend keeps the response shape compatible (existing
 	// callers ignore the extra `meta` key) without forcing a refactor of
 	// config.Config to carry presentation metadata.
@@ -514,6 +518,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(blob, &out)
 	out["meta"] = map[string]any{
 		"systemDefaultModel": sysDefaults.Model,
+		"serverTimezone":     serverTimezone,
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
@@ -533,6 +538,23 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
+	}
+	var raw struct {
+		Prefs   *config.PrefsCfg `json:"prefs"`
+		Sandbox *json.RawMessage `json:"sandbox"`
+		Skills  *struct {
+			AgentEntries map[string]map[string]config.SkillEntryCfg `json:"agentEntries"`
+		} `json:"skills"`
+	}
+	_ = json.Unmarshal(buf, &raw)
+	if raw.Prefs != nil {
+		raw.Prefs.Timezone = strings.TrimSpace(raw.Prefs.Timezone)
+		if raw.Prefs.Timezone != "" {
+			if _, err := time.LoadLocation(raw.Prefs.Timezone); err != nil {
+				jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid timezone: use an IANA name like Asia/Shanghai"})
+				return
+			}
+		}
 	}
 	merged, err := s.loadUserConfig(r)
 	if err != nil {
@@ -556,12 +578,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// name=skills.entries). Pull from the raw body — not from the
 	// merged Config — so we only touch agents the caller actually
 	// patched, and don't echo every existing override back as a write.
-	var raw struct {
-		Skills *struct {
-			AgentEntries map[string]map[string]config.SkillEntryCfg `json:"agentEntries"`
-		} `json:"skills"`
+	if raw.Prefs != nil {
+		sc, scopeID := s.scopeForSave(r)
+		uid, aid := scope.OwnershipFromScope(sc, scopeID)
+		data := map[string]interface{}{}
+		if raw.Prefs.Timezone != "" {
+			data["timezone"] = raw.Prefs.Timezone
+		}
+		if err := scope.SaveSetting(r.Context(), s.dataStore, uid, aid, scope.PrefsNamespace, data); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 	}
-	_ = json.Unmarshal(buf, &raw)
 	if raw.Skills != nil && raw.Skills.AgentEntries != nil {
 		for agentID, entries := range raw.Skills.AgentEntries {
 			rec, err := s.dataStore.GetAgent(r.Context(), agentID)
@@ -583,8 +611,25 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// agent loaded before the change keeps seeing the stale model and
 	// surfaces "no usable LLM provider" in chat.
 	sc, scopeID := s.scopeForSave(r)
+	if sc == scope.System && raw.Sandbox != nil {
+		if err := s.reloadSystemSandbox(); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+	}
 	s.invalidateScope(sc, scopeID)
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) reloadSystemSandbox() error {
+	type sandboxReloader interface{ ReloadSandbox() error }
+	if s.userResolver == nil {
+		return nil
+	}
+	if r, ok := s.userResolver.(sandboxReloader); ok {
+		return r.ReloadSandbox()
+	}
+	return nil
 }
 
 // scopeForSave mirrors the scope-resolution logic in saveUserConfig so
@@ -1081,6 +1126,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	defer keepalive.Stop()
 
 	clientGone := r.Context().Done()
+	forwardedAny := false
 	// turnPending flips on when the slash handler reports it queued a
 	// continuation via bus.Inbound (`turn_pending` event). The POST
 	// goroutine's HandleMessage has already returned, but the real
@@ -1117,9 +1163,12 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 					if env.Event.Type == "done" {
+						forwardEvent(w, flusher, env)
+						forwardedAny = true
 						return
 					}
 					forwardEvent(w, flusher, env)
+					forwardedAny = true
 				default:
 					break drain
 				}
@@ -1131,6 +1180,12 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				// (15-min timeout) is the upper bound if it never lands.
 				agentDone = nil
 				continue
+			}
+			if !forwardedAny {
+				forwardSyntheticEvent(w, flusher, agent.ChatEvent{
+					Type: "error",
+					Data: map[string]any{"message": "agent finished without emitting a response"},
+				})
 			}
 			return
 		case <-agentCtx.Done():
@@ -1150,6 +1205,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			forwardEvent(w, flusher, env)
+			forwardedAny = true
 			if env.Event.Type == "done" {
 				return
 			}
@@ -1176,6 +1232,10 @@ func forwardEvent(w http.ResponseWriter, flusher http.Flusher, env agent.EventEn
 	}
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
+}
+
+func forwardSyntheticEvent(w http.ResponseWriter, flusher http.Flusher, evt agent.ChatEvent) {
+	forwardEvent(w, flusher, agent.EventEnvelope{Seq: -1, Event: evt})
 }
 
 // handleChatSubscribe holds an SSE connection open for one (agent,
@@ -1655,10 +1715,10 @@ func (s *Server) handleChats(w http.ResponseWriter, r *http.Request) {
 	}
 	totalPages := (total + pageSize - 1) / pageSize
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"sessions":  out,
-		"page":      page,
-		"pageSize":  pageSize,
-		"total":     total,
+		"sessions":   out,
+		"page":       page,
+		"pageSize":   pageSize,
+		"total":      total,
 		"totalPages": totalPages,
 	})
 }
