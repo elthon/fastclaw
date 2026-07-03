@@ -55,8 +55,66 @@ func registerChannelInstance(rec store.ConfigRecord, mb *bus.MessageBus, chanMgr
 		return registerWeChatChannels(rec, cc, mb, chanMgr, st, hot)
 	case "feishu":
 		return registerFeishuChannels(cc, mb, chanMgr, hot)
+	case "dingtalk":
+		return registerDingTalkChannels(cc, mb, chanMgr, hot)
 	}
 	return nil
+}
+
+// registerChannelFromRecord starts a channel adapter from a ChannelRecord.
+// This is the new-table equivalent of registerChannelInstance.
+func registerChannelFromRecord(rec store.ChannelRecord, mb *bus.MessageBus, chanMgr *channels.Manager, st store.Store, hot bool) error {
+	cc := decodeChannelFromRecord(rec)
+	switch rec.Type {
+	case "telegram":
+		return registerTelegramChannels(cc, mb, chanMgr, hot)
+	case "discord":
+		return registerDiscordChannels(cc, mb, chanMgr, hot)
+	case "slack":
+		return registerSlackChannels(cc, mb, chanMgr, hot)
+	case "line":
+		return registerLINEChannels(cc, mb, chanMgr, hot)
+	case "wechat":
+		cfgRec := channelRecordToConfigRecord(rec)
+		return registerWeChatChannels(cfgRec, cc, mb, chanMgr, st, hot)
+	case "feishu":
+		return registerFeishuChannels(cc, mb, chanMgr, hot)
+	}
+	return nil
+}
+
+// channelRecordToConfigRecord builds a ConfigRecord from a ChannelRecord
+// for backward compatibility with registerWeChatChannels which needs
+// the ConfigRecord shape for its on-expired callback.
+func channelRecordToConfigRecord(ch store.ChannelRecord) store.ConfigRecord {
+	return store.ConfigRecord{
+		ID:            ch.ID,
+		Kind:          store.KindChannel,
+		UserID:        ch.UserID,
+		AgentID:       ch.AgentID,
+		Name:          ch.Type,
+		Enabled:       ch.Enabled,
+		CredentialKey: ch.AccountID,
+		Data:          ch.Data,
+		CreatedAt:     ch.CreatedAt,
+		UpdatedAt:     ch.UpdatedAt,
+	}
+}
+
+// decodeChannelFromRecord converts a ChannelRecord into a ChannelConfig.
+// It reads from both the top-level fields and the Data JSON blob.
+func decodeChannelFromRecord(rec store.ChannelRecord) config.ChannelConfig {
+	cc := config.ChannelConfig{Enabled: rec.Enabled}
+	// First, decode from the Data blob (preserves the Accounts map, etc.)
+	if blob, err := json.Marshal(rec.Data); err == nil && len(blob) > 0 {
+		_ = json.Unmarshal(blob, &cc)
+	}
+	cc.Enabled = rec.Enabled
+	// Override BotToken from top-level field when present.
+	if rec.BotToken != "" {
+		cc.BotToken = rec.BotToken
+	}
+	return cc
 }
 
 // register adds an adapter to the manager via the appropriate path
@@ -227,6 +285,29 @@ func registerFeishuChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, chan
 	return nil
 }
 
+func registerDingTalkChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, chanMgr *channels.Manager, hot bool) error {
+	for accountID, acct := range chCfg.Accounts {
+		clientID := acct.ClientID
+		if clientID == "" {
+			clientID = accountID
+		}
+		clientSecret := acct.ClientSecret
+		if clientSecret == "" {
+			clientSecret = acct.BotToken
+		}
+		requireMention := true
+		if acct.RequireMention != nil {
+			requireMention = *acct.RequireMention
+		}
+		dt, err := channels.NewDingTalk(clientID, clientSecret, acct.RobotCode, requireMention, accountID, mb)
+		if err != nil {
+			return err
+		}
+		registerSingleton(chanMgr, dt, hot)
+	}
+	return nil
+}
+
 func registerWeChatChannels(rec store.ConfigRecord, chCfg config.ChannelConfig, mb *bus.MessageBus, chanMgr *channels.Manager, st store.Store, hot bool) error {
 	// WeChat is multi-account by design — every QR scan mints a new
 	// (botToken, ilink_user_id, baseURL) triple keyed under a fresh
@@ -305,4 +386,3 @@ func purgeWeChatAccount(st store.Store, rowID, deadAccount string) error {
 	rec.Data = data
 	return st.SaveConfig(ctx, rec)
 }
-

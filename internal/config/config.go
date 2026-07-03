@@ -168,6 +168,12 @@ type TaskQueueCfg struct {
 	TaskTimeoutSec int `json:"taskTimeoutSec,omitempty"`
 }
 
+// PrefsCfg holds runtime preferences that can be set at system, user, or
+// agent scope. Timezone is an IANA name such as "Asia/Shanghai".
+type PrefsCfg struct {
+	Timezone string `json:"timezone,omitempty"`
+}
+
 // SandboxCfg holds sandbox configuration for an agent.
 //
 // Image is the legacy single-slot image/template/snapshot — read-only
@@ -295,6 +301,7 @@ type Config struct {
 	Memory        MemoryCfg                  `json:"memory,omitempty"`
 	Privacy       PrivacyCfg                 `json:"privacy,omitempty"`
 	SkillsLearner SkillsLearnerCfg           `json:"skillsLearner,omitempty"`
+	Prefs         PrefsCfg                   `json:"prefs,omitempty"`
 }
 
 // ModelCost holds pricing info for a model.
@@ -469,6 +476,18 @@ type ChannelConfig struct {
 
 type AccountConfig struct {
 	BotToken string `json:"botToken,omitempty"`
+	// ClientID/ClientSecret are used by platforms whose app credentials
+	// are not token-shaped (DingTalk stream mode, for example).
+	ClientID     string `json:"clientId,omitempty"`
+	ClientSecret string `json:"clientSecret,omitempty"`
+	// RobotCode is the platform-side bot identifier when it differs
+	// from the app/client id. DingTalk often uses the client id as the
+	// robot code for internal bots, but keeping it explicit avoids
+	// another round of field overloading.
+	RobotCode string `json:"robotCode,omitempty"`
+	// RequireMention gates group-chat delivery for adapters that can
+	// tell whether the bot was @mentioned. Nil means adapter default.
+	RequireMention *bool `json:"requireMention,omitempty"`
 	// BaseURL is the per-account API base used by adapters whose
 	// upstream isn't a fixed hostname (e.g. WeChat iLink hands out a
 	// region-specific baseurl on QR confirmation). Empty for
@@ -855,6 +874,17 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 		if fileCfg.AutoPersist != nil {
 			v := *fileCfg.AutoPersist
 			resolved.AutoPersist = &v
+		}
+	}
+
+	// Chatbot mode: cap tool iterations at a lower default (5) unless
+	// the operator explicitly set a value on the agent entry. Chatbots
+	// are conversational — 20 tool rounds burns tokens and makes the
+	// user wait too long.
+	if resolved.PromptMode == PromptModeChatbot && entry.MaxToolIterations == 0 {
+		const chatbotDefaultIter = 5
+		if resolved.MaxToolIterations > chatbotDefaultIter {
+			resolved.MaxToolIterations = chatbotDefaultIter
 		}
 	}
 

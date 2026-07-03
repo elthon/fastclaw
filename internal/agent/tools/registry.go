@@ -187,15 +187,16 @@ type Registry struct {
 	// subfolder of the scope workspace (the folder a project runtime
 	// scaffolds its app into). See SetCodingSubdir / wsPath.
 	codingSubdir string
-	// messageChannel + messageChatID name the bus address of the chat
+	// messageChannel + messageAccountID + messageChatID name the bus address of the chat
 	// that's currently in flight. Set per-turn by bindSession so tools
 	// that schedule asynchronous work (e.g. create_cron_job) can stamp
 	// the originating address onto persisted rows — when the cron
 	// scheduler later fires, it routes the synthesized inbound message
-	// back to the same channel/chatID the user was talking on, so the
+	// back to the same channel/accountID/chatID the user was talking on, so the
 	// reminder lands in the right web/Telegram/Discord thread.
-	messageChannel string
-	messageChatID  string
+	messageChannel   string
+	messageAccountID string
+	messageChatID    string
 	// goalSessionKey is the persistent session_key (session.Session's
 	// opaque identifier) for the in-flight turn — distinct from
 	// sessionID above, which is just the channel's chatID. Goal tools
@@ -354,6 +355,13 @@ func (r *Registry) SetOwnerUserID(userID string) {
 	r.userID = userID
 }
 
+// OwnerUserID returns the boot-time UserSpace owner. Billing quota is
+// enforced against this account, so billing tools use it instead of the
+// per-turn chatter when the two differ on IM channels.
+func (r *Registry) OwnerUserID() string {
+	return r.userID
+}
+
 // SetChatterUserID overrides the per-user file routing target for the
 // in-flight turn. Called by the agent loop at the top of HandleMessage /
 // HandleMessageStream with the resolved chatterUID so per-sender USER.md
@@ -375,6 +383,9 @@ func (r *Registry) ChatterUserID() string {
 	}
 	return r.userID
 }
+
+// AgentID returns the agent_id this registry belongs to.
+func (r *Registry) AgentID() string { return r.agentID }
 
 // SetAgentOwnerUserID records the agent's owning user_id (agent.user_id
 // in the DB). Identity-file writes (SOUL.md / IDENTITY.md / BOOTSTRAP.md
@@ -559,15 +570,21 @@ func (r *Registry) wsPath(p string) string {
 // SetMessageContext records the bus address of the in-flight turn so
 // tools that persist deferred work (cron jobs) can capture it for
 // later replay. Channel is e.g. "web" / "telegram" / "discord";
+// accountID names the bot/account within that channel;
 // chatID is the thread/session identifier within that channel.
-func (r *Registry) SetMessageContext(channel, chatID string) {
+func (r *Registry) SetMessageContext(channel, accountID, chatID string) {
 	r.messageChannel = channel
+	r.messageAccountID = accountID
 	r.messageChatID = chatID
 }
 
 // MessageChannel returns the channel of the in-flight turn, or "" if
 // not set (e.g. a tool invocation outside a chat context).
 func (r *Registry) MessageChannel() string { return r.messageChannel }
+
+// MessageAccountID returns the account/bot id of the in-flight turn, or "" if
+// not set.
+func (r *Registry) MessageAccountID() string { return r.messageAccountID }
 
 // MessageChatID returns the chat/session id of the in-flight turn,
 // or "" if not set.
@@ -759,9 +776,9 @@ func (r *Registry) RegisteredTools() []ToolInfo {
 // operators extend a chatbot beyond the built-in IM primitives, and
 // gating them by mode would defeat that. Only built-ins are filtered:
 //
-//   builtinAllow == nil       → all built-ins included (agent mode)
-//   builtinAllow == []string{} → no built-ins included (customize mode)
-//   builtinAllow == ["a","b"]  → only those built-ins (chatbot mode)
+//	builtinAllow == nil       → all built-ins included (agent mode)
+//	builtinAllow == []string{} → no built-ins included (customize mode)
+//	builtinAllow == ["a","b"]  → only those built-ins (chatbot mode)
 //
 // The agent loop computes builtinAllow from PromptMode via the helper
 // in loop.go; this method just executes the filter.

@@ -42,6 +42,7 @@ import {
   connectAgentSlack,
   connectAgentLINE,
   connectAgentFeishu,
+  connectAgentDingTalk,
   startAgentWeChatLogin,
   pollAgentWeChatLoginStatus,
   disconnectAgentChannel,
@@ -94,6 +95,12 @@ const CATALOG: { type: string; label: string; description: string; available: bo
     description: "Connect a Feishu custom-app bot via webhook (App ID + App Secret).",
     available: true,
   },
+  {
+    type: "dingtalk",
+    label: "DingTalk",
+    description: "Connect a DingTalk internal robot via Stream mode (Client ID + Client Secret).",
+    available: true,
+  },
 ];
 
 export default function AgentChannelsPage() {
@@ -110,6 +117,7 @@ export default function AgentChannelsPage() {
   const [lineOpen, setLineOpen] = useState(false);
   const [wechatOpen, setWechatOpen] = useState(false);
   const [feishuOpen, setFeishuOpen] = useState(false);
+  const [dingtalkOpen, setDingtalkOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<AgentChannel | null>(null);
 
   const refresh = useCallback(() => {
@@ -197,6 +205,7 @@ export default function AgentChannelsPage() {
                   else if (entry.type === "line") setLineOpen(true);
                   else if (entry.type === "wechat") setWechatOpen(true);
                   else if (entry.type === "feishu") setFeishuOpen(true);
+                  else if (entry.type === "dingtalk") setDingtalkOpen(true);
                 }}
               />
             );
@@ -242,6 +251,13 @@ export default function AgentChannelsPage() {
       <ConnectFeishuDialog
         open={feishuOpen}
         onOpenChange={setFeishuOpen}
+        agentId={agentId}
+        onConnected={refresh}
+      />
+
+      <ConnectDingTalkDialog
+        open={dingtalkOpen}
+        onOpenChange={setDingtalkOpen}
         agentId={agentId}
         onConnected={refresh}
       />
@@ -1133,6 +1149,177 @@ function ConnectWeChatDialog({
               )}
               <Button variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel
+              </Button>
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+
+function ConnectDingTalkDialog({
+  open,
+  onOpenChange,
+  agentId,
+  onConnected,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  agentId: string;
+  onConnected: () => void;
+}) {
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [robotCode, setRobotCode] = useState("");
+  const [requireMention, setRequireMention] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [connected, setConnected] = useState<{ accountId: string; requireMention: boolean } | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setClientId("");
+      setClientSecret("");
+      setRobotCode("");
+      setRequireMention(true);
+      setError("");
+      setSubmitting(false);
+      setConnected(null);
+    }
+  }, [open]);
+
+  const submit = async () => {
+    if (!clientId.trim() || !clientSecret.trim() || !agentId) return;
+    setSubmitting(true);
+    setError("");
+    const res = await connectAgentDingTalk(
+      agentId,
+      clientId.trim(),
+      clientSecret.trim(),
+      robotCode.trim(),
+      requireMention,
+    );
+    setSubmitting(false);
+    if (res.error || !res.ok) {
+      setError(res.error || "Failed to connect");
+      return;
+    }
+    setConnected({
+      accountId: res.accountId || res.robotCode || res.clientId || "",
+      requireMention: !!res.requireMention,
+    });
+    onConnected();
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <ChannelIcon type="dingtalk" />
+            Connect DingTalk robot
+          </DialogTitle>
+          <DialogDescription>
+            Use a DingTalk internal robot with Stream mode enabled. Save the
+            Client ID and Client Secret here, then message the robot in a DM or
+            @ it in a group to test.
+          </DialogDescription>
+        </DialogHeader>
+
+        {connected ? (
+          <div className="space-y-3 py-2">
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4 space-y-2">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                <span className="text-sm font-medium">Saved and starting</span>
+              </div>
+              <p className="text-sm">
+                Account <code className="font-mono text-xs">{connected.accountId}</code>{" "}
+                is registered. The stream client starts in the background and
+                will log DingTalk auth or subscription errors if the upstream
+                rejects the credentials.
+              </p>
+            </div>
+            <div className="rounded-lg border bg-muted/30 p-4 space-y-2">
+              <p className="text-sm font-medium">Test path</p>
+              <p className="text-xs text-muted-foreground">
+                Send the robot a direct message. In a group, {connected.requireMention ? "@mention the robot" : "messages can trigger without @mention"}.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="dingtalk-client-id">Client ID / AppKey</Label>
+              <Input
+                id="dingtalk-client-id"
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="ding..."
+                className="font-mono text-sm"
+                autoFocus
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="dingtalk-client-secret">Client Secret / AppSecret</Label>
+              <Input
+                id="dingtalk-client-secret"
+                value={clientSecret}
+                onChange={(e) => setClientSecret(e.target.value)}
+                placeholder="..."
+                type="password"
+                className="font-mono text-sm"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="dingtalk-robot-code">RobotCode</Label>
+              <Input
+                id="dingtalk-robot-code"
+                value={robotCode}
+                onChange={(e) => setRobotCode(e.target.value)}
+                placeholder="defaults to Client ID"
+                className="font-mono text-sm"
+              />
+            </div>
+            <div className="flex items-start justify-between gap-3 rounded-lg border bg-muted/30 p-3">
+              <div className="space-y-0.5">
+                <Label htmlFor="dingtalk-require-mention" className="text-sm">
+                  Require @mention in groups
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  Direct messages always trigger. Group messages trigger only
+                  when DingTalk marks the robot as mentioned.
+                </p>
+              </div>
+              <Switch
+                id="dingtalk-require-mention"
+                checked={requireMention}
+                onCheckedChange={setRequireMention}
+              />
+            </div>
+            {error && <p className="text-xs text-destructive">{error}</p>}
+          </div>
+        )}
+
+        <DialogFooter>
+          {connected ? (
+            <Button onClick={() => onOpenChange(false)}>Done</Button>
+          ) : (
+            <>
+              <Button
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={submitting}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={submit}
+                disabled={submitting || !clientId.trim() || !clientSecret.trim()}
+              >
+                {submitting ? "Saving..." : "Connect"}
               </Button>
             </>
           )}

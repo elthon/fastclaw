@@ -29,6 +29,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/cron"
 	"github.com/fastclaw-ai/fastclaw/internal/plugin"
+	"github.com/fastclaw-ai/fastclaw/internal/rediscoord"
 	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
@@ -43,6 +44,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/users"
 	"github.com/fastclaw-ai/fastclaw/internal/webhook"
 	"github.com/fastclaw-ai/fastclaw/internal/workspace"
+	"github.com/redis/go-redis/v9"
 )
 
 var toolProviderRegistry = func() *toolproviders.Registry {
@@ -174,6 +176,7 @@ type Gateway struct {
 	workspace   workspace.Store
 	sandboxPool sandbox.ExecutorPool
 	usage       usage.Meter
+	quotaStore  usage.QuotaStore
 	envCfg      *config.EnvConfig
 	// projectRuntime is the coding-agent runtime manager (live dev server
 	// + preview). Set by SetProjectRuntime after construction; nil keeps
@@ -223,6 +226,9 @@ func (g *Gateway) Workspace() workspace.Store { return g.workspace }
 // Usage returns the per-tenant resource meter.
 func (g *Gateway) Usage() usage.Meter { return g.usage }
 
+// QuotaStore returns the per-user quota store.
+func (g *Gateway) QuotaStore() usage.QuotaStore { return g.quotaStore }
+
 // Store returns the gateway's storage backend.
 func (g *Gateway) Store() store.Store { return g.store }
 
@@ -246,7 +252,32 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 	if env == nil {
 		env = &config.EnvConfig{}
 	}
+	holderID := uuid.NewString()
+	slog.Info("gateway holder id", "id", holderID)
+
+	var redisClient *redis.Client
 	mb := bus.New()
+	if env.Redis.Enabled {
+		addr := strings.TrimSpace(env.Redis.Addr)
+		if addr == "" {
+			addr = "127.0.0.1:6379"
+		}
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:     addr,
+			Username: env.Redis.Username,
+			Password: env.Redis.Password,
+			DB:       env.Redis.DB,
+		})
+		if err := redisClient.Ping(context.Background()).Err(); err != nil {
+			return nil, fmt.Errorf("connect redis: %w", err)
+		}
+		mb = bus.NewRedis(bus.RedisConfig{
+			Client:   redisClient,
+			Prefix:   redisPrefix(env.Redis.Prefix),
+			Group:    "fastclaw-gateway",
+			Consumer: holderID,
+		})
+	}
 
 	homeDir, _ := config.HomeDir()
 	st, err := store.New(&store.StorageConfig{
@@ -290,20 +321,23 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 	// back to MemMeter if the store doesn't expose a *sql.DB (shouldn't
 	// happen in real installs — only an embedded test double would).
 	var meter usage.Meter = usage.NewMemMeter()
+	var quotaStore usage.QuotaStore = usage.NewMemQuotaStore()
 	if dbs, ok := st.(*store.DBStore); ok {
 		meter = usage.NewSQLMeter(dbs.DB(), dbs.Dialect())
+		quotaStore = usage.NewSQLQuotaStore(dbs.DB(), dbs.Dialect())
 	}
 	ws := wsInner
 
-	// holderID is the per-process identifier stamped into
-	// channel_leases.holder_id. Stable for the lifetime of this
-	// gateway so renewals keep matching the row; a peer process
-	// generates its own and can only steal the lease once ours
-	// expires. Logged at boot so ops can correlate "who is currently
-	// driving this WeChat bot" with a specific replica.
-	holderID := uuid.NewString()
-	slog.Info("gateway holder id", "id", holderID)
-	chanMgr := channels.NewManagerWithLeaser(mb, storeLeaser{st: st}, holderID)
+	// holderID is the per-process identifier used by the cross-replica
+	// channel lease. Redis is preferred when configured; otherwise the
+	// historical DB-backed lease keeps single-instance / no-Redis deploys
+	// working unchanged.
+	var leaser channels.Leaser = storeLeaser{st: st}
+	if redisClient != nil {
+		leaser = rediscoord.NewLeaser(redisClient, redisPrefix(env.Redis.Prefix))
+		slog.Info("redis channel leaser enabled", "prefix", redisPrefix(env.Redis.Prefix))
+	}
+	chanMgr := channels.NewManagerWithLeaser(mb, leaser, holderID)
 	// Always-on web channel: routes cron-fired (and any other
 	// async-emitted) outbound messages to the dashboard's SSE
 	// subscribers so the user sees the agent's reply live instead of
@@ -381,8 +415,9 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		accounts:    accts,
 		workspace:   ws,
 		usage:       meter,
+		quotaStore:  quotaStore,
 		sandboxPool: systemSandboxPool,
-		users:       newUserSpaceRegistry(mb, st, ws, meter, systemSandboxPool, pluginMgr),
+		users:       newUserSpaceRegistry(mb, st, ws, meter, quotaStore, systemSandboxPool, pluginMgr),
 		chanMgr:     chanMgr,
 		webChan:     webChan,
 		scheduler:   scheduler,
@@ -463,7 +498,13 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		// image-tool already saved the real file to /workspace. Dedupe
 		// by filename so we don't double-send anything
 		// splitMediaFromReply already resolved.
-		items = appendRecentWorkspaceMedia(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, turnStart, items)
+		// Skip fallback when splitMediaFromReply already extracted
+		// images — the explicit markdown refs are authoritative and
+		// the time-based scan can pick up stale files whose mtime
+		// was refreshed by sandbox mount/restart.
+		if len(items) == 0 {
+			items = appendRecentWorkspaceMedia(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, turnStart, items)
+		}
 		// Web-streamed turns already delivered the reply via the hub.
 		// Skip the outbound push entirely when there's no media; with
 		// media, push with empty text so attachments still flow but
@@ -571,15 +612,19 @@ func (g *Gateway) Run() error {
 			case <-ctx.Done():
 				return
 			case <-reloadCh:
-				slog.Info("received reload signal, reloading agents")
+				slog.Info("received reload signal, reloading agents and scheduled jobs")
 				if err := g.ReloadAgents(); err != nil {
 					slog.Warn("agent reload failed", "error", err)
 				}
+				cron.NotifyJobCreated()
 			}
 		}
 	}()
 
 	var wg sync.WaitGroup
+	if err := g.bus.Start(ctx); err != nil {
+		return fmt.Errorf("start message bus: %w", err)
+	}
 	wg.Add(1)
 	go func() { defer wg.Done(); g.users.startEvictor(ctx) }()
 	wg.Add(1)
@@ -668,6 +713,14 @@ func defaultStr(v, fallback string) string {
 	return v
 }
 
+func redisPrefix(v string) string {
+	v = strings.Trim(v, ":")
+	if v == "" {
+		return "fastclaw"
+	}
+	return v
+}
+
 // readObjectStoreCfg pulls the "objectstore" setting namespace, then
 // layers FASTCLAW_OBJECT_STORE_* env vars on top.
 func readObjectStoreCfg(st store.Store) config.ObjectStoreCfg {
@@ -737,14 +790,34 @@ const (
 	NSBindings       = "bindings"
 )
 
-// registerChannelsFromStore loads every enabled kind="channel" row from
-// configs and starts a channel adapter for each, regardless of
-// scope. The owner is captured per-row and resolved at message receipt
-// time via LookupChannelByCredential.
+// registerChannelsFromStore loads every enabled channel from the
+// channels table and starts a channel adapter for each. Falls back
+// to configs (kind='channel') when the channels table is empty (pre-
+// migration installs). The owner is captured per-row and resolved at
+// message receipt time via LookupChannel / LookupChannelByCredential.
 func registerChannelsFromStore(st store.Store, mb *bus.MessageBus, chanMgr *channels.Manager) error {
 	if st == nil {
 		return nil
 	}
+	// Try the new channels table first.
+	chRows, err := st.ListAllChannels(context.Background())
+	if err != nil {
+		slog.Warn("ListAllChannels failed, falling back to configs", "error", err)
+		chRows = nil
+	}
+	if len(chRows) > 0 {
+		for _, r := range chRows {
+			if !r.Enabled {
+				continue
+			}
+			if err := registerChannelFromRecord(r, mb, chanMgr, st, false); err != nil {
+				slog.Warn("register channel failed",
+					"type", r.Type, "user_id", r.UserID, "agent_id", r.AgentID, "error", err)
+			}
+		}
+		return nil
+	}
+	// Fallback: read from configs for pre-migration installs.
 	rows, err := allChannelRows(st)
 	if err != nil {
 		return err
@@ -762,7 +835,7 @@ func registerChannelsFromStore(st store.Store, mb *bus.MessageBus, chanMgr *chan
 }
 
 // allChannelRows returns every channel row regardless of ownership —
-// system rows ('','') plus per-user, per-agent, and per-(user, agent)
+// system rows ("", "") plus per-user, per-agent, and per-(user, agent)
 // rows. The boot path needs the union so each owner's adapter is
 // hot-started; per-row routing is decided later at message-receipt
 // time via LookupChannelByCredential.

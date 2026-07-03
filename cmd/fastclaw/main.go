@@ -64,11 +64,20 @@ func (a *apiResolver) EnsureAgent(ctx context.Context, userID, agentID string) e
 // chat turn.
 func (a *apiResolver) ReloadAgents() error { return a.gw.ReloadAgents() }
 
+// ReloadSandbox rebuilds the gateway-owned sandbox executor pool after
+// system-scope sandbox settings change, avoiding a manual process restart.
+func (a *apiResolver) ReloadSandbox() error { return a.gw.ReloadSandbox() }
+
 // RegisterChannelFromConfig hot-starts a freshly-saved channel row.
 // Called by setup handlers after they persist a new bot config so the
 // adapter starts polling without a process restart.
 func (a *apiResolver) RegisterChannelFromConfig(rec store.ConfigRecord) error {
 	return a.gw.RegisterChannelFromConfig(rec)
+}
+
+// RegisterChannel hot-starts a freshly-saved ChannelRecord.
+func (a *apiResolver) RegisterChannel(rec store.ChannelRecord) error {
+	return a.gw.RegisterChannel(rec)
 }
 
 func (a *apiResolver) UnregisterChannel(channelType, accountID string) {
@@ -105,6 +114,11 @@ func main() {
 	rootCmd.AddCommand(apikeyCmd())
 	rootCmd.AddCommand(agentsCmd())
 	rootCmd.AddCommand(sessionCmd())
+	rootCmd.AddCommand(cronCmd())
+	rootCmd.AddCommand(channelsCmd())
+	rootCmd.AddCommand(toolsCmd())
+	rootCmd.AddCommand(usageCmd())
+	rootCmd.AddCommand(projectsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -185,6 +199,8 @@ func runGateway(port int) error {
 	gw.SetChatEvents(webSrv.ChatEventHub())
 
 	apiSrv := api.NewServer(&apiResolver{gw: gw}, authResolver, gwCfg)
+	apiSrv.SetMeter(gw.Usage())
+	apiSrv.SetQuotaStore(gw.QuotaStore())
 	webSrv.SetAPIServer(apiSrv)
 
 	// Coding-agent project runtime: long-lived dev-server sandbox +

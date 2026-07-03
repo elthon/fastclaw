@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/fastclaw-ai/fastclaw/internal/provider"
 )
 
 func TestRecoverToolCallsFromContent(t *testing.T) {
@@ -40,6 +42,18 @@ func TestRecoverToolCallsFromContent(t *testing.T) {
 			wantName:   "read_file",
 			wantArgs:   map[string]any{"path": "IDENTITY.md"},
 			wantResLen: 0,
+		},
+		{
+			name: "Claude antml function_calls XML — recovered",
+			in: `Let me check. <antml:function_calls>` +
+				`<antml:invoke name="web_fetch">` +
+				`<antml:parameter name="url" string="true">https://example.com</antml:parameter>` +
+				`<antml:parameter name="max_length" string="false">5000</antml:parameter>` +
+				`</antml:invoke></antml:function_calls>`,
+			wantCalls:  1,
+			wantName:   "web_fetch",
+			wantArgs:   map[string]any{"url": "https://example.com", "max_length": float64(5000)},
+			wantResLen: len("Let me check."),
 		},
 		{
 			name: "multi-line command body preserved",
@@ -121,6 +135,27 @@ func TestRecoverToolCallsFromContent(t *testing.T) {
 			wantResLen: 0,
 		},
 		{
+			name: "leaked fullwidth DSML double-pipe tokens — recovered",
+			in: `好的，我来写一个 Go 的 Hello World 程序。` +
+				`<｜｜DSML｜｜tool_calls>` +
+				`<｜｜DSML｜｜invoke name="write_file">` +
+				`<｜｜DSML｜｜parameter name="path" string="true">/workspace/hello.go</｜｜DSML｜｜parameter>` +
+				`<｜｜DSML｜｜parameter name="content" string="true">package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("Hello, World! 你好，世界！")
+}
+</｜｜DSML｜｜parameter>` +
+				`</｜｜DSML｜｜invoke>` +
+				`</｜｜DSML｜｜tool_calls>`,
+			wantCalls:  1,
+			wantName:   "write_file",
+			wantArgs:   map[string]any{"path": "/workspace/hello.go", "content": "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Hello, World! 你好，世界！\")\n}\n"},
+			wantResLen: len("好的，我来写一个 Go 的 Hello World 程序。"),
+		},
+		{
 			// No recoverable invoke inside, but leaked wrappers must still
 			// be scrubbed so the UI doesn't render `< | | DSML | …>` text.
 			name:       "leaked wrappers without invoke — scrubbed to empty",
@@ -182,5 +217,56 @@ func TestRecoverToolCallsFromContent(t *testing.T) {
 				t.Errorf("residual still has invoke tags: %q", residual)
 			}
 		})
+	}
+}
+
+func TestMaybeRecoverToolCallsScrubsContentWhenNativeToolCallsExist(t *testing.T) {
+	ag := &Agent{name: "test-agent", model: "test-model"}
+	resp := &provider.Response{
+		Content: `好的，我来写。<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="exec"><｜｜DSML｜｜parameter name="command" string="true">echo hi</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>`,
+		ToolCalls: []provider.ToolCall{{
+			ID:   "native_1",
+			Type: "function",
+			Function: provider.FunctionCall{
+				Name:      "exec",
+				Arguments: `{"command":"echo hi"}`,
+			},
+		}},
+		RawAssistant: []byte(`raw`),
+	}
+	ag.maybeRecoverToolCalls(resp)
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "native_1" {
+		t.Fatalf("native tool calls changed: %+v", resp.ToolCalls)
+	}
+	if strings.Contains(resp.Content, "DSML") || strings.Contains(resp.Content, "invoke") || strings.Contains(resp.Content, "parameter") {
+		t.Fatalf("content still leaks tool XML: %q", resp.Content)
+	}
+	if resp.Content != "好的，我来写。" {
+		t.Fatalf("content = %q, want preamble only", resp.Content)
+	}
+	if resp.RawAssistant != nil {
+		t.Fatalf("RawAssistant should be cleared after scrub")
+	}
+}
+
+func TestScrubLeakedToolCallContentForDisplay(t *testing.T) {
+	in := `< | | DSML | | tool_calls>
+< | | DSML | | invoke name="exec">
+< | | DSML | | parameter name="command" string="true">curl -sL "https://www.baidu.com/s?wd=idoubi"</ | | DSML | | parameter>
+< | | DSML | | parameter name="timeout" string="false">15</ | | DSML | | parameter>
+</ | | DSML | | invoke>
+</ | | DSML | | tool_calls>`
+	if got := scrubLeakedToolCallContent(in); got != "" {
+		t.Fatalf("scrubbed display content = %q; want empty", got)
+	}
+
+	withPreamble := "I'll check. " + in
+	got := scrubLeakedToolCallContent(withPreamble)
+	if strings.Contains(got, "DSML") || strings.Contains(got, "tool_calls") ||
+		strings.Contains(got, "invoke") || strings.Contains(got, "parameter") {
+		t.Fatalf("scrubbed display content still leaks tool markup: %q", got)
+	}
+	if strings.TrimSpace(got) != "I'll check." {
+		t.Fatalf("scrubbed display content = %q; want preamble only", got)
 	}
 }

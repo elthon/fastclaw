@@ -17,6 +17,12 @@ For the local demo created by Codex, you can also load the generated state:
 
   python3 examples/fastclaw_api_client.py --state /tmp/fastclaw_integration_state.json \
     "请给出公安舆情分析的输出结构。"
+
+Pass structured business context through params:
+
+  python3 examples/fastclaw_api_client.py \
+    --params-json '{"tenantId":"tenant_demo_police","caseId":"case-20260623-001"}' \
+    "请结合案件上下文生成处置建议。"
 """
 
 from __future__ import annotations
@@ -110,6 +116,33 @@ def parse_json_maybe(text: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return text
+
+
+def build_demo_params() -> dict[str, Any]:
+    """Example params payload forwarded to the Agent as structured context.
+
+    These values are not interpreted by this client. FastClaw passes them
+    through to the Agent runtime so prompts, hooks, tools, or downstream
+    business logic can use tenant/case/source metadata without stuffing it
+    into the user's natural-language message.
+    """
+    return {
+        "tenantId": "tenant_demo_police",
+        "source": "python-demo-client",
+        "channel": "backend-api",
+        "caseId": "case-demo-001",
+        "operator": {
+            "id": "demo-user-001",
+            "name": "Demo Operator",
+            "department": "情指中心",
+        },
+        "businessContext": {
+            "scenario": "public_opinion_analysis",
+            "priority": "normal",
+            "region": "示例辖区",
+            "tags": ["舆情", "研判", "演示"],
+        },
+    }
 
 
 def stream_chat(
@@ -210,15 +243,29 @@ def main() -> int:
     parser.add_argument("message", nargs="?", default="请用三点说明你能如何做公安舆情分析。")
     parser.add_argument("--state", help="JSON state file generated during local provisioning")
     parser.add_argument("--todo", action="store_true", help="Fetch /api/chat/todo after the chat turn")
+    parser.add_argument(
+        "--params-json",
+        help="JSON object forwarded as request params. Defaults to a documented demo params payload.",
+    )
     parser.add_argument("--debug-events", action="store_true", help="Print the full raw SSE event JSON")
     parser.add_argument("--tool-output-chars", type=int, default=800, help="Max chars to print for each tool args/result")
     args = parser.parse_args()
 
     cfg = load_config(args.state)
+    params = build_demo_params()
+    if args.params_json:
+        try:
+            parsed_params = json.loads(args.params_json)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"--params-json is not valid JSON: {e}") from e
+        if not isinstance(parsed_params, dict):
+            raise SystemExit("--params-json must be a JSON object")
+        params = parsed_params
+
     stream_chat(
         cfg,
         args.message,
-        params={"tenantId": "tenant_demo_police", "source": "python-demo-client"},
+        params=params,
         debug_events=args.debug_events,
         tool_output_chars=args.tool_output_chars,
     )
