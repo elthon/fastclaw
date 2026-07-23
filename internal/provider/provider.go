@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,11 +30,26 @@ import (
 //
 // 60s is conservative for LLM APIs: response headers come back well
 // under 1s on a healthy path; 60s catches a hung connection without
-// false-positives on a slow but live network.
+// false-positives on a slow but live network. Deployments with slow
+// upstream gateways can override this with
+// FASTCLAW_LLM_RESPONSE_HEADER_TIMEOUT_SEC.
 func newLLMHTTPClient() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = 60 * time.Second
+	tr.ResponseHeaderTimeout = llmResponseHeaderTimeout()
 	return &http.Client{Transport: tr}
+}
+
+func llmResponseHeaderTimeout() time.Duration {
+	const defaultTimeout = 60 * time.Second
+	v := strings.TrimSpace(os.Getenv("FASTCLAW_LLM_RESPONSE_HEADER_TIMEOUT_SEC"))
+	if v == "" {
+		return defaultTimeout
+	}
+	seconds, err := strconv.Atoi(v)
+	if err != nil || seconds <= 0 {
+		return defaultTimeout
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // ApplyCustomHeaders applies operator-configured headers to an outbound LLM

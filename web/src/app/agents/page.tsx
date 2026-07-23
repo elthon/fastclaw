@@ -7,6 +7,13 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -25,10 +32,12 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Bot, Plus, Trash2, ImagePlus, Pencil, Copy, Check } from "lucide-react";
+import { Bot, Plus, Trash2, ImagePlus, Pencil, Copy, Check, UserPlus } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import {
+  adminCreateUserAgent,
   adminListAgents,
+  adminListUsers,
   apiFetch,
   getAgents,
   getMe,
@@ -48,6 +57,18 @@ interface OtherAgent {
   ownerEmail?: string;
   ownerDisplayName?: string;
 }
+
+interface ProvisionUser {
+  id: string;
+  username: string;
+  email: string;
+  displayName?: string;
+  role: string;
+  status: string;
+}
+
+const BLANK_TEMPLATE_VALUE = "__blank__";
+const SELECT_USER_VALUE = "__select_user__";
 
 // AgentAvatar tries to load /api/agents/{id}/files/avatar.png and falls
 // back to the default Bot icon when the agent has no avatar yet (404).
@@ -87,6 +108,9 @@ function AgentAvatar({
 export default function AgentsPage() {
   const [agents, setAgents] = useState<AgentDetail[]>([]);
   const [otherAgents, setOtherAgents] = useState<OtherAgent[]>([]);
+  const [provisionTemplates, setProvisionTemplates] = useState<OtherAgent[]>([]);
+  const [provisionUsers, setProvisionUsers] = useState<ProvisionUser[]>([]);
+  const [currentUserId, setCurrentUserId] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<"own" | "others">("own");
@@ -97,6 +121,7 @@ export default function AgentsPage() {
   // state tells them to contact their admin.
   const [quotaLocked, setQuotaLocked] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [provisionOpen, setProvisionOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<AgentDetail | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -113,6 +138,14 @@ export default function AgentsPage() {
   const [newAvatarPreview, setNewAvatarPreview] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const createAvatarInput = useRef<HTMLInputElement>(null);
+
+  // Admin provisioning dialog state
+  const [provisionTargetUserId, setProvisionTargetUserId] = useState("");
+  const [provisionTemplateId, setProvisionTemplateId] = useState(BLANK_TEMPLATE_VALUE);
+  const [provisionName, setProvisionName] = useState("");
+  const [provisionDescription, setProvisionDescription] = useState("");
+  const [provisionError, setProvisionError] = useState<string | null>(null);
+  const [provisionLoading, setProvisionLoading] = useState(false);
 
   // Edit dialog state
   const [editName, setEditName] = useState("");
@@ -144,6 +177,14 @@ export default function AgentsPage() {
     setEditLinkCopied(false);
   };
 
+  const resetProvisionForm = () => {
+    setProvisionTargetUserId("");
+    setProvisionTemplateId(BLANK_TEMPLATE_VALUE);
+    setProvisionName("");
+    setProvisionDescription("");
+    setProvisionError(null);
+  };
+
   const openEdit = (agent: AgentDetail) => {
     resetEditForm();
     setEditTarget(agent);
@@ -169,8 +210,10 @@ export default function AgentsPage() {
       const visibleIds = new Set(list.map((a) => a.id));
       const res = await adminListAgents().catch(() => null);
       const all: OtherAgent[] = (res?.agents || []) as OtherAgent[];
+      setProvisionTemplates(all);
       setOtherAgents(all.filter((a) => !visibleIds.has(a.id)));
     } else {
+      setProvisionTemplates([]);
       setOtherAgents([]);
     }
     setLoading(false);
@@ -191,6 +234,7 @@ export default function AgentsPage() {
     getMe()
       .then((me) => {
         if (aborted) return;
+        if (me?.user?.id) setCurrentUserId(me.user.id);
         if (me?.user?.agentQuota === 0) setQuotaLocked(true);
       })
       .catch(() => {});
@@ -198,6 +242,43 @@ export default function AgentsPage() {
       aborted = true;
     };
   }, []);
+
+  async function loadProvisionData() {
+    if (!isAdmin) return;
+    setProvisionLoading(true);
+    setProvisionError(null);
+    try {
+      const [usersRes, agentsRes] = await Promise.all([
+        adminListUsers(),
+        adminListAgents(),
+      ]);
+      if (usersRes?.error) throw new Error(usersRes.error);
+      if (agentsRes?.error) throw new Error(agentsRes.error);
+      setProvisionUsers((usersRes?.users || []) as ProvisionUser[]);
+      setProvisionTemplates((agentsRes?.agents || []) as OtherAgent[]);
+    } catch (err) {
+      setProvisionError(err instanceof Error ? err.message : "Failed to load provisioning data");
+    } finally {
+      setProvisionLoading(false);
+    }
+  }
+
+  function openProvisionDialog() {
+    resetProvisionForm();
+    setProvisionOpen(true);
+    loadProvisionData();
+  }
+
+  function handleProvisionTemplateChange(value: string | null) {
+    if (!value) return;
+    setProvisionTemplateId(value);
+    setProvisionError(null);
+    if (value === BLANK_TEMPLATE_VALUE) return;
+    const template = provisionTemplates.find((a) => a.id === value);
+    if (!template) return;
+    if (!provisionName.trim()) setProvisionName(template.name || "");
+    if (!provisionDescription.trim()) setProvisionDescription(template.description || "");
+  }
 
   async function uploadAvatar(agentID: string, file: File) {
     const fd = new FormData();
@@ -231,6 +312,36 @@ export default function AgentsPage() {
     setCreateOpen(false);
     resetCreateForm();
     fetchAgents();
+  };
+
+  const handleProvision = async () => {
+    if (!provisionTargetUserId || !provisionName.trim()) return;
+    setSaving(true);
+    setProvisionError(null);
+    const payload: { name: string; description?: string; forkFrom?: string } = {
+      name: provisionName.trim(),
+    };
+    const desc = provisionDescription.trim();
+    if (desc) payload.description = desc;
+    if (provisionTemplateId !== BLANK_TEMPLATE_VALUE) payload.forkFrom = provisionTemplateId;
+
+    try {
+      const resp = await adminCreateUserAgent(provisionTargetUserId, payload);
+      if (resp && (resp.ok === false || resp.error)) {
+        setProvisionError(resp.error || "Failed to provision agent");
+        return;
+      }
+      setProvisionOpen(false);
+      resetProvisionForm();
+      if (provisionTargetUserId && currentUserId && provisionTargetUserId !== currentUserId) {
+        setActiveTab("others");
+      }
+      fetchAgents();
+    } catch (err) {
+      setProvisionError(err instanceof Error ? err.message : "Failed to provision agent");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleEdit = async () => {
@@ -284,12 +395,20 @@ export default function AgentsPage() {
             Manage your AI agents and their configurations
           </p>
         </div>
-        {!quotaLocked && (
-          <Button onClick={() => setCreateOpen(true)}>
-            <Plus className="h-4 w-4 mr-2" />
-            New Agent
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {isAdmin && (
+            <Button variant="outline" onClick={openProvisionDialog}>
+              <UserPlus className="h-4 w-4 mr-2" />
+              Provision Agent
+            </Button>
+          )}
+          {!quotaLocked && (
+            <Button onClick={() => setCreateOpen(true)}>
+              <Plus className="h-4 w-4 mr-2" />
+              New Agent
+            </Button>
+          )}
+        </div>
       </div>
 
       {loading ? (
@@ -559,6 +678,124 @@ export default function AgentsPage() {
             </Button>
             <Button onClick={handleCreate} disabled={!newName.trim() || saving}>
               {saving ? "Creating..." : "Create Agent"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Provision Dialog */}
+      <Dialog
+        open={provisionOpen}
+        onOpenChange={(v) => {
+          setProvisionOpen(v);
+          if (!v) resetProvisionForm();
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Provision Agent</DialogTitle>
+            <DialogDescription>
+              Create an agent for a user, optionally starting from an existing template.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label>Create for</Label>
+              <Select
+                value={provisionTargetUserId || SELECT_USER_VALUE}
+                onValueChange={(v) => {
+                  if (!v) return;
+                  setProvisionTargetUserId(v === SELECT_USER_VALUE ? "" : v);
+                  setProvisionError(null);
+                }}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={SELECT_USER_VALUE} disabled>
+                    Select a user
+                  </SelectItem>
+                  {provisionUsers.map((user) => (
+                    <SelectItem key={user.id} value={user.id}>
+                      <div className="flex min-w-0 flex-col">
+                        <span className="truncate">
+                          {user.displayName || user.username}
+                        </span>
+                        <span className="truncate text-xs text-muted-foreground">
+                          {user.email || user.id}
+                        </span>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Start from</Label>
+              <Select
+                value={provisionTemplateId}
+                onValueChange={handleProvisionTemplateChange}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={BLANK_TEMPLATE_VALUE}>Blank agent</SelectItem>
+                  {provisionTemplates.map((agent) => (
+                    <SelectItem key={agent.id} value={agent.id}>
+                      <div className="flex min-w-0 flex-col">
+                        <span className="truncate">{agent.name || agent.id}</span>
+                        <span className="truncate text-xs text-muted-foreground">
+                          Owner: {agent.ownerDisplayName || agent.ownerUsername || agent.userId}
+                        </span>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="provision-agent-name">Name</Label>
+              <Input
+                id="provision-agent-name"
+                value={provisionName}
+                onChange={(e) => {
+                  setProvisionName(e.target.value);
+                  setProvisionError(null);
+                }}
+                placeholder="Tenant support agent"
+                autoFocus
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="provision-agent-desc">Description (optional)</Label>
+              <Textarea
+                id="provision-agent-desc"
+                value={provisionDescription}
+                onChange={(e) => setProvisionDescription(e.target.value)}
+                placeholder="Shown in the agent list and on its profile."
+                rows={3}
+              />
+            </div>
+            {provisionError && (
+              <p className="text-sm text-destructive">{provisionError}</p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setProvisionOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleProvision}
+              disabled={
+                !provisionTargetUserId ||
+                !provisionName.trim() ||
+                saving ||
+                provisionLoading
+              }
+            >
+              {saving ? "Provisioning..." : "Provision Agent"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -430,6 +430,18 @@ export async function adminListAgents() {
   return res.json();
 }
 
+export async function adminCreateUserAgent(
+  userId: string,
+  req: { name: string; description?: string; model?: string; forkFrom?: string },
+) {
+  const res = await apiFetch(`/api/users/${encodeURIComponent(userId)}/agents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  return res.json();
+}
+
 export async function adminCreateUser(req: {
   username: string;
   email: string;
