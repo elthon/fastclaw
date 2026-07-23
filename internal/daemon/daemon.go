@@ -109,6 +109,7 @@ func Start(port int) error {
 	lf.Close()
 
 	fmt.Printf("Daemon started (PID %d)\n", cmd.Process.Pid)
+	fmt.Printf("Web:  http://127.0.0.1:%d\n", port)
 	fmt.Printf("Logs: %s\n", logFile)
 	return nil
 }

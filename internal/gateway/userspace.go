@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
+	"github.com/fastclaw-ai/fastclaw/internal/buildinfo"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/plugin"
@@ -164,8 +165,11 @@ func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.E
 
 // attachSandboxToAgents wires the gateway's shared sandbox pool to every
 // agent in `agentMgr`. When `systemPool` is nil (sandbox disabled or
-// not configured at system scope), falls back to the path-only mode:
-// each agent's file tools are restricted to its own workspace dir.
+// not configured at system scope), hosted deployments fall back to the
+// path-only mode: each agent's file tools are restricted to its own
+// workspace dir. Self-hosted installs intentionally keep direct host file
+// access in this case; without a sandbox the operator's machine is the
+// execution environment, and requests such as listing ~/Desktop must work.
 //
 // Pool ownership stays at the gateway: UserSpace eviction MUST NOT
 // close the pool. The returned reference is the same pointer the
@@ -182,19 +186,32 @@ func attachSandboxToAgents(
 		for _, ag := range agentMgr.All() {
 			ag.SetSandboxPool(systemPool)
 		}
+		if buildinfo.IsSandboxEnforced() {
+			slog.Info("sandbox attached (enforced): all exec routed into sandbox", "user", userID)
+		} else {
+			slog.Info("sandbox attached (optional): host exec stays default, exec(sandbox:true) opts in per call", "user", userID)
+		}
 		return systemPool
 	}
-	for _, rc := range resolved {
-		if rc.Workspace == "" {
-			continue
+	if pathSandboxRequired() {
+		for _, rc := range resolved {
+			if rc.Workspace == "" {
+				continue
+			}
+			_ = os.MkdirAll(rc.Workspace, 0o755)
+			if ag := agentMgr.AgentByID(rc.ID); ag != nil {
+				ag.ToolRegistry().SetSandboxRoot(rc.Workspace)
+			}
 		}
-		_ = os.MkdirAll(rc.Workspace, 0o755)
-		if ag := agentMgr.AgentByID(rc.ID); ag != nil {
-			ag.ToolRegistry().SetSandboxRoot(rc.Workspace)
-		}
+		slog.Info("path sandbox enabled (no system pool configured)", "user", userID)
+	} else {
+		slog.Info("host file access enabled (self-hosted, no system pool configured)", "user", userID)
 	}
-	slog.Info("path sandbox enabled (no system pool configured)", "user", userID)
 	return nil
+}
+
+func pathSandboxRequired() bool {
+	return buildinfo.IsHostedDeploy()
 }
 
 // assembleConfig reads the namespaced settings rows and the scope-merged
@@ -259,6 +276,9 @@ func assembleConfig(ctx context.Context, st store.Store, userID, agentID string)
 		}
 	}
 	if err := scope.SettingInto(ctx, st, NSMemory, userID, agentID, &cfg.Memory); err != nil {
+		return nil, err
+	}
+	if err := scope.SettingInto(ctx, st, NSWorkspaceHistory, userID, agentID, &cfg.WorkspaceHistory); err != nil {
 		return nil, err
 	}
 	if err := scope.SettingInto(ctx, st, NSPrivacy, userID, agentID, &cfg.Privacy); err != nil {
@@ -580,7 +600,7 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 		if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
 			ag.SetSandboxPool(sp.SandboxPool)
 		}
-	} else if rc.Workspace != "" {
+	} else if rc.Workspace != "" && pathSandboxRequired() {
 		_ = os.MkdirAll(rc.Workspace, 0o755)
 		if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
 			ag.ToolRegistry().SetSandboxRoot(rc.Workspace)
@@ -721,6 +741,10 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 			if agentOverride.AutoPersist != nil {
 				v := *agentOverride.AutoPersist
 				rc.AutoPersist = &v
+			}
+			if agentOverride.WorkspaceHistory != nil {
+				v := *agentOverride.WorkspaceHistory
+				rc.WorkspaceHistory = &v
 			}
 		}
 		// Same story for providers: assembleConfig was called with

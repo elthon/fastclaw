@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "github.com/lib/pq"  // PostgreSQL driver
 	_ "modernc.org/sqlite" // SQLite driver (pure Go)
@@ -130,6 +132,9 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateCronJobsAddUserID(ctx); err != nil {
 		return fmt.Errorf("migrate cron_jobs.user_id: %w", err)
 	}
+	if err := d.migrateCronJobsAddChatterID(ctx); err != nil {
+		return fmt.Errorf("migrate cron_jobs.chatter_id: %w", err)
+	}
 	if err := d.migrateConfigsAddScopeColumn(ctx); err != nil {
 		return fmt.Errorf("migrate configs.scope: %w", err)
 	}
@@ -168,6 +173,13 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	}
 	if err := d.migrateConfigsDropLegacyColumns(ctx); err != nil {
 		return fmt.Errorf("migrate configs drop legacy columns: %w", err)
+	}
+	// Promote cron_jobs time columns to timestamptz. Runs last among the
+	// cron_jobs migrations so the table has its final column shape before
+	// the type conversion (ADD COLUMN works on any column type, so the
+	// earlier failure_count / user_id steps don't depend on this one).
+	if err := d.migrateCronJobsTimestampTZ(ctx); err != nil {
+		return fmt.Errorf("migrate cron_jobs timestamptz: %w", err)
 	}
 	return nil
 }
@@ -826,6 +838,31 @@ func (d *DBStore) migrateCronJobsAddUserID(ctx context.Context) error {
 	return nil
 }
 
+// migrateCronJobsAddChatterID retrofits chatter_id onto cron_jobs so a
+// job created by one chatter of a public agent is invisible to the
+// others (the list_cron_jobs tool filters on it). Legacy rows default to
+// '' — they predate per-chatter attribution, so they're treated as
+// owner/system-owned and only surface in the owner's web dashboard / CLI
+// (the agent tool layer hides empty-chatter rows from any chatter). A
+// partial index keeps the lookup cheap and legacy rows out of it.
+func (d *DBStore) migrateCronJobsAddChatterID(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "cron_jobs", "chatter_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := d.db.ExecContext(ctx,
+			`ALTER TABLE cron_jobs ADD COLUMN chatter_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add cron_jobs.chatter_id: %w", err)
+		}
+	}
+	if _, err := d.db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_cron_jobs_chatter ON cron_jobs (chatter_id, agent_id) WHERE chatter_id <> ''`); err != nil {
+		return fmt.Errorf("index cron_jobs.chatter_id: %w", err)
+	}
+	return nil
+}
+
 // migrateSessionsAddChannelTriple retrofits channel / account_id / chat_id
 // onto pre-feature sessions rows. Existing session_keys followed the
 // `<channel>_<chatID>` convention (web_<sid>, wechat_<openid>, …), so the
@@ -949,6 +986,110 @@ func (d *DBStore) migrateCronJobsFailureCount(ctx context.Context) error {
 		return fmt.Errorf("add failure_count: %w", err)
 	}
 	return nil
+}
+
+// migrateCronJobsTimestampTZ fixes the timezone bug on the cron schedule
+// columns. The time columns (next_run, last_run, locked_at, created_at)
+// were declared TIMESTAMP without time zone. lib/pq sends each Go
+// time.Time to the server carrying its original zone offset
+// ("2006-01-02 15:04:05.999999999Z07:00"), but a TIMESTAMP-without-tz
+// column silently drops the offset and keeps only the wall-clock text.
+// Reading it back yields a UTC instant whose wall-clock equals the
+// chatter's local wall-clock — so a "09:00 Asia/Shanghai" job is stored
+// as 09:00 and reinterpreted as 09:00 UTC = 17:00 Beijing, firing 8h
+// late. SQLite is unaffected (its driver stores the full instant).
+//
+// Fix: promote the columns to timestamptz. That type preserves the
+// instant across write/read regardless of offset or session TimeZone
+// (verified end-to-end against lib/pq). This is Postgres-only; SQLite
+// has no separate timestamptz type and already stores instants losslessly.
+//
+// Existing rows are wiped rather than converted: their stored
+// wall-clocks are wrong (offset already dropped), so any conversion
+// would just freeze the bug into the new type. Truncating is safe here
+// because cron rows are ephemeral schedule state, not history — the
+// scheduler rewrites next_run on every fire and deletes "once" rows
+// after firing, so a clean reschedule is the correct recovery and
+// cheaper than per-row guesswork.
+//
+// Idempotent: the probe on pg_catalog.format_type short-circuits once a
+// column is already timestamptz, so re-runs and fresh installs are no-ops.
+// On SQLite the tableHasColumnType probe returns (false, nil) and the
+// whole step is skipped.
+func (d *DBStore) migrateCronJobsTimestampTZ(ctx context.Context) error {
+	if d.dialect != "postgres" {
+		return nil
+	}
+	cols := []string{"next_run", "last_run", "locked_at", "created_at"}
+	needConvert := false
+	for _, col := range cols {
+		isTZ, err := d.columnIsTimestampTZ(ctx, "cron_jobs", col)
+		if err != nil {
+			return fmt.Errorf("probe cron_jobs.%s type: %w", col, err)
+		}
+		if !isTZ {
+			needConvert = true
+			break
+		}
+	}
+	if !needConvert {
+		return nil
+	}
+	// Count first so the upgrade is observable: a non-zero count tells an
+	// operator that existing schedule state is about to be wiped and must be
+	// recreated (see CHANGELOG). The count is logged before the TRUNCATE so
+	// it survives even if the type conversion that follows were to fail.
+	var wiping int
+	if err := d.db.QueryRowContext(ctx, `SELECT count(*) FROM cron_jobs`).Scan(&wiping); err != nil {
+		return fmt.Errorf("count cron_jobs before tz migration: %w", err)
+	}
+	if wiping > 0 {
+		slog.Warn("resetting cron schedule state for timestamptz migration — existing jobs must be recreated",
+			"rows", wiping,
+			"reason", "stored next_run values carry the pre-fix wrong timezone; see CHANGELOG")
+	}
+	// Wipe the schedule state in place, then widen the columns. Doing the
+	// DELETE before the ALTER means the type change is instant on an empty
+	// table (no heap rewrite), and there are no stale rows to convert.
+	if _, err := d.db.ExecContext(ctx, `TRUNCATE TABLE cron_jobs`); err != nil {
+		return fmt.Errorf("truncate cron_jobs: %w", err)
+	}
+	for _, col := range cols {
+		// AT TIME ZONE 'UTC' is a no-op type-wise but documents intent: the
+		// emptied column is interpreted in UTC when repopulated. The column
+		// type becomes timestamptz in all cases.
+		stmt := fmt.Sprintf(
+			`ALTER TABLE cron_jobs ALTER COLUMN %s TYPE timestamptz USING %s AT TIME ZONE 'UTC'`,
+			col, col)
+		if _, err := d.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("convert cron_jobs.%s to timestamptz: %w\nSQL: %s", col, err, stmt)
+		}
+	}
+	return nil
+}
+
+// columnIsTimestampTZ reports whether the column's Postgres type is
+// timestamptz (timestamp with time zone). Used by migrations that need
+// to promote a TIMESTAMP-without-tz column and stay idempotent. Returns
+// (false, nil) on SQLite — callers must gate on dialect themselves.
+func (d *DBStore) columnIsTimestampTZ(ctx context.Context, table, column string) (bool, error) {
+	if d.dialect != "postgres" {
+		return false, nil
+	}
+	var dataType string
+	err := d.db.QueryRowContext(ctx,
+		`SELECT format_type(a.atttypid, a.atttypmod)
+		   FROM pg_attribute a
+		   JOIN pg_class c ON c.oid = a.attrelid
+		  WHERE c.relname = $1 AND a.attname = $2 AND a.attnum > 0`,
+		table, column).Scan(&dataType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return dataType == "timestamp with time zone", nil
 }
 
 // migrateUsersAvatarURL retrofits the avatar_url column onto pre-feature
@@ -1604,6 +1745,19 @@ func (d *DBStore) migrationSQL() []string {
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (agent_id, user_id, filename)
 		)`,
+		`CREATE TABLE IF NOT EXISTS agent_knowledge_chunks (
+			agent_id TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			path TEXT NOT NULL,
+			hash TEXT NOT NULL DEFAULT '',
+			chunk_index INTEGER NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (agent_id, user_id, path, chunk_index)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_knowledge_chunks_file ON agent_knowledge_chunks (agent_id, user_id, path)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_knowledge_chunks_hash ON agent_knowledge_chunks (agent_id, user_id, hash)`,
 		// configs uses (user_id, agent_id) as the ownership pair, matching
 		// agent_files / sessions / session_messages / session_events. The
 		// older (scope, scope_id) pair is gone — scope was redundant
@@ -2002,7 +2156,7 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 	}
 	rows.Close()
 	for _, aid := range ownedAgents {
-		for _, t := range []string{"agent_files", "sessions", "session_messages", "session_events", "cron_jobs"} {
+		for _, t := range []string{"agent_files", "agent_knowledge_chunks", "sessions", "session_messages", "session_events", "cron_jobs"} {
 			if _, err := tx.ExecContext(ctx,
 				fmt.Sprintf("DELETE FROM %s WHERE agent_id = %s", t, d.ph(1)), aid); err != nil {
 				return err
@@ -2029,11 +2183,14 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	// Drop every config row owned by this user — both their own
-	// ('user_id=X, agent_id="') and any per-agent overrides they
-	// authored on someone else's agent ('user_id=X, agent_id=Y').
+	// Drop every config row owned by this user. configs has no user_id
+	// column — ownership lives in scope_id (scope="user" → scope_id=<uid>;
+	// per-user overrides authored on an agent → scope_id="<uid>/<agentID>").
+	// Mirror the agent-side delete above (scope_id = aid OR "%/"+aid) so we
+	// drop both this user's own rows and any overrides they authored.
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("DELETE FROM configs WHERE user_id = %s", d.ph(1)), id); err != nil {
+		fmt.Sprintf("DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s", d.ph(1), d.ph(2)),
+		id, id+"/%"); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -2354,6 +2511,7 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 	defer tx.Rollback()
 	for _, t := range []string{
 		"agent_files",
+		"agent_knowledge_chunks",
 		"sessions",
 		"session_messages",
 		"session_events",
@@ -3091,6 +3249,230 @@ func (d *DBStore) ListAgentFiles(ctx context.Context, agentID, userID string) ([
 	return files, rows.Err()
 }
 
+func (d *DBStore) SaveAgentKnowledgeChunks(ctx context.Context, agentID, userID, path, hash string, chunks []string) error {
+	if agentID == "" {
+		return errors.New("store: SaveAgentKnowledgeChunks requires agent_id")
+	}
+	if userID == "" {
+		return errors.New("store: SaveAgentKnowledgeChunks requires user_id")
+	}
+	if path == "" {
+		return errors.New("store: SaveAgentKnowledgeChunks requires path")
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM agent_knowledge_chunks WHERE agent_id = %s AND user_id = %s AND path = %s`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		agentID, userID, path); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for i, chunk := range chunks {
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" {
+			continue
+		}
+		if d.dialect == "postgres" {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO agent_knowledge_chunks (agent_id, user_id, path, hash, chunk_index, content, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+					ON CONFLICT (agent_id, user_id, path, chunk_index) DO UPDATE SET
+					  hash=$4, content=$6, updated_at=$8`,
+				agentID, userID, path, hash, i, chunk, now, now); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO agent_knowledge_chunks (agent_id, user_id, path, hash, chunk_index, content, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT (agent_id, user_id, path, chunk_index) DO UPDATE SET
+				  hash=excluded.hash, content=excluded.content, updated_at=excluded.updated_at`,
+			agentID, userID, path, hash, i, chunk, now, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (d *DBStore) DeleteAgentKnowledgeChunks(ctx context.Context, agentID, userID, path string) error {
+	if agentID == "" {
+		return errors.New("store: DeleteAgentKnowledgeChunks requires agent_id")
+	}
+	if userID == "" {
+		return errors.New("store: DeleteAgentKnowledgeChunks requires user_id")
+	}
+	if path == "" {
+		return errors.New("store: DeleteAgentKnowledgeChunks requires path")
+	}
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM agent_knowledge_chunks WHERE agent_id = %s AND user_id = %s AND path = %s`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		agentID, userID, path)
+	return err
+}
+
+// ListAgentKnowledgeDocs returns every raw knowledge source file
+// (agent_files rows under knowledge/) for the agent, resolving the
+// owner fallback so shared-agent chatters see the owner's corpus.
+// When both a caller row and an owner row exist for the same path the
+// caller's wins, matching GetAgentFile semantics.
+func (d *DBStore) ListAgentKnowledgeDocs(ctx context.Context, agentID, userID string) ([]KnowledgeDoc, error) {
+	if agentID == "" {
+		return nil, errors.New("store: ListAgentKnowledgeDocs requires agent_id")
+	}
+	if userID == "" {
+		return nil, errors.New("store: ListAgentKnowledgeDocs requires user_id")
+	}
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT filename, content FROM agent_files
+			WHERE agent_id = %s AND filename LIKE 'knowledge/%%'
+			  AND user_id IN (%s, COALESCE((SELECT user_id FROM agents WHERE id = %s), ''))
+			ORDER BY filename, CASE WHEN user_id = %s THEN 0 ELSE 1 END`,
+			d.ph(1), d.ph(2), d.ph(3), d.ph(4)),
+		agentID, userID, agentID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var docs []KnowledgeDoc
+	for rows.Next() {
+		var doc KnowledgeDoc
+		if err := rows.Scan(&doc.Path, &doc.Content); err != nil {
+			return nil, err
+		}
+		if n := len(docs); n > 0 && docs[n-1].Path == doc.Path {
+			continue // owner row shadowed by the caller's own row
+		}
+		docs = append(docs, doc)
+	}
+	return docs, rows.Err()
+}
+
+func (d *DBStore) SearchAgentKnowledgeChunks(ctx context.Context, agentID, userID, query string, limit int) ([]KnowledgeChunkRecord, error) {
+	if agentID == "" {
+		return nil, errors.New("store: SearchAgentKnowledgeChunks requires agent_id")
+	}
+	if userID == "" {
+		return nil, errors.New("store: SearchAgentKnowledgeChunks requires user_id")
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 6
+	}
+	// Knowledge rows are written under the agent owner's user_id, but the
+	// caller may be a chatter / space owner on a shared agent — resolve the
+	// owner in-query like GetAgentFile does so both ids find the corpus.
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT agent_id, user_id, path, hash, chunk_index, content, created_at, updated_at
+			FROM agent_knowledge_chunks
+			WHERE agent_id = %s
+			  AND user_id IN (%s, COALESCE((SELECT user_id FROM agents WHERE id = %s), ''))`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		agentID, userID, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	terms := knowledgeSearchTerms(query)
+	var scored []KnowledgeChunkRecord
+	seen := map[string]bool{}
+	for rows.Next() {
+		var rec KnowledgeChunkRecord
+		if err := rows.Scan(&rec.AgentID, &rec.UserID, &rec.Path, &rec.Hash, &rec.ChunkIndex, &rec.Content, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		key := fmt.Sprintf("%s\x00%d", rec.Path, rec.ChunkIndex)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		rec.Score = scoreKnowledgeChunk(query, terms, rec.Path, rec.Content)
+		if rec.Score > 0 {
+			scored = append(scored, rec)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].Score != scored[j].Score {
+			return scored[i].Score > scored[j].Score
+		}
+		if scored[i].Path != scored[j].Path {
+			return scored[i].Path < scored[j].Path
+		}
+		return scored[i].ChunkIndex < scored[j].ChunkIndex
+	})
+	if len(scored) > limit {
+		scored = scored[:limit]
+	}
+	return scored, nil
+}
+
+func knowledgeSearchTerms(query string) []string {
+	query = strings.ToLower(strings.TrimSpace(query))
+	seen := map[string]bool{}
+	var terms []string
+	add := func(term string) {
+		term = strings.TrimSpace(term)
+		if term == "" || seen[term] {
+			return
+		}
+		seen[term] = true
+		terms = append(terms, term)
+	}
+	var b strings.Builder
+	flush := func() {
+		add(b.String())
+		b.Reset()
+	}
+	for _, r := range query {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(r)
+		default:
+			flush()
+		}
+		if unicode.Is(unicode.Han, r) {
+			add(string(r))
+		}
+	}
+	flush()
+	runes := []rune(query)
+	for i := 0; i+1 < len(runes); i++ {
+		if unicode.Is(unicode.Han, runes[i]) && unicode.Is(unicode.Han, runes[i+1]) {
+			add(string(runes[i : i+2]))
+		}
+	}
+	return terms
+}
+
+func scoreKnowledgeChunk(query string, terms []string, path, content string) int {
+	haystack := strings.ToLower(path + "\n" + content)
+	score := 0
+	if q := strings.ToLower(strings.TrimSpace(query)); q != "" && strings.Contains(haystack, q) {
+		score += 20
+	}
+	for _, term := range terms {
+		if len([]rune(term)) <= 1 {
+			if strings.Contains(haystack, term) {
+				score++
+			}
+			continue
+		}
+		score += strings.Count(haystack, term) * (2 + min(len([]rune(term)), 6))
+	}
+	return score
+}
+
 // --- Scoped configs (providers + channels + settings) ---
 
 // ListConfigs returns all rows of the given (kind, scope) tuple. When
@@ -3650,7 +4032,7 @@ func (d *DBStore) migrateChannelsAddSharedIdentity(ctx context.Context) error {
 
 // --- Cron jobs ---
 
-const cronSelectCols = `id, user_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, failure_count, created_at`
+const cronSelectCols = `id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, failure_count, created_at`
 
 func (d *DBStore) ListCronJobsByOwner(ctx context.Context, ownerUserID string) ([]CronJobRecord, error) {
 	// user_id is denormalized onto cron_jobs; the JOIN against agents
@@ -3683,7 +4065,7 @@ func (d *DBStore) GetCronJob(ctx context.Context, jobID string) (*CronJobRecord,
 		fmt.Sprintf(`SELECT `+cronSelectCols+` FROM cron_jobs WHERE id = %s`, d.ph(1)), jobID)
 	var j CronJobRecord
 	var lastRun, nextRun sql.NullTime
-	if err := row.Scan(&j.ID, &j.UserID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.CreatedAt); err != nil {
+	if err := row.Scan(&j.ID, &j.UserID, &j.ChatterID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.CreatedAt); err != nil {
 		return nil, scanErr(err)
 	}
 	if lastRun.Valid {
@@ -3716,23 +4098,23 @@ func (d *DBStore) SaveCronJob(ctx context.Context, job *CronJobRecord) error {
 	}
 	if d.dialect == "postgres" {
 		_, err := d.db.ExecContext(ctx,
-			`INSERT INTO cron_jobs (id, user_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, created_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			`INSERT INTO cron_jobs (id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 				ON CONFLICT (id) DO UPDATE SET
-				  user_id=$2, agent_id=$3, name=$4, type=$5, schedule=$6, message=$7, channel=$8,
-				  chat_id=$9, account_id=$10, timezone=$11, enabled=$12, last_run=$13, next_run=$14`,
-			job.ID, job.UserID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.CreatedAt)
+				  user_id=$2, chatter_id=$3, agent_id=$4, name=$5, type=$6, schedule=$7, message=$8, channel=$9,
+				  chat_id=$10, account_id=$11, timezone=$12, enabled=$13, last_run=$14, next_run=$15`,
+			job.ID, job.UserID, job.ChatterID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.CreatedAt)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO cron_jobs (id, user_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO cron_jobs (id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
-			  user_id=excluded.user_id, agent_id=excluded.agent_id, name=excluded.name, type=excluded.type,
+			  user_id=excluded.user_id, chatter_id=excluded.chatter_id, agent_id=excluded.agent_id, name=excluded.name, type=excluded.type,
 			  schedule=excluded.schedule, message=excluded.message, channel=excluded.channel,
 			  chat_id=excluded.chat_id, account_id=excluded.account_id, timezone=excluded.timezone,
 			  enabled=excluded.enabled, last_run=excluded.last_run, next_run=excluded.next_run`,
-		job.ID, job.UserID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.CreatedAt)
+		job.ID, job.UserID, job.ChatterID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.CreatedAt)
 	return err
 }
 
@@ -4142,7 +4524,7 @@ func scanCronJobs(rows *sql.Rows) ([]CronJobRecord, error) {
 	for rows.Next() {
 		var j CronJobRecord
 		var lastRun, nextRun sql.NullTime
-		if err := rows.Scan(&j.ID, &j.UserID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.CreatedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.UserID, &j.ChatterID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.CreatedAt); err != nil {
 			return nil, err
 		}
 		if lastRun.Valid {

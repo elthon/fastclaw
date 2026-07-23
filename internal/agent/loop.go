@@ -2,12 +2,12 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +15,7 @@ import (
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent/goal"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
+	"github.com/fastclaw-ai/fastclaw/internal/buildinfo"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
@@ -70,6 +71,8 @@ type Agent struct {
 	ftsStore        *store.FTSStore
 	piiScrubEnabled bool
 	memoryCfg       config.MemoryCfg
+	workspaceHistoryEnabled bool
+	history                 *workspace.History
 	// splitReplies is the per-agent multi-bubble toggle. Gates the
 	// per-turn system-prompt hint that advertises SplitMessageMarker
 	// to the LLM (see renderChannelHints) AND stamps
@@ -148,10 +151,19 @@ type Agent struct {
 // the container while the prompt still advertises host paths — model
 // dutifully writes `/Users/.../workspaces/<id>/foo` which 404s inside
 // the container. The two states must agree.
+//
+// The pool means two different things depending on the deploy mode
+// (buildinfo.IsSandboxEnforced): enforced (hosted / opt-in env) locks
+// ALL exec + file tools into the sandbox; optional (self-hosted
+// default) keeps the host as the execution environment and merely makes
+// the sandbox reachable per-call via exec(sandbox:true) — so the prompt
+// keeps advertising host paths and the host-shell fallback stays legal.
 func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 	a.sandboxPool = p
+	enforced := p != nil && buildinfo.IsSandboxEnforced()
 	if a.ctxBuilder != nil {
-		a.ctxBuilder.sandboxEnabled = p != nil
+		a.ctxBuilder.sandboxEnabled = enforced
+		a.ctxBuilder.sandboxOptional = p != nil && !enforced
 	}
 	// Tell the tool registry sandbox is required so its host-shell exec
 	// fallback refuses to run when bindSession can't bind an executor.
@@ -159,8 +171,9 @@ func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 	// exec actually using sandbox) must agree — without this, a Docker
 	// daemon hiccup turns into "sh: python: command not found" on the
 	// host instead of a clear "sandbox required but unavailable" error.
+	// Only in enforced mode: optional mode's host fallback is the point.
 	if a.registry != nil {
-		a.registry.SetSandboxRequired(p != nil)
+		a.registry.SetSandboxRequired(enforced)
 	}
 }
 
@@ -197,8 +210,24 @@ func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, 
 	}
 	a.registry.SetMessageContext(channel, accountID, sessionID)
 	if a.sandboxPool == nil {
+		a.registry.SetSandboxProvider(nil)
 		return
 	}
+	if !buildinfo.IsSandboxEnforced() {
+		// Optional-sandbox mode (self-hosted): the host stays the default
+		// execution environment, so DON'T spin up a container for every
+		// session. Hand the registry a lazy resolver instead — the exec
+		// tool calls it only when the model passes sandbox:true, and the
+		// pool caches per (agent, project, session) so repeat calls in a
+		// turn reuse the same container.
+		pool := a.sandboxPool
+		agentName := a.name
+		a.registry.SetSandboxProvider(func(ctx context.Context) (sandbox.Executor, error) {
+			return pool.Get(ctx, agentName, projectID, sessionID)
+		})
+		return
+	}
+	a.registry.SetSandboxProvider(nil)
 	ex, err := a.sandboxPool.Get(ctx, a.name, projectID, sessionID)
 	if err != nil {
 		// Error level (not warn) — when sandbox is required and we
@@ -213,6 +242,13 @@ func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, 
 	a.registry.SetExecutor(ex)
 }
 
+// newWorkspaceHistory builds the git-snapshot history store rooted under
+// FASTCLAW_HOME. Package-level helper so call sites where a local
+// `workspace` string shadows the workspace package can use it.
+func newWorkspaceHistory(homeDir string) *workspace.History {
+	return workspace.NewHistory(filepath.Join(homeDir, "workspace-history"))
+}
+
 // NewAgent creates a new Agent from a resolved config.
 func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string) *Agent {
 	return NewAgentWithSkillsCfg(rc, prov, mb, homeDir, config.SkillsCfg{})
@@ -222,6 +258,10 @@ func NewAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBu
 func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, homeDir string, fullCfg *config.Config) *Agent {
 	ag := NewAgentWithSkillsCfg(rc, prov, mb, homeDir, fullCfg.Skills)
 	ag.memoryCfg = fullCfg.Memory
+	ag.workspaceHistoryEnabled = fullCfg.WorkspaceHistory.Enabled
+	if ag.workspaceHistoryEnabled {
+		ag.history = newWorkspaceHistory(homeDir)
+	}
 	ag.piiScrubEnabled = fullCfg.Privacy.PIIScrubbing.Enabled
 	// splitReplies is plumbed inside NewAgentWithSkillsCfg so foreign-
 	// attached agents also pick up the toggle; don't re-stamp here.
@@ -304,10 +344,14 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	// sandbox was REQUIRED for this agent — without that signal an
 	// executor-pool failure would silently fall through to /bin/sh on the
 	// host, defeating the security boundary the user asked for.
+	// Only when sandbox is a boundary (enforced): in optional mode
+	// (self-hosted default) the host shell IS the intended default and
+	// the sandbox is just a per-call tool, so sbCfg stays nil.
 	skillDirs := loader.AllSkillDirs()
 	tools.RegisterLoadSkill(registry, skillDirs)
+	sandboxEnforced := rc.Sandbox.Enabled && buildinfo.IsSandboxEnforced()
 	var sbCfg *tools.SandboxConfig
-	if rc.Sandbox.Enabled {
+	if sandboxEnforced {
 		sbCfg = &tools.SandboxConfig{Enabled: true}
 	}
 	tools.RegisterExecWithSkillEnv(registry, sbCfg, loader.SkillEnvVars, skillDirs)
@@ -331,7 +375,7 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		registry:             registry,
 		sessions:             session.NewManager(rc.Home + "/sessions"),
 		memory:               memory,
-		ctxBuilder:           newContextBuilderWithSandbox(rc.Home, workspace, memory, skillsSummary, rc.Thinking, rc.Sandbox.Enabled, rc.Sandbox.Backend, rc.PromptMode),
+		ctxBuilder:           newContextBuilderWithSandbox(rc.Home, workspace, memory, skillsSummary, rc.Thinking, sandboxEnforced, rc.Sandbox.Backend, rc.PromptMode),
 		hooks:                hooks,
 		model:                rc.Model,
 		maxTokens:            rc.MaxTokens,
@@ -382,6 +426,15 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	// AutoPersist without specifying a cadence.
 	if rc.AutoPersist != nil {
 		ag.memoryCfg.AutoPersist.Enabled = *rc.AutoPersist
+	}
+	// Workspace history toggle — same per-agent pointer pattern as
+	// AutoPersist above (NewAgentWithSkillsCfg is the production path;
+	// the fullCfg copy in NewAgentWithFullCfg covers the system default).
+	if rc.WorkspaceHistory != nil {
+		ag.workspaceHistoryEnabled = *rc.WorkspaceHistory
+	}
+	if ag.workspaceHistoryEnabled && ag.history == nil {
+		ag.history = newWorkspaceHistory(homeDir)
 	}
 	if ag.memoryCfg.AutoPersist.EveryNTurns == 0 {
 		ag.memoryCfg.AutoPersist.EveryNTurns = 5
@@ -1697,6 +1750,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	}
 
 	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, a.memory.WithUserID(chatterUID))
+	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 	// Tool catalog injection: plan mode passes tools=nil to the LLM so
 	// it can't accidentally call anything, but that also hides the
@@ -1713,13 +1767,18 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	if catalog != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: catalog})
 	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sess.GetMessages(), chatterUID)...)
+	messages = append(messages, withConversationGapContext(sess.GetMessages())...)
 	if a.piiScrubEnabled {
 		messages = privacy.ScrubMessages(messages)
 	}
 
 	resp, err := a.streamChatToResponse(ctx, messages, nil)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("plan-mode chat canceled", "agent", a.name)
+			emitEvent(ctx, ChatEvent{Type: "done"})
+			return ""
+		}
 		slog.Error("plan-mode chat failed", "agent", a.name, "error", err)
 		emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 		emitEvent(ctx, ChatEvent{Type: "done"})
@@ -1727,7 +1786,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	}
 	a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 
-	planMeta := map[string]any{"planMode": true}
+	planMeta := mergeMetadata(map[string]any{"planMode": true}, knowledgeMeta)
 	sess.Append(provider.Message{
 		Role:         "assistant",
 		Content:      resp.Content,
@@ -1819,6 +1878,173 @@ func llmRetry(ctx context.Context, label string, fn func(context.Context) (*prov
 	slog.Error("LLM call failed after all retries",
 		"agent", label, "attempts", llmRetryAttempts, "error", lastErr)
 	return nil, lastErr
+}
+
+// sameToolFailStreakLimit and softDeadlineFraction gate the two stall-
+// prevention mechanisms added per fastclaw-timeout-error-root-cause-
+// analysis.md (P0.1 / P1). sameToolFailStreakLimit is intentionally
+// tighter than the pre-existing allFailedRounds/failedRoundsLimit (3):
+// "the same tool failed twice in a row, even with different arguments"
+// is a stronger unproductive-loop signal than "some tool in the round
+// failed", and should trip sooner. softDeadlineFraction leaves ~20% of
+// the turn's wall-time budget as headroom for one more full LLM
+// round-trip + response after the wrap-up nudge fires.
+const sameToolFailStreakLimit = 2
+const softDeadlineFraction = 0.20
+
+// toolProgressInterval is how often runToolsWithProgress emits a
+// "tool_progress" heartbeat while a tool-execution round is in flight.
+const toolProgressInterval = 8 * time.Second
+
+// sameToolFailStreakState is the running state for the P0.1 same-tool-
+// repeated-failure detector, threaded through updateSameToolFailStreak
+// across a turn's tool-result processing. Extracted into a small pure
+// struct + function (rather than three loose local vars mutated inline
+// in both HandleMessage and HandleMessageStream) specifically so the
+// counting/reset rules have one implementation and can be unit-tested
+// directly — see TestUpdateSameToolFailStreak in loop_stall_test.go.
+// Building a full fake-Provider/Agent harness to exercise this inline
+// would have required far more scaffolding than the pure-function
+// extraction costs.
+type sameToolFailStreakState struct {
+	streak          int
+	lastFailedTool  string
+	lastFailureText string
+}
+
+// updateSameToolFailStreak folds one tool-result's outcome into the
+// running streak and returns the updated state. failed should come
+// from isFailedToolResult; summary is the one-line failure description
+// to remember for buildFallbackReply (ignored when failed is false).
+//
+// Rules:
+//   - Same tool, still failing: streak increments.
+//   - A different tool starts failing: streak resets to 1, the
+//     tracked tool switches to this one.
+//   - The tool whose streak we're tracking now succeeds: streak resets
+//     to 0, tracked tool cleared.
+//   - Some other (not currently tracked) tool succeeds: no change —
+//     this call doesn't concern the tool we're tracking.
+func updateSameToolFailStreak(state sameToolFailStreakState, toolName string, failed bool, summary string) sameToolFailStreakState {
+	if failed {
+		if toolName == state.lastFailedTool {
+			state.streak++
+		} else {
+			state.streak = 1
+			state.lastFailedTool = toolName
+		}
+		state.lastFailureText = summary
+		return state
+	}
+	if toolName == state.lastFailedTool {
+		state.streak = 0
+		state.lastFailedTool = ""
+	}
+	return state
+}
+
+// buildFallbackReply assembles a context-aware message when a turn is
+// cut short by an error, instead of the old static string that
+// discarded every diagnostic clue the agent had already gathered.
+// Modeled on the pattern already used in subagent.go's DeadlineExceeded
+// handling (see runSubagentLoop) — that path already surfaces "ran out
+// of its N-minute wall-time budget" instead of a canned string; this
+// brings loop.go's two top-level paths (HandleMessage,
+// HandleMessageStream) up to the same standard.
+//
+// replyParts may be nil/empty (HandleMessageStream doesn't accumulate
+// reply text the way HandleMessage does) — handled gracefully.
+func buildFallbackReply(err error, replyParts []string, lastToolName, lastToolFailure string) string {
+	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	var sb strings.Builder
+	if len(replyParts) > 0 {
+		sb.WriteString(joinReplyParts(replyParts))
+		sb.WriteString("\n\n")
+	}
+	switch {
+	case timedOut && lastToolName != "":
+		fmt.Fprintf(&sb, "I ran out of time while working on this — I was last troubleshooting %q, which was failing with: %s. Want me to keep going, or would you like to address that first?",
+			lastToolName, firstNonEmptyLine(lastToolFailure))
+	case timedOut:
+		sb.WriteString("I ran out of time before finishing this. Want me to try again, possibly with a narrower scope?")
+	default:
+		fmt.Fprintf(&sb, "Sorry, I hit an error while processing this: %s", err.Error())
+	}
+	return sb.String()
+}
+
+// maybeInjectSoftDeadlineWarning checks ctx's deadline (if any) against
+// the turn's start time. When less than softDeadlineFraction of the
+// total budget remains and this hasn't fired yet this turn, it appends
+// a system message asking the model to stop exploring and deliver its
+// best answer now, emits a "status" event (phase="wrap_up") so callers
+// can surface it, and returns fired=true so the caller can gate this to
+// fire exactly once per turn.
+//
+// No-ops (returns messages unchanged, fired=false) when ctx has no
+// deadline — some callers (tests, certain cron paths) don't set one.
+func maybeInjectSoftDeadlineWarning(ctx context.Context, turnStart time.Time, messages []provider.Message, alreadyFired bool) ([]provider.Message, bool) {
+	if alreadyFired {
+		return messages, true
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return messages, false
+	}
+	total := deadline.Sub(turnStart)
+	if total <= 0 {
+		return messages, false
+	}
+	remaining := time.Until(deadline)
+	if float64(remaining) > float64(total)*softDeadlineFraction {
+		return messages, false
+	}
+	emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{
+		"phase":             "wrap_up",
+		"remaining_seconds": remaining.Seconds(),
+	}})
+	warnMsg := provider.Message{
+		Role: "system",
+		Content: fmt.Sprintf(
+			"Time budget warning: roughly %.0fs remain before this turn is forcibly cut off. "+
+				"Stop starting new tool calls. Summarize what you've found so far and give your "+
+				"best-effort answer now.",
+			remaining.Seconds()),
+	}
+	return append(messages, warnMsg), true
+}
+
+// runToolsWithProgress wraps executeToolsConcurrently with a ticker that
+// emits "tool_progress" events every toolProgressInterval while the
+// call is in flight, so a slow tool (sandbox exec, subagent delegate)
+// doesn't look frozen between the tool_call and tool_result events.
+// Stops cleanly via a done channel the instant the blocking call
+// returns — no goroutine leak, no event fired after the fact.
+func (a *Agent) runToolsWithProgress(ctx context.Context, toolCalls []provider.ToolCall, workspace string) []toolCallResult {
+	toolNames := make([]string, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		toolNames = append(toolNames, tc.Function.Name)
+	}
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		ticker := time.NewTicker(toolProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				emitEvent(ctx, ChatEvent{Type: "tool_progress", Data: map[string]any{
+					"tools":           toolNames,
+					"elapsed_seconds": time.Since(start).Seconds(),
+				}})
+			}
+		}
+	}()
+	results := a.engine.executeToolsConcurrently(ctx, a.registry, toolCalls, workspace)
+	close(done)
+	return results
 }
 
 // HandleMessage processes an inbound message through the ReAct loop.
@@ -1919,7 +2145,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// admin. File tools use this to refuse identity-file reads from
 	// regular chatters (SOUL/IDENTITY/BOOTSTRAP/... leak as verbatim
 	// chat replies otherwise).
-	a.registry.SetCallerIsAdmin(a.isAdminChatter(msg))
+	a.registry.SetCallerIsAdmin(a.isTrustedTurn(msg))
 	// Plumb the persistent session_key for goal-scoped tools.
 	// SetSessionID above uses msg.ChatID (the channel-level chat
 	// identifier); goal tools need the durable session.Session.SessionKey
@@ -1961,6 +2187,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 	chatterMem := a.memory.WithUserID(chatterUID)
 	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem)
+	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 
 	// Hook: AfterSystemPrompt
@@ -2008,17 +2235,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
+	messages = append(messages, withConversationGapContext(sessionMsgs)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
-	// Loop detection: track consecutive identical tool calls
-	type toolCallSig struct {
-		name string
-		hash [32]byte
-	}
-	var lastSig toolCallSig
-	consecutiveCount := 0
+	// Loop detection: track consecutive identical tool calls and results.
+	var loopDetector toolLoopDetector
 	totalToolCalls := 0
 	// allFailedRounds is the count of CONSECUTIVE rounds where every
 	// tool result came back as a 4xx/5xx HTTP error or an executor
@@ -2029,6 +2251,24 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// directly instead of burning more rounds chasing dead URLs.
 	allFailedRounds := 0
 	const failedRoundsLimit = 3
+	// sameToolFailStreak / lastFailedToolName track "the same tool
+	// failed N times in a row, regardless of arguments" — a tighter,
+	// argument-agnostic sibling of allFailedRounds. See
+	// fastclaw-timeout-error-root-cause-analysis.md P0.1: this catches
+	// e.g. two differently-worded "browser-use --doctor" retries that
+	// both fail, one round sooner than allFailedRounds' threshold of 3
+	// would, before the turn's wall-clock budget runs out.
+	//
+	// streakState is a sameToolFailStreakState (see updateSameToolFailStreak)
+	// rather than loose vars specifically so the counting/reset rules
+	// are unit-tested independently of this function.
+	streakState := sameToolFailStreakState{}
+	// turnStart / softDeadlineFired back the soft-deadline heartbeat
+	// (P1): once ctx's deadline is within softDeadlineFraction of
+	// arriving, inject a one-time wrap-up nudge instead of letting the
+	// turn run until it's hard-killed mid-request.
+	turnStart := time.Now()
+	softDeadlineFired := false
 
 	// replyParts accumulates every non-empty assistant text segment
 	// emitted across iterations (preamble lines before tool calls + the
@@ -2048,9 +2288,13 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			"chat_id", msg.ChatID,
 		)
 
+		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
+
 		// Hook: BeforeModelCall
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
+		// Read back messages that may have been modified by sync hooks (e.g., mem0)
+		messages = hcBefore.Messages
 
 		// PII scrubbing: redact sensitive data before sending to LLM
 		llmMessages := messages
@@ -2070,8 +2314,23 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		// forced to produce a text answer with what it has. The
 		// system message above the request makes the constraint
 		// explicit so the model doesn't apologetically dangle.
+		//
+		// sameToolFailStreak is checked first (tighter threshold, more
+		// specific signal) so the two nudges don't both fire the same
+		// round.
 		callTools := toolDefs
-		if allFailedRounds >= failedRoundsLimit {
+		if streakState.streak >= sameToolFailStreakLimit {
+			slog.Warn("same tool failed repeatedly — forcing convergence",
+				"agent", a.name, "tool", streakState.lastFailedTool, "streak", streakState.streak)
+			callTools = nil
+			llmMessages = append(llmMessages, provider.Message{
+				Role: "system",
+				Content: fmt.Sprintf(
+					"The tool %q has failed %d times in a row (even with different arguments). Stop retrying it. Either explain to the user what's blocking it, or answer with what you already know.",
+					streakState.lastFailedTool, streakState.streak,
+				),
+			})
+		} else if allFailedRounds >= failedRoundsLimit {
 			slog.Warn("disabling tools after consecutive failed rounds",
 				"agent", a.name, "failed_rounds", allFailedRounds)
 			callTools = nil
@@ -2093,10 +2352,20 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
+			// Cancellation is a control-flow outcome (Stop, shutdown, or a
+			// disconnected caller), not a provider failure. Publishing it as
+			// an error leaves a persisted "context canceled" bubble that can
+			// arrive after the UI has already rendered "(Stopped)".
+			if errors.Is(err, context.Canceled) {
+				slog.Info("LLM chat canceled", "agent", a.name)
+				emitEvent(ctx, ChatEvent{Type: "done"})
+				return ""
+			}
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
+			fallback := buildFallbackReply(err, replyParts, streakState.lastFailedTool, streakState.lastFailureText)
 			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
-			return "Sorry, I encountered an error processing your request."
+			return fallback
 		}
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
@@ -2108,9 +2377,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				emitEvent(ctx, ChatEvent{Type: "done"})
 				return emptyMsg
 			}
-			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
+			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
 			sess.Append(asst)
-			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
+			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content, "metadata": knowledgeMeta}})
 			if resp.Content != "" {
 				replyParts = append(replyParts, resp.Content)
 			}
@@ -2137,7 +2406,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 		// Emit assistant content before tool calls if present
 		if resp.Content != "" {
-			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
+			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content, "metadata": knowledgeMeta}})
 			replyParts = append(replyParts, resp.Content)
 		}
 
@@ -2155,40 +2424,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			Content:      resp.Content,
 			ToolCalls:    resp.ToolCalls,
 			Thinking:     resp.Thinking,
+			Metadata:     knowledgeMeta,
 			Timestamp:    time.Now().UnixMilli(),
 			RawAssistant: resp.RawAssistant,
 		}
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
-
-		// Loop detection: check before executing
-		loopDetected := false
-		for _, tc := range resp.ToolCalls {
-			sig := toolCallSig{
-				name: tc.Function.Name,
-				hash: sha256.Sum256([]byte(tc.Function.Arguments)),
-			}
-			if sig.name == lastSig.name && sig.hash == lastSig.hash {
-				consecutiveCount++
-			} else {
-				consecutiveCount = 1
-				lastSig = sig
-			}
-			if consecutiveCount >= 3 {
-				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
-				warnMsg := provider.Message{
-					Role:    "system",
-					Content: "Loop detected: you called the same tool with the same arguments 3 times. Please try a different approach.",
-				}
-				sess.Append(warnMsg)
-				messages = append(messages, warnMsg)
-				loopDetected = true
-				break
-			}
-		}
-		if loopDetected {
-			break
-		}
 
 		// Fire BeforeToolCall hooks
 		for _, tc := range resp.ToolCalls {
@@ -2231,7 +2472,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			"agent", a.name,
 			"count", len(executeCalls),
 		)
-		results := a.engine.executeToolsConcurrently(ctx, a.registry, executeCalls, a.workspacePath)
+		results := a.runToolsWithProgress(ctx, executeCalls, a.workspacePath)
 		// Append synthetic deferred results so every original tool_use
 		// id has a paired tool_result. The deferred message tells the
 		// model exactly why it didn't run — it can re-issue next
@@ -2273,6 +2514,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			results = padded
 		}
 
+		loopDetected := false
 		// Round-level failure detection: did EVERY result come back
 		// as a 4xx/5xx HTTP error or executor error? Tracked here so
 		// the next iteration can decide whether to drop tools.
@@ -2318,10 +2560,17 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 					summary = firstNonEmptyLine(resultContent)
 				}
 				a.registry.RecordToolFailure(r.toolName, tc.Function.Arguments, summary)
+				// Same-tool-fail-streak tracking (P0.1): counts
+				// consecutive failures of THIS tool regardless of
+				// arguments, independent of roundAllFailed (which
+				// requires the whole round to fail). See
+				// updateSameToolFailStreak for the tested counting rules.
+				streakState = updateSameToolFailStreak(streakState, r.toolName, true, summary)
 			} else {
 				// One call in this round produced a real result —
 				// the round as a whole isn't "all failed".
 				roundAllFailed = false
+				streakState = updateSameToolFailStreak(streakState, r.toolName, false, "")
 			}
 
 			// Index in FTS if available
@@ -2353,6 +2602,16 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				evt["metadata"] = meta
 			}
 			emitEvent(ctx, ChatEvent{Type: "tool_result", Data: evt})
+
+			if loopDetector.Observe(tc, resultContent) && !loopDetected {
+				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
+				loopDetected = true
+			}
+		}
+		if loopDetected {
+			warnMsg := repeatedToolCallWarning("Loop detected: you called the same tool with the same arguments and received the same result 3 times. Please try a different approach.")
+			sess.Append(warnMsg)
+			messages = append(messages, warnMsg)
 		}
 		// Update consecutive-failed-rounds tally now that the whole
 		// round's results have been processed. A single non-failure
@@ -2362,6 +2621,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			allFailedRounds++
 		} else {
 			allFailedRounds = 0
+		}
+		if loopDetected {
+			break
 		}
 
 		// Steering: messages that arrived while this tool round ran are
@@ -2394,7 +2656,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		// badge attached.
 		finalContent = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
 	}
-	capMeta := iterationCapMetadata(a.maxToolIterations)
+	capMeta := mergeMetadata(iterationCapMetadata(a.maxToolIterations), knowledgeMeta)
 	sess.Append(provider.Message{
 		Role:      "assistant",
 		Content:   finalContent,
@@ -2628,6 +2890,30 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 			}
 		}()
 	}
+
+	// Workspace version history: snapshot the session workspace at turn
+	// boundary (opt-in; LocalFS only — S3-backed stores skip). Commit
+	// here, not per tool write, because sandbox exec writes via the bind
+	// mount are invisible to this process; the turn boundary is the one
+	// consistency point that covers file tools, exec and uploads.
+	if a.workspaceHistoryEnabled && a.history != nil {
+		if ls, ok := a.workspaceStore.(workspace.LocalScoper); ok {
+			scope := msg.ChatID
+			if pid := a.registry.ProjectID(); pid != "" {
+				scope = pid + "-" + msg.ChatID
+			}
+			workTree, _ := ls.LocalScopeDir(a.agentID, a.registry.ProjectID(), msg.ChatID)
+			go func() {
+				// context.Background(): the turn ctx is cancelled when the HTTP
+				// handler returns, and a killed git leaves index.lock behind,
+				// silently breaking every later snapshot of this scope.
+				// runGit has its own 30s timeout as the bound.
+				if err := a.history.Commit(context.Background(), scope, workTree, "turn "+time.Now().Format(time.RFC3339)); err != nil {
+					slog.Warn("workspace history commit failed", "agent", a.name, "scope", scope, "error", err)
+				}
+			}()
+		}
+	}
 }
 
 // HandleMessageStream processes a message through the ReAct loop and returns
@@ -2670,7 +2956,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		sess.SetProviderModel(prov, mdl)
 	}
 	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
-	a.registry.SetCallerIsAdmin(a.isAdminChatter(msg))
+	a.registry.SetCallerIsAdmin(a.isTrustedTurn(msg))
 	a.registry.SetGoalSessionKey(sess.SessionKey())
 	// Per-user file writes (USER.md / MEMORY.md) need to land in the
 	// per-turn chatter's row, not the UserSpace owner — see
@@ -2690,6 +2976,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 	chatterMem := a.memory.WithUserID(chatterUID)
 	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem)
+	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt, UserID: a.ownerUserID})
 
@@ -2723,26 +3010,51 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
+	messages = append(messages, withConversationGapContext(sessionMsgs)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
-	type toolCallSig struct {
-		name string
-		hash [32]byte
-	}
-	var lastSig toolCallSig
-	consecutiveCount := 0
+	var loopDetector toolLoopDetector
 	totalToolCalls := 0
+	// sameToolFailStreak / lastFailedToolName / lastToolFailureSummary
+	// and turnStart / softDeadlineFired mirror the same additions in
+	// HandleMessage — see fastclaw-timeout-error-root-cause-analysis.md
+	// P0.1 / P1. HandleMessageStream previously had no failure
+	// classification at all in its tool-result loop; isFailedToolResult
+	// (already used by HandleMessage) is reused here for parity.
+	streakState := sameToolFailStreakState{}
+	turnStart := time.Now()
+	softDeadlineFired := false
 
 	// ReAct loop - use Chat for tool iterations
 	for i := 0; i < a.maxToolIterations; i++ {
+		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
+
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
+		// Read back messages that may have been modified by sync hooks (e.g., mem0)
+		messages = hcBefore.Messages
 
-		dumpLLMRequest(a.name, a.model, messages, toolDefs)
+		// callTools mirrors HandleMessage's disable-tools-after-
+		// repeated-failure gate (P0.1). sameToolFailStreakLimit is
+		// checked first (tighter threshold, more specific signal).
+		callTools := toolDefs
+		if streakState.streak >= sameToolFailStreakLimit {
+			slog.Warn("same tool failed repeatedly — forcing convergence",
+				"agent", a.name, "tool", streakState.lastFailedTool, "streak", streakState.streak)
+			callTools = nil
+			messages = append(messages, provider.Message{
+				Role: "system",
+				Content: fmt.Sprintf(
+					"The tool %q has failed %d times in a row (even with different arguments). Stop retrying it. Either explain to the user what's blocking it, or answer with what you already know.",
+					streakState.lastFailedTool, streakState.streak,
+				),
+			})
+		}
+
+		dumpLLMRequest(a.name, a.model, messages, callTools)
 		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-			return a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+			return a.provider.Chat(ctx, messages, callTools, a.model, a.maxTokens, a.temperature)
 		})
 
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
@@ -2750,7 +3062,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 		if err != nil {
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
-			return a.stringStream("Sorry, I encountered an error processing your request.")
+			return a.stringStream(buildFallbackReply(err, nil, streakState.lastFailedTool, streakState.lastFailureText))
 		}
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
@@ -2760,8 +3072,9 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			sr, err := a.provider.ChatStream(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
 			if err != nil {
 				slog.Error("LLM stream failed, falling back", "agent", a.name, "error", err)
-				sess.Append(provider.Message{Role: "assistant", Content: resp.Content})
-				a.runPostTurn(ctx, msg, append(messages, provider.Message{Role: "assistant", Content: resp.Content}), totalToolCalls, chatterMem)
+				fallbackMsg := provider.Message{Role: "assistant", Content: resp.Content, Metadata: knowledgeMeta}
+				sess.Append(fallbackMsg)
+				a.runPostTurn(ctx, msg, append(messages, fallbackMsg), totalToolCalls, chatterMem)
 				return a.stringStream(resp.Content)
 			}
 
@@ -2809,7 +3122,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 					}
 				}
 				a.meterTokens(ctx, sess.Key(), streamUsage, 0)
-				msg := provider.Message{Role: "assistant", Content: full.String(), Thinking: thinking}
+				msg := provider.Message{Role: "assistant", Content: full.String(), Thinking: thinking, Metadata: knowledgeMeta}
 				switch {
 				case len(rawAssistant) > 0:
 					// Provider already serialized the assistant message
@@ -2845,40 +3158,12 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			Content:      resp.Content,
 			ToolCalls:    resp.ToolCalls,
 			Thinking:     resp.Thinking,
+			Metadata:     knowledgeMeta,
 			Timestamp:    time.Now().UnixMilli(),
 			RawAssistant: resp.RawAssistant,
 		}
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
-
-		// Loop detection
-		loopDetected := false
-		for _, tc := range resp.ToolCalls {
-			sig := toolCallSig{
-				name: tc.Function.Name,
-				hash: sha256.Sum256([]byte(tc.Function.Arguments)),
-			}
-			if sig.name == lastSig.name && sig.hash == lastSig.hash {
-				consecutiveCount++
-			} else {
-				consecutiveCount = 1
-				lastSig = sig
-			}
-			if consecutiveCount >= 3 {
-				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
-				warnMsg := provider.Message{
-					Role:    "system",
-					Content: "Loop detected: you called the same tool with the same arguments 3 times. Please try a different approach.",
-				}
-				sess.Append(warnMsg)
-				messages = append(messages, warnMsg)
-				loopDetected = true
-				break
-			}
-		}
-		if loopDetected {
-			break
-		}
 
 		// Fire BeforeToolCall hooks
 		for _, tc := range resp.ToolCalls {
@@ -2886,8 +3171,9 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		}
 
 		// Execute tools concurrently via SDK engine
-		results := a.engine.executeToolsConcurrently(ctx, a.registry, resp.ToolCalls, a.workspacePath)
+		results := a.runToolsWithProgress(ctx, resp.ToolCalls, a.workspacePath)
 		totalToolCalls += len(results)
+		loopDetected := false
 
 		for idx, r := range results {
 			tc := resp.ToolCalls[idx]
@@ -2898,6 +3184,23 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 				slog.Warn("tool execution error", "agent", a.name, "name", r.toolName, "error", r.err)
 			}
 
+			// Same-tool-fail-streak tracking (P0.1) — this function had
+			// no failure classification at all before; isFailedToolResult
+			// is the same helper HandleMessage already uses. See
+			// updateSameToolFailStreak for the tested counting rules.
+			if isFailedToolResult(r.err, resultContent) {
+				summary := ""
+				if r.err != nil {
+					summary = r.err.Error()
+				}
+				if summary == "" || summary == "<nil>" {
+					summary = firstNonEmptyLine(resultContent)
+				}
+				streakState = updateSameToolFailStreak(streakState, r.toolName, true, summary)
+			} else {
+				streakState = updateSameToolFailStreak(streakState, r.toolName, false, "")
+			}
+
 			if mediaPaths := extractMediaPaths(resultContent); len(mediaPaths) > 0 {
 				a.sendMediaFiles(msg, mediaPaths)
 			}
@@ -2905,6 +3208,19 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			toolMsg := provider.Message{Role: "tool", Content: resultContent, ToolCallID: tc.ID, Name: r.toolName, Metadata: meta}
 			sess.Append(toolMsg)
 			messages = append(messages, toolMsg)
+
+			if loopDetector.Observe(tc, resultContent) && !loopDetected {
+				slog.Warn("tool loop detected", "agent", a.name, "tool", tc.Function.Name)
+				loopDetected = true
+			}
+		}
+		if loopDetected {
+			warnMsg := repeatedToolCallWarning("Loop detected: you called the same tool with the same arguments and received the same result 3 times. Please try a different approach.")
+			sess.Append(warnMsg)
+			messages = append(messages, warnMsg)
+		}
+		if loopDetected {
+			break
 		}
 	}
 
@@ -2918,7 +3234,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 // Returned StreamReader matches the contract of the normal "final
 // response" branch above so callers don't need a special case.
 func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.InboundMessage, messages []provider.Message, sess *session.Session, toolCallCount int, chatterMem *Memory) *provider.StreamReader {
-	capMeta := iterationCapMetadata(a.maxToolIterations)
+	capMeta := mergeMetadata(iterationCapMetadata(a.maxToolIterations), knowledgeMetadata(extractKnowledgeCitationSources(firstSystemContent(messages))))
 	finalMessages := append(messages, capReachedNudge(a.maxToolIterations))
 	resp, err := a.provider.Chat(ctx, finalMessages, nil, a.model, a.maxTokens, a.temperature)
 	content := ""
@@ -3096,6 +3412,10 @@ var chatbotBuiltinAllowlist = []string{
 	// news, prices, etc.) without requiring full agent mode.
 	"web_search",
 	"web_fetch",
+	// knowledge_search retrieves from the owner-uploaded knowledge base
+	// when the corpus is too large to inject into the system prompt in
+	// full — customer-support chatbots are its primary consumer.
+	"knowledge_search",
 	// exec + load_skill let the chatbot invoke installed skills
 	// (e.g. image generation, data lookup). Skills are the primary
 	// extension mechanism — without exec the chatbot can't run them.
@@ -3151,28 +3471,51 @@ func (a *Agent) chatterLocation(chatterUID string) *time.Location {
 	return scope.LoadLocationOrLocal(tz)
 }
 
-// withMessageTimestamps returns a COPY of msgs where each user message is
-// prefixed with its send time in the chatter's timezone, e.g.
-// "[2026-06-13 22:15 Fri] …". This is what lets the model reason about
-// time across a conversation — tell today from earlier days, and not say
-// "good night" at midday. The originals are never mutated (the prefix is
-// a read-time view for the LLM, not stored history), so the session store
-// stays clean and the next turn doesn't double-prefix. The system prompt
-// (context.go dateLine) tells the model what the bracketed prefix means.
-func (a *Agent) withMessageTimestampsForChatter(msgs []provider.Message, chatterUID string) []provider.Message {
-	if len(msgs) == 0 {
+const conversationGapThreshold = 24 * time.Hour
+
+// withConversationGapContext keeps message bodies clean while still telling
+// the model when the latest turn resumes a stale conversation. Timestamps stay
+// in message metadata and are never rendered as user-visible text.
+func withConversationGapContext(msgs []provider.Message) []provider.Message {
+	if len(msgs) < 2 {
 		return msgs
 	}
-	loc := a.chatterLocation(chatterUID)
-	out := make([]provider.Message, len(msgs))
-	for i, m := range msgs {
-		if m.Role == "user" && m.Timestamp > 0 && m.Content != "" {
-			t := time.UnixMilli(m.Timestamp).In(loc)
-			m.Content = "[" + t.Format("2006-01-02 15:04 Mon") + "] " + m.Content
-		}
-		out[i] = m
+	latest := msgs[len(msgs)-1]
+	if latest.Role != "user" || latest.Timestamp <= 0 {
+		return msgs
 	}
+
+	var previousTimestamp int64
+	for i := len(msgs) - 2; i >= 0; i-- {
+		if msgs[i].Timestamp > 0 && (msgs[i].Role == "user" || msgs[i].Role == "assistant") {
+			previousTimestamp = msgs[i].Timestamp
+			break
+		}
+	}
+	gap := time.Duration(latest.Timestamp-previousTimestamp) * time.Millisecond
+	if previousTimestamp == 0 || gap < conversationGapThreshold {
+		return msgs
+	}
+
+	note := fmt.Sprintf(
+		"Conversation timing context: the latest user message arrived after %s of inactivity. "+
+			"Treat it as a resumed conversation in the current moment. Use earlier messages as background, "+
+			"but do not assume their time-sensitive situation is still current and do not repeat an earlier answer unless the user asks for it. "+
+			"Keep this timing context silent; do not mention the gap or report timestamps.",
+		formatConversationGap(gap),
+	)
+	out := make([]provider.Message, 0, len(msgs)+1)
+	out = append(out, provider.Message{Role: "system", Content: note})
+	out = append(out, msgs...)
 	return out
+}
+
+func formatConversationGap(gap time.Duration) string {
+	days := int(gap / (24 * time.Hour))
+	if days >= 2 {
+		return fmt.Sprintf("about %d days", days)
+	}
+	return "more than a day"
 }
 
 // UpdateConfig updates the agent's runtime config (model, temperature, etc.)
@@ -3189,7 +3532,13 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	// executor itself has been swapped to Docker — model dutifully calls
 	// list_dir /Users/idoubi/.fastclaw/agents/<id>/agent and 404s in the
 	// container.
-	a.ctxBuilder.sandboxEnabled = rc.Sandbox.Enabled
+	enforced := rc.Sandbox.Enabled && buildinfo.IsSandboxEnforced()
+	a.ctxBuilder.sandboxEnabled = enforced
+	// Optional flag follows the POOL, not the config row: the opt-in
+	// sandbox is only real once attachSandboxToAgents / SetSandboxPool
+	// wired an executor pool; advertising it earlier would make the
+	// model call exec(sandbox:true) into a guaranteed error.
+	a.ctxBuilder.sandboxOptional = a.sandboxPool != nil && !buildinfo.IsSandboxEnforced()
 	a.ctxBuilder.sandboxBackend = rc.Sandbox.Backend
 	// Propagate per-agent prompt mode updates from dashboard saves.
 	// Without this, an operator switching an agent to chatbot mode in

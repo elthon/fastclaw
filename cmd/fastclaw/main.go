@@ -97,11 +97,15 @@ func main() {
 		Use:   "fastclaw",
 		Short: "FastClaw - Multi-User AI Agent Platform",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if isInteractiveTerminal(os.Stdin, os.Stdout) {
+				return runChat(cmd.Context(), chatOptions{})
+			}
 			return runGateway(18953)
 		},
 	}
 
 	rootCmd.AddCommand(gatewayCmd())
+	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(skillCmd())
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(upgradeCmd())

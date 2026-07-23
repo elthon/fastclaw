@@ -798,13 +798,13 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 var agentSystemFileAllowlist = map[string]bool{
 	"SOUL.md": true, "IDENTITY.md": true, "AGENTS.md": true,
 	"BOOTSTRAP.md": true, "TOOLS.md": true, "MEMORY.md": true,
-	"HEARTBEAT.md": true, "USER.md": true, "agent.json": true,
+	"HEARTBEAT.md": true, "USER.md": true, "KNOWLEDGE.md": true, "agent.json": true,
 }
 
 var agentIdentityFiles = map[string]bool{
 	"SOUL.md": true, "IDENTITY.md": true, "AGENTS.md": true,
 	"BOOTSTRAP.md": true, "TOOLS.md": true, "HEARTBEAT.md": true,
-	"agent.json": true,
+	"KNOWLEDGE.md": true, "agent.json": true,
 }
 
 func (s *Server) handleGetAgentSystemFile(w http.ResponseWriter, r *http.Request) {
@@ -889,6 +889,12 @@ func (s *Server) handlePutAgentSystemFile(w http.ResponseWriter, r *http.Request
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if name == "KNOWLEDGE.md" && len([]byte(body.Content)) > maxKnowledgeFileBytes {
+		jsonResponse(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"error": "KNOWLEDGE.md is too large; maximum size is 256KB",
+		})
 		return
 	}
 	target, ok := s.resolveSystemFileTarget(w, r, id, name)

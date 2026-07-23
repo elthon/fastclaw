@@ -833,6 +833,17 @@ export async function getChangedFiles(
   return { files: (data.files || []) as WorkspaceFile[], available: !!data.available };
 }
 
+export async function getAgentKnowledgeFile(
+  agentId: string,
+  storedName: string,
+): Promise<{ name: string; storedName: string; path: string; content: string; size: number; hash?: string }> {
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/knowledge-files/${encodeURIComponent(storedName)}`,
+  );
+  if (!res.ok) throw new Error(`knowledge file failed: ${res.status}`);
+  return (await res.json()) as { name: string; storedName: string; path: string; content: string; size: number; hash?: string };
+}
+
 // Chat
 export interface ChatHistoryMessage {
   role: "user" | "assistant" | "tool";
@@ -1105,6 +1116,7 @@ export async function steerChat(
 
 export interface ToolResultMetadata {
   sandbox?: boolean;
+  knowledgeSources?: KnowledgeSource[];
   // Stamped on the forced-final-delivery assistant message that the
   // backend emits when the per-turn tool-iteration cap was hit. Lets the
   // UI surface a small badge so the user knows the answer was synthesized
@@ -1115,6 +1127,14 @@ export interface ToolResultMetadata {
   // The bubble is a plan, not an execution result — UI shows a distinct
   // badge so the user knows to review it and reply with "go" (or edits).
   planMode?: boolean;
+}
+
+export interface KnowledgeSource {
+  id: string;
+  file: string;
+  path: string;
+  chunk?: number;
+  score?: string;
 }
 
 export interface ChatStreamEvent {
@@ -1776,6 +1796,7 @@ export interface AgentCronJob {
   channel: string;
   chatId: string;
   accountId?: string;
+  chatterId?: string;   // per-sender app_user / web login that created the job
   timezone: string;
   enabled: boolean;
   lastRun?: string;
@@ -2049,4 +2070,41 @@ export function fileUrl(agentId: string, path: string, download = false): string
   if (download) params.set("download", "1");
   const qs = params.toString();
   return `/api/agents/${agentId}/files/${encoded}${qs ? "?" + qs : ""}`;
+}
+
+// Workspace version history (per-session git snapshots taken after each
+// agent run). Backs the Workspace panel's history dropdown: list commits,
+// restore the whole session workspace to one of them.
+export interface WorkspaceHistoryEntry {
+  hash: string;
+  message: string;
+  time: number; // unix seconds
+}
+
+export async function getSessionHistory(
+  agentId: string,
+  sessionId: string,
+): Promise<WorkspaceHistoryEntry[]> {
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/sessions/${encodeURIComponent(sessionId)}/history`,
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.history || []) as WorkspaceHistoryEntry[];
+}
+
+export async function restoreSessionHistory(
+  agentId: string,
+  sessionId: string,
+  commit: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/sessions/${encodeURIComponent(sessionId)}/history/restore`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commit }),
+    },
+  );
+  if (!res.ok) throw new Error(`restore failed: ${res.status}`);
 }

@@ -11,7 +11,7 @@ func TestOpenAICustomHeadersApplied(t *testing.T) {
 		"X-No-Filter":   "true",
 		"Authorization": "Bearer gateway-key",
 	})
-	req, err := p.buildRequest(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, "test-model", 16, 0, true)
+	req, err := p.buildRequest(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, "test-model", 16, 0, true, initialOpenAIRequestMode("test-model"))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
