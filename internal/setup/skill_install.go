@@ -154,36 +154,11 @@ func resolveInstallTarget(r *http.Request, agentID string) (string, error) {
 	return dir, nil
 }
 
-// runInstall dispatches to the right skills backend. When source is empty it
-// tries skills.sh then clawhub (skill-creator is a chat-level fallback, not a
-// registry — the agent tool offers it when both sources miss).
+// runInstall dispatches to the right skills backend. The dispatch itself
+// lives in skills.Install so `fastclaw skill install` accepts exactly the
+// same sources as this endpoint.
 func runInstall(source, name, repo, targetDir string) (*skills.Result, error) {
-	switch source {
-	case "github":
-		if repo == "" {
-			return nil, fmt.Errorf("source=github requires 'repo'")
-		}
-		return skills.InstallFromGitHubRepo(repo, name, targetDir)
-	case "clawhub":
-		return skills.InstallFromClawHub(name, targetDir)
-	case "skillssh", "skills.sh":
-		results, err := skills.SearchSkillsSh(name)
-		if err != nil {
-			return nil, err
-		}
-		pick := skills.PickSkillsShExact(results, name)
-		if pick == nil || pick.SkillID != name {
-			return nil, fmt.Errorf("skill %q not found on skills.sh", name)
-		}
-		return skills.InstallFromSkillsSh(*pick, targetDir)
-	case "", "auto":
-		if repo != "" {
-			return skills.InstallFromGitHubRepo(repo, name, targetDir)
-		}
-		return skills.InstallAuto(name, targetDir)
-	default:
-		return nil, fmt.Errorf("unknown source %q", source)
-	}
+	return skills.Install(source, name, repo, targetDir)
 }
 
 // handleUploadSkill installs a skill from a user-supplied .zip file.

@@ -155,6 +155,59 @@ func findSkillDirInTarball(client *http.Client, url, skillID string) (string, er
 	return "", nil
 }
 
+// findSkillRootsInTarball returns every in-tarball directory (relative to
+// the archive's top-level dir) that directly contains a SKILL.md. The repo
+// root is reported as "".
+//
+// Whole-repo installs need this: plenty of "one skill per repo" projects
+// keep the manifest in a subfolder (skill/SKILL.md, .claude/skills/x/…)
+// with a README and examples at the root. Extracting the root verbatim
+// produces a directory with no SKILL.md, which every loader then ignores —
+// the install reports success and the skill never shows up.
+func findSkillRootsInTarball(client *http.Client, url string) ([]string, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("probe tarball: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("probe HTTP %d", resp.StatusCode)
+	}
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+
+	var roots []string
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		slash := strings.IndexByte(hdr.Name, '/')
+		if slash < 0 {
+			continue
+		}
+		rel := hdr.Name[slash+1:]
+		if rel == "SKILL.md" {
+			roots = append(roots, "")
+			continue
+		}
+		if strings.HasSuffix(rel, "/SKILL.md") {
+			roots = append(roots, strings.TrimSuffix(rel, "/SKILL.md"))
+		}
+	}
+	return roots, nil
+}
+
 // defaultHTTPClient is the shared timeout-bounded client for registry calls.
 func defaultHTTPClient() *http.Client {
 	return &http.Client{Timeout: 60 * time.Second}

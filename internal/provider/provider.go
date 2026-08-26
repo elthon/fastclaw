@@ -290,6 +290,22 @@ func (r *StreamReader) SetErr(err error) {
 	r.err = err
 }
 
+// App identity sent with every upstream LLM call so model platforms can
+// attribute traffic to FastClaw.
+const (
+	AppName = "FastClaw"
+	AppURL  = "https://fastclaw.ai"
+)
+
+// SetAppIdentityHeaders tags an outbound LLM request with the FastClaw app
+// identity. X-Title/HTTP-Referer are OpenRouter's app-attribution headers;
+// platforms that copied its leaderboard convention read the same pair.
+// Unknown headers are ignored upstream, so this is safe to send everywhere.
+func SetAppIdentityHeaders(h http.Header) {
+	h.Set("X-Title", AppName)
+	h.Set("HTTP-Referer", AppURL)
+}
+
 // Provider is the LLM provider interface.
 type Provider interface {
 	Chat(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64) (*Response, error)

@@ -15,10 +15,10 @@ import (
 // Result describes a successful install so callers can show the user what
 // happened and, if they care, where to find the files.
 type Result struct {
-	Source       string `json:"source"`           // "skills.sh" | "clawhub" | "github"
-	Name         string `json:"name"`             // final directory name under targetDir
+	Source       string `json:"source"` // "skills.sh" | "clawhub" | "github"
+	Name         string `json:"name"`   // final directory name under targetDir
 	Version      string `json:"version,omitempty"`
-	InstalledAt  string `json:"installedAt"`      // filesystem path of the new skill dir
+	InstalledAt  string `json:"installedAt"` // filesystem path of the new skill dir
 	FilesWritten int    `json:"filesWritten"`
 }
 
@@ -171,4 +171,42 @@ func InstallAuto(name, targetDir string) (*Result, error) {
 		return nil, fmt.Errorf("not found on skills.sh (%v) or clawhub (%v)", firstErr, err)
 	}
 	return nil, fmt.Errorf("not found on skills.sh or clawhub (%v)", err)
+}
+
+// Install dispatches to the right registry backend by source name. It is
+// the single entry point shared by the HTTP install handler and the
+// `fastclaw skill install` CLI so both accept the same source vocabulary
+// and resolve a slug the same way — a CLI/API divergence here is exactly
+// what stopped an operator from provisioning an agent end-to-end.
+//
+// source "" / "auto" tries GitHub when repo is set, otherwise skills.sh
+// then clawhub (InstallAuto). skill-creator is a chat-level fallback, not
+// a registry, so it is never reached from here.
+func Install(source, name, repo, targetDir string) (*Result, error) {
+	switch source {
+	case "github":
+		if repo == "" {
+			return nil, fmt.Errorf("source=github requires 'repo'")
+		}
+		return InstallFromGitHubRepo(repo, name, targetDir)
+	case "clawhub":
+		return InstallFromClawHub(name, targetDir)
+	case "skillssh", "skills.sh":
+		results, err := SearchSkillsSh(name)
+		if err != nil {
+			return nil, err
+		}
+		pick := PickSkillsShExact(results, name)
+		if pick == nil || pick.SkillID != name {
+			return nil, fmt.Errorf("skill %q not found on skills.sh", name)
+		}
+		return InstallFromSkillsSh(*pick, targetDir)
+	case "", "auto":
+		if repo != "" {
+			return InstallFromGitHubRepo(repo, name, targetDir)
+		}
+		return InstallAuto(name, targetDir)
+	default:
+		return nil, fmt.Errorf("unknown source %q", source)
+	}
 }

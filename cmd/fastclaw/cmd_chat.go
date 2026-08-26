@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -138,6 +139,7 @@ func runChat(ctx context.Context, opts chatOptions) error {
 
 func ensureGateway(ctx context.Context, baseURL string, port int) error {
 	if gatewayReady(ctx, baseURL) {
+		warnVersionSkew(ctx, baseURL)
 		return nil
 	}
 	st, _ := daemon.GetStatus()
@@ -150,11 +152,37 @@ func ensureGateway(ctx context.Context, baseURL string, port int) error {
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if gatewayReady(ctx, baseURL) {
+			warnVersionSkew(ctx, baseURL)
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("gateway did not become ready at %s; check `fastclaw daemon logs`", baseURL)
+}
+
+// warnVersionSkew compares the running gateway's version against this
+// CLI binary and warns when they differ. The chat client reuses any
+// healthy gateway on the port, so after an upgrade or `make install`
+// the daemon keeps serving the OLD code until restarted — without this
+// check the only symptom is the agent reporting a stale version in
+// conversation. Best-effort: any probe failure is silently ignored.
+func warnVersionSkew(ctx context.Context, baseURL string) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/status", nil)
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var st struct {
+		Version string `json:"version"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&st) != nil {
+		return
+	}
+	if st.Version != "" && st.Version != version {
+		fmt.Fprintf(os.Stderr, "⚠ gateway is running FastClaw %s but this CLI is %s — run `fastclaw daemon restart` to pick up the new binary\n", st.Version, version)
+	}
 }
 
 func gatewayReady(ctx context.Context, baseURL string) bool {

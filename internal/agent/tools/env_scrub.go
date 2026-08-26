@@ -42,11 +42,30 @@ var sensitiveEnvSubstrings = []string{
 	"DATABASE_URL",
 }
 
+// nonSensitiveEnvExceptions are names that match a prefix/substring rule
+// above but carry no credential and must survive scrubbing.
+//
+// FASTCLAW_STORAGE_TYPE holds "sqlite" or "postgres" — a backend
+// selector, never a secret. It matters because an operator chatting with
+// their agent can now have it run `fastclaw agents init` / `skill install`
+// through exec. Those commands open the store themselves via
+// config.LoadEnv, and with the TYPE stripped a Postgres deployment would
+// silently fall back to the sqlite default: the CLI would report success
+// while writing the new agent to a local file the gateway never reads.
+// Keeping TYPE (while FASTCLAW_STORAGE_DSN stays scrubbed) turns that
+// silent divergence into a loud connect error instead.
+var nonSensitiveEnvExceptions = map[string]bool{
+	"FASTCLAW_STORAGE_TYPE": true,
+}
+
 // isSensitiveEnvKey reports whether the given env-var NAME (no =value
 // suffix) should be stripped from the parent env before spawning a
 // child shell the LLM agent can drive.
 func isSensitiveEnvKey(name string) bool {
 	upper := strings.ToUpper(name)
+	if nonSensitiveEnvExceptions[upper] {
+		return false
+	}
 	for _, p := range sensitiveEnvPrefixes {
 		if strings.HasPrefix(upper, p) {
 			return true

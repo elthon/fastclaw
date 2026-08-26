@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -217,8 +216,6 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 			return "", fmt.Errorf("sandbox required but no executor available — check that the sandbox backend (docker / e2b) is reachable and the configured image (%q) can start", sbCfgImage(sbCfg))
 		}
 
-		cmd := exec.CommandContext(execCtx, "sh", "-c", command)
-
 		// Always set cmd.Env explicitly. Default Go behavior is to
 		// inherit the parent's full env, which leaks daemon secrets
 		// (FASTCLAW_STORAGE_DSN, FASTCLAW_OBJECT_STORE_*, ...) into
@@ -227,16 +224,8 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 		if envProvider != nil && skillDirs != nil {
 			skillEnv = resolveSkillEnv(args.Command, envProvider, skillDirs)
 		}
-		cmd.Env = buildSubprocessEnv(skillEnv)
 
-		output, err := cmd.CombinedOutput()
-
-		result := string(output)
-		if err != nil {
-			return fmt.Sprintf("%s\nError: %s", result, err.Error()), err
-		}
-
-		return result, nil
+		return runHostCommand(execCtx, command, buildSubprocessEnv(skillEnv), time.Duration(timeout)*time.Second)
 	}
 }
 
@@ -396,7 +385,6 @@ func registerHostExec(r *Registry, envProvider SkillEnvProvider, skillDirs []str
 			if args.Stdin != "" {
 				command = fmt.Sprintf("(cat <<'__FCSTDIN__'\n%s\n__FCSTDIN__\n) | %s", args.Stdin, args.Command)
 			}
-			cmd := exec.CommandContext(execCtx, "sh", "-c", command)
 			// host_exec is the operator's escape hatch — even so, scrub
 			// daemon secrets from the inherited env. The operator
 			// rarely needs FASTCLAW_STORAGE_DSN reachable from a host
@@ -405,13 +393,7 @@ func registerHostExec(r *Registry, envProvider SkillEnvProvider, skillDirs []str
 			if envProvider != nil && skillDirs != nil {
 				skillEnv = resolveSkillEnv(args.Command, envProvider, skillDirs)
 			}
-			cmd.Env = buildSubprocessEnv(skillEnv)
-			out, err := cmd.CombinedOutput()
-			result := string(out)
-			if err != nil {
-				return fmt.Sprintf("%s\nError: %s", result, err.Error()), err
-			}
-			return result, nil
+			return runHostCommand(execCtx, command, buildSubprocessEnv(skillEnv), time.Duration(timeout)*time.Second)
 		})
 }
 
@@ -520,10 +502,23 @@ func runSandboxedCommand(ctx context.Context, ex sandbox.Executor, args execArgs
 	// when the operator actually opted into registering it —
 	// suggesting a tool that doesn't exist just confuses the model.
 	if err != nil && looksLikeSandboxAbsence(err, out) {
-		if !buildinfo.IsSandboxEnforced() {
+		switch {
+		case !buildinfo.IsSandboxEnforced():
 			err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine, retry WITHOUT sandbox:true — plain exec runs on the host here.]", err)
-		} else if buildinfo.IsHostExecAllowed() {
+		case buildinfo.IsHostExecAllowed():
 			err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine — e.g. `fastclaw upgrade`, `~/Downloads`, host CLI tools — retry with the `host_exec` tool instead.]", err)
+		default:
+			// Enforced sandbox with no host escape hatch — the hosted
+			// case. This branch previously said nothing at all, leaving
+			// the model with a bare "command not found" and no way to
+			// tell "I typo'd" from "this deployment structurally cannot
+			// run that". The observed reaction to an unexplained missing
+			// binary is a filesystem-wide hunt for it, so say plainly
+			// that there is nothing to find.
+			err = fmt.Errorf("%w\n[hint: this command is not available inside the sandbox, and this deployment does not permit host commands. "+
+				"There is NO host shell to fall back to — do not search the filesystem for the binary and do not try to install it. "+
+				"In particular, `fastclaw` admin commands (agents init, skill install, agents config, …) manage the host installation and are deliberately unreachable from here: "+
+				"tell the user to run them from the FastClaw admin UI or their own terminal instead.]", err)
 		}
 	}
 	return MetaSandboxPrefix + out, err

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -63,14 +64,14 @@ type Agent struct {
 	// mode slash commands (/new /undo /retry /compact /model /personality).
 	// Keyed by channel name (e.g. "discord" → ["123...", "456..."]). Empty
 	// or absent → no gate, anyone can run the command (legacy default).
-	admins          map[string][]string
-	skillsCfg       config.SkillsConfig
-	globalSkillsCfg config.SkillsCfg
-	messageBus      *bus.MessageBus
-	subAgentSpawner tools.SubAgentSpawner
-	ftsStore        *store.FTSStore
-	piiScrubEnabled bool
-	memoryCfg       config.MemoryCfg
+	admins                  map[string][]string
+	skillsCfg               config.SkillsConfig
+	globalSkillsCfg         config.SkillsCfg
+	messageBus              *bus.MessageBus
+	subAgentSpawner         tools.SubAgentSpawner
+	ftsStore                *store.FTSStore
+	piiScrubEnabled         bool
+	memoryCfg               config.MemoryCfg
 	workspaceHistoryEnabled bool
 	history                 *workspace.History
 	// splitReplies is the per-agent multi-bubble toggle. Gates the
@@ -1749,7 +1750,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 		return noProviderMsg
 	}
 
-	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, a.memory.WithUserID(chatterUID))
+	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, a.memory.WithUserID(chatterUID), a.isTrustedTurn(msg))
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 	// Tool catalog injection: plan mode passes tools=nil to the LLM so
@@ -2014,6 +2015,115 @@ func maybeInjectSoftDeadlineWarning(ctx context.Context, turnStart time.Time, me
 	return append(messages, warnMsg), true
 }
 
+// pendingTodoItems returns the unchecked items in this session's
+// todo.md, or nil when there is no todo file (the common case — most
+// turns never write one).
+//
+// Reads through the workspace store rather than the filesystem so it
+// sees the same bytes write_file wrote, in every deployment.
+func (a *Agent) pendingTodoItems(ctx context.Context) []string {
+	if a.workspaceStore == nil || a.agentID == "" || a.registry == nil {
+		return nil
+	}
+	rc, err := a.workspaceStore.Get(ctx, a.agentID, a.registry.ProjectID(), a.registry.SessionID(), "todo.md")
+	if err != nil {
+		return nil
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(io.LimitReader(rc, 64<<10))
+	if err != nil {
+		return nil
+	}
+	return uncheckedTodoItems(string(body))
+}
+
+// uncheckedTodoItems parses the "- [ ] step" convention the UI renders.
+// Anything that isn't a checkbox line is prose and ignored, matching the
+// panel's own parser.
+func uncheckedTodoItems(body string) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(trimmed, "- [ ]"); ok {
+			if item := strings.TrimSpace(rest); item != "" {
+				out = append(out, item)
+			}
+		}
+	}
+	return out
+}
+
+// todoReconcileNudge asks for one more pass when a turn is about to end
+// with its own checklist still showing unfinished work.
+//
+// The checklist is a promise rendered in the UI, and it drifts for a
+// mundane reason: something goes wrong mid-turn, the model firefights,
+// and never returns to the file. What the user then sees is a reply
+// saying "all done" beside a progress panel reading 1/5 — and there is
+// no way to tell from the outside which one is lying.
+//
+// Fires at most once per turn, and accepts "I did not finish these" as a
+// valid resolution — leaving an item unchecked is correct when the work
+// genuinely did not happen. What is not acceptable is the mismatch.
+func todoReconcileNudge(pending []string) provider.Message {
+	return provider.Message{
+		Role: "system",
+		Content: fmt.Sprintf(
+			"Before this reply goes out: todo.md still has %d unchecked item(s) — %s. "+
+				"The user sees that checklist as a live progress panel next to your answer, so it must not contradict what you are about to say. "+
+				"Resolve it one of two ways: edit_file('todo.md', …) to flip the items you actually completed, "+
+				"or keep them unchecked and say plainly in your reply which steps did not get done and why. "+
+				"Do not claim the task is complete while its own checklist says otherwise.",
+			len(pending), strings.Join(pending, "; ")),
+	}
+}
+
+// softIterationFraction is the share of the tool-call budget left when
+// the wrap-up warning fires. 0.30 of 20 leaves 6 calls — enough to close
+// out a multi-step task (finish the current step, verify, report) but
+// not enough to start a new line of exploration.
+const softIterationFraction = 0.30
+
+// maybeInjectIterationBudgetWarning is the tool-call analogue of
+// maybeInjectSoftDeadlineWarning.
+//
+// The wall-clock budget has warned the model since it shipped; the
+// iteration budget never did, and it is the one that actually fires. A
+// turn that plans five steps, spends its calls on the first four, and
+// gets guillotined mid-plan produces the worst possible artifact: the
+// forced synthesis reads as a confident completion report, because from
+// the model's point of view it never learned it was about to be cut off.
+// The verification step is what gets dropped — it is always last — so
+// the turn ends by claiming success it never checked.
+//
+// Warning early enough to act is the whole point: this fires with
+// softIterationFraction of the budget left, so the model can spend its
+// remaining calls finishing rather than exploring.
+func maybeInjectIterationBudgetWarning(ctx context.Context, used, max int, messages []provider.Message, alreadyFired bool) ([]provider.Message, bool) {
+	if alreadyFired || max <= 0 {
+		return messages, alreadyFired
+	}
+	remaining := max - used
+	if remaining <= 0 || float64(remaining) > float64(max)*softIterationFraction {
+		return messages, false
+	}
+	emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{
+		"phase":                "wrap_up",
+		"remaining_tool_calls": remaining,
+	}})
+	warnMsg := provider.Message{
+		Role: "system",
+		Content: fmt.Sprintf(
+			"Tool budget warning: %d of %d tool calls used — about %d remain before this turn is cut off and "+
+				"a final answer is forced from whatever you have. Stop exploring and start closing out. "+
+				"Spend the remaining calls on finishing the task and on any verification you told the user you would do; "+
+				"verification is the step that gets lost when the budget runs out, and an unverified claim reported as "+
+				"done is worse than an honest 'not yet checked'. If you cannot finish, say plainly which steps did not run.",
+			used, max, remaining),
+	}
+	return append(messages, warnMsg), true
+}
+
 // runToolsWithProgress wraps executeToolsConcurrently with a ticker that
 // emits "tool_progress" events every toolProgressInterval while the
 // call is in flight, so a slow tool (sandbox exec, subagent delegate)
@@ -2186,7 +2296,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 
 	chatterMem := a.memory.WithUserID(chatterUID)
-	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem)
+	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem, a.isTrustedTurn(msg))
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 
@@ -2269,6 +2379,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// turn run until it's hard-killed mid-request.
 	turnStart := time.Now()
 	softDeadlineFired := false
+	iterBudgetWarned := false
+	todoReconciled := false
 
 	// replyParts accumulates every non-empty assistant text segment
 	// emitted across iterations (preamble lines before tool calls + the
@@ -2289,6 +2401,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		)
 
 		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
+		messages, iterBudgetWarned = maybeInjectIterationBudgetWarning(ctx, i, a.maxToolIterations, messages, iterBudgetWarned)
 
 		// Hook: BeforeModelCall
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
@@ -2378,6 +2491,20 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				return emptyMsg
 			}
 			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
+
+			// Reconcile the checklist BEFORE the answer is emitted — once
+			// the user has read "all done", a corrected todo panel is just
+			// a second contradiction. Firing once per turn bounds this to
+			// one extra round and cannot loop.
+			if !todoReconciled {
+				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
+					todoReconciled = true
+					messages = append(messages, asst, todoReconcileNudge(pending))
+					continue
+				}
+				todoReconciled = true
+			}
+
 			sess.Append(asst)
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content, "metadata": knowledgeMeta}})
 			if resp.Content != "" {
@@ -2656,6 +2783,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		// badge attached.
 		finalContent = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
 	}
+	finalContent += iterationCapNotice(msg.Channel, a.maxToolIterations)
 	capMeta := mergeMetadata(iterationCapMetadata(a.maxToolIterations), knowledgeMeta)
 	sess.Append(provider.Message{
 		Role:      "assistant",
@@ -2975,7 +3103,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 	chatterMem := a.memory.WithUserID(chatterUID)
-	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem)
+	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem, a.isTrustedTurn(msg))
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt, UserID: a.ownerUserID})
@@ -3025,10 +3153,13 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	streakState := sameToolFailStreakState{}
 	turnStart := time.Now()
 	softDeadlineFired := false
+	iterBudgetWarned := false
+	todoReconciled := false
 
 	// ReAct loop - use Chat for tool iterations
 	for i := 0; i < a.maxToolIterations; i++ {
 		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
+		messages, iterBudgetWarned = maybeInjectIterationBudgetWarning(ctx, i, a.maxToolIterations, messages, iterBudgetWarned)
 
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
@@ -3068,6 +3199,22 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
+			// Reconcile the checklist before re-issuing as a stream. This
+			// path decides tool-calls-or-not with a non-streaming call
+			// first, which is the last moment nothing has been sent to the
+			// user yet — and this is the path the web UI uses, where the
+			// todo panel the answer would contradict is actually rendered.
+			if !todoReconciled {
+				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
+					todoReconciled = true
+					messages = append(messages,
+						provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, RawAssistant: resp.RawAssistant},
+						todoReconcileNudge(pending))
+					continue
+				}
+				todoReconciled = true
+			}
+
 			// Final response - use streaming
 			sr, err := a.provider.ChatStream(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
 			if err != nil {
@@ -3252,6 +3399,7 @@ func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.
 	if content == "" {
 		content = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
 	}
+	content += iterationCapNotice(inboundMsg.Channel, a.maxToolIterations)
 	finalMsg := provider.Message{
 		Role:      "assistant",
 		Content:   content,
@@ -3294,10 +3442,37 @@ func capReachedNudge(maxIterations int) provider.Message {
 	return provider.Message{
 		Role: "system",
 		Content: fmt.Sprintf(
-			"You've used all %d tool-call iterations available for this turn. Tools are now disabled for this final response — do not attempt to call any. Synthesize what you've already gathered into the most complete deliverable you can: if the user asked for a structured artifact (table, list, ICP summary, email drafts, etc.), produce it now from the existing tool results. For any fields you couldn't resolve, mark them as 'unknown' / 'not found' / 'partial' rather than dropping rows or skipping the structure — give the user something usable plus an honest note about what's missing. Do not apologize without delivering content.",
+			"You've used all %d tool-call iterations available for this turn. Tools are now disabled for this final response — do not attempt to call any. "+
+				"Synthesize what you've already gathered into the most complete deliverable you can: if the user asked for a structured artifact (table, list, ICP summary, email drafts, etc.), produce it now from the existing tool results. "+
+				"For any fields you couldn't resolve, mark them as 'unknown' / 'not found' / 'partial' rather than dropping rows or skipping the structure — give the user something usable plus an honest note about what's missing. Do not apologize without delivering content.\n\n"+
+				"Two things you MUST get right, because this turn ended early and the user cannot see that unless you say it:\n"+
+				"- State up front that you ran out of tool budget and the work is incomplete. Name the steps you planned but did not run.\n"+
+				"- Report ONLY what tool results actually showed. Do not mark a step done, tick it off, or call something verified unless a tool result in this conversation confirms it — being cut off before a check is not the same as the check passing. "+
+				"If your last plan step was verification and it never ran, the honest report is 'configured but not verified', never a completion claim.",
 			maxIterations,
 		),
 	}
+}
+
+// iterationCapNotice is the in-band truncation marker for channels that
+// cannot render the iterationCapReached badge.
+//
+// That badge is read by exactly one consumer — the web chat UI. Every
+// other surface (WeChat, Discord, Feishu, LINE, plain API consumers)
+// drops the metadata silently, so a turn that was guillotined mid-plan
+// arrives looking like a finished, confident answer. The disclosure that
+// the work is partial cannot live only in UI chrome; on those channels
+// it has to be in the text or it does not exist.
+//
+// Returns "" for channels that do render the badge, so the web UI
+// doesn't show the same warning twice.
+func iterationCapNotice(channel string, maxIterations int) string {
+	if channel == "web" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"\n\n---\n⚠️ This turn hit its %d tool-call limit and was cut short — the answer above is built from partial results, and any step described as done was not necessarily verified. Reply to continue.",
+		maxIterations)
 }
 
 // iterationCapMetadata is the assistant-side metadata stamped on the

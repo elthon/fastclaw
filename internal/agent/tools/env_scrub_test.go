@@ -46,6 +46,13 @@ func TestIsSensitiveEnvKey(t *testing.T) {
 		{"FASTCLAW_LOG_LEVEL", false},
 		{"FASTCLAW_DEPLOY", false},
 		{"FASTCLAW_ALLOW_HOST_EXEC", false},
+		// Backend selector, not a credential. An operator's agent runs
+		// `fastclaw agents init` / `skill install` through exec; stripping
+		// this would make those commands silently open the default sqlite
+		// store on a Postgres deployment. The DSN above stays scrubbed,
+		// so the CLI fails loudly instead of writing to the wrong DB.
+		{"FASTCLAW_STORAGE_TYPE", false},
+		{"fastclaw_storage_type", false}, // case-insensitive exception
 	}
 	for _, c := range cases {
 		got := isSensitiveEnvKey(c.name)

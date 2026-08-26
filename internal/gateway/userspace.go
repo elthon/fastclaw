@@ -788,6 +788,15 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		agent.WithSessionStore(session.NewStoreAdapter(st, userID)),
 		agent.WithMemoryStore(agent.NewMemoryStoreAdapter(st)),
 		agent.WithDataStore(st),
+		// Capability probe for check_agent. Only this layer can answer
+		// it: provider-backed tools (image_gen, web_search, tts) are
+		// registered per agent from the merged config, so "does agent X
+		// have image_gen" is a config question, not a runtime one — and
+		// it is precisely the question that decides whether a freshly
+		// provisioned illustration agent can draw anything at all.
+		agent.WithToolAvailability(func(_ context.Context, agentID string) (map[string]bool, error) {
+			return agentToolAvailability(cfg, agentID), nil
+		}),
 	}
 	if ws != nil {
 		managerOpts = append(managerOpts, agent.WithWorkspaceStore(ws))

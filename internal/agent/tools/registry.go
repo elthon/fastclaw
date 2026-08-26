@@ -480,6 +480,41 @@ func (r *Registry) readSystemFileForUser(ctx context.Context, userID, name strin
 	return r.systemFileStore.GetWorkspaceFile(ctx, r.agentID, userID, name)
 }
 
+// HasTool reports whether a tool of that name is currently registered.
+// Tool availability is dynamic — image_gen, web_search and tts appear
+// only once provider credentials exist — so this is the authoritative
+// answer to "can this agent actually do X", as opposed to whether a
+// skill claiming to do X is installed.
+func (r *Registry) HasTool(name string) bool {
+	if r == nil {
+		return false
+	}
+	return r.GetFunc(name) != nil
+}
+
+// ExecRunsOnHost reports whether shell commands from this registry land
+// on the operator's own machine, as opposed to inside a sandbox
+// container. It is the ONLY safe basis for probing the environment a
+// command will run in — the host's PATH says nothing about the
+// container's, and vice versa.
+//
+// False whenever a sandbox could service the call: an executor is bound
+// (enforced mode), a sandbox is required, a lazy provider is installed
+// (optional mode, reachable via exec(sandbox:true)), or the caller isn't
+// an admin (guests are forced into the sandbox — see makeExecToolFull).
+// Deliberately conservative: "might be sandboxed" answers false, because
+// a wrong "yes, host" produces confident claims about an environment we
+// never looked at.
+func (r *Registry) ExecRunsOnHost() bool {
+	if r == nil {
+		return false
+	}
+	if r.executor != nil || r.sandboxRequired || r.sandboxProvider != nil {
+		return false
+	}
+	return r.callerIsAdmin
+}
+
 // SetSandboxRequired flips the exec tool's host-shell fallback off. Call
 // with true whenever the runtime decides this agent must run inside a
 // sandbox executor (e.g., user enabled cfg.Sandbox after boot, so

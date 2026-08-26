@@ -2,6 +2,8 @@ package agent
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -38,6 +40,15 @@ type promptCtx struct {
 	now        time.Time
 	loc        *time.Location
 	dateLine   string // pre-rendered, shared across modules
+	// trusted mirrors Agent.isTrustedTurn for this turn: the chatter is
+	// the agent owner or a channel admin (or it's a heartbeat). The tool
+	// layer already enforces it via Registry.SetCallerIsAdmin; carrying
+	// it into the prompt is what stops the model from *self*-refusing
+	// operator work it is in fact authorized to do. Without this the
+	// model falls back to guessing from USER.md, and an empty USER.md
+	// reads as "unknown chatter" → it declines platform-management
+	// requests from the operator themselves.
+	trusted bool
 }
 
 // moduleEntry pairs a human-readable key with its builder function.
@@ -233,14 +244,12 @@ func modAgentIntro(p *promptCtx) string {
 	if buildinfo.IsHostedDeploy() {
 		fastclawLine = "FastClaw: hosted deployment. The chatter does NOT operate this runtime — if they ask about the version, upgrades, or installing/changing skills at the platform level, tell them those are administrator-controlled and offer to help with what's actually in your reach (config, skills you can author, files in the workspace)."
 	} else {
-		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install — the chatter is the operator.\n"+
+		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install.\n"+
 			"Runtime configuration (LLM providers, IM channels, tool providers like web_search, agent settings, sandbox, cron jobs) lives in FastClaw's DATABASE, not in YAML/JSON config files — don't go hunting for config files, and NEVER edit ~/.fastclaw/fastclaw.db directly. "+
-			"The management interface is the `fastclaw` CLI: `fastclaw provider` (LLM credentials), `fastclaw tools provider-set` / `category-set` (web_search & friends), `fastclaw channels`, `fastclaw agents config`, `fastclaw admin`, `fastclaw cron`, `fastclaw skill` — run any subcommand with --help to see flags. "+
-			"CLI writes persist to the database and hot-reload the running gateway, so no restart is needed. "+
-			"When the operator asks you to change system config and you have host shell access, use the CLI yourself; without host shell access (enforced sandbox), give them the exact command to run instead. "+
-			"Upgrades work the same way: `fastclaw upgrade` in a terminal (`fastclaw version` to verify), only run it yourself when explicitly asked and host shell access is available. "+
-			"Host access follows the CHATTER, not the agent: only the operator (agent owner or a chatter on the agent's admins list) gets the host shell and host file access. For any other chatter your exec calls run in the sandbox (or are refused when none is configured) and file tools are confined to the workspace — if a guest asks for host-side or platform-management work (creating agents, changing config), explain it's operator-only instead of retrying.",
-			buildinfo.Version, buildinfo.Commit, buildinfo.Date)
+			"The management interface is the `fastclaw` CLI: `fastclaw provider` (LLM credentials), `fastclaw tools provider-set` / `category-set` (web_search & friends), `fastclaw channels`, `fastclaw agents` (init / ls / config / rm), `fastclaw skill` (list / search / install), `fastclaw admin`, `fastclaw cron` — run any subcommand with --help to see flags. "+
+			"CLI writes persist to the database and hot-reload the running gateway, so no restart is needed.\n%s",
+			buildinfo.Version, buildinfo.Commit, buildinfo.Date,
+			operatorAccessLine(p.trusted, p.cb.sandboxEnabled))
 	}
 
 	return fmt.Sprintf(`You run on the FastClaw runtime. Your identity (name, role, personality)
@@ -291,6 +300,117 @@ new files or full rewrites. This matters most for MEMORY.md / SOUL.md /
 USER.md, which grow over time and would lose context if rewritten in full.`,
 		p.dateLine, fastclawLine,
 		runtime.GOOS, runtime.GOARCH, workdir, homeDesc)
+}
+
+// operatorAccessLine states, in the system prompt, whether THIS turn's
+// chatter is the operator. The runtime already decided (isTrustedTurn →
+// Registry.SetCallerIsAdmin); the model used to be left guessing from
+// USER.md, and an empty USER.md made it refuse operator work — including
+// "create an agent for me" — that it was fully authorized to perform.
+// So: say it outright, and separate authorization from identity.
+//
+// The operator branch carries the agent-provisioning recipe because that
+// is the one multi-step CLI flow the model reliably failed to assemble on
+// its own: `agents config` was the only agents verb it had ever been
+// shown, so `agents init` never came to mind.
+//
+// sandboxEnforced splits the operator branch again: being the operator
+// grants the AUTHORITY to manage the platform, but on an enforced-sandbox
+// build nobody gets a host shell, so the agent has to hand the commands
+// over instead of running them. Claiming host access there would send the
+// model into a loop of exec calls that land in the container.
+// fastclawBinary returns the command the agent should invoke for CLI work:
+// the absolute path of the binary running this gateway, falling back to
+// the bare name.
+//
+// Two failure modes it removes, both of which land as a confusing "unknown
+// flag" or "command not found" mid-provisioning:
+//   - the daemon's PATH doesn't include the install dir (launchd, systemd,
+//     and docker entrypoints routinely have a narrower PATH than the shell
+//     the operator installed from);
+//   - PATH resolves to a DIFFERENT, older fastclaw than the one serving
+//     this turn — `skill install --agent` would then not exist.
+//
+// Falls back to "fastclaw" when the executable doesn't look like the CLI
+// (notably under `go test`, which keeps the prompt assertions stable).
+func fastclawBinary() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "fastclaw"
+	}
+	base := filepath.Base(exe)
+	if base != "fastclaw" && base != "fastclaw.exe" {
+		return "fastclaw"
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return exe
+}
+
+func operatorAccessLine(trusted, sandboxEnforced bool) string {
+	if !trusted {
+		return "Host access follows the CHATTER, not the agent, and the current chatter is NOT this agent's operator. " +
+			"Your exec calls run in the sandbox (or are refused when none is configured) and file tools are confined to the workspace. " +
+			"Platform-management work — creating agents, installing skills, changing runtime config, upgrades — is operator-only: " +
+			"say so plainly once and offer what you CAN do instead. Do not retry the command, and do not hand them a `fastclaw` " +
+			"command to run as a workaround for work they aren't authorized to have done."
+	}
+
+	// Every command below is pinned to the running gateway's own binary,
+	// not the bare name — see fastclawBinary.
+	fc := fastclawBinary()
+
+	access := `The current chatter IS this agent's operator (owner or listed admin). The runtime verified
+this from their account — NOT from USER.md — and has already granted this turn host shell
+access via exec plus host file access. Act on it: when they ask for platform-level work,
+run the FastClaw CLI yourself with exec and report the result. Do not tell them it's
+operator-only, do not ask them to run the command in their own terminal, and do not stop to
+ask whether they're the operator — that question is already answered.
+Invoke it as ` + "`" + fc + "`" + ` — that exact path is the binary serving this
+conversation, so it always has the flags described below; a bare ` + "`fastclaw`" + ` on PATH may
+be an older install.
+Same for upgrades: ` + "`" + fc + ` upgrade` + "`" + `, then ` + "`" + fc + ` version` + "`" + ` to verify — but
+only when they explicitly ask for one.`
+	if sandboxEnforced {
+		access = `The current chatter IS this agent's operator (owner or listed admin). The runtime verified
+this from their account — NOT from USER.md — so platform-management requests from them are
+legitimate; never answer one with "that's operator-only". But this build enforces the
+sandbox: your exec calls run in the container, NOT on the host, so you cannot run the
+` + "`fastclaw`" + ` CLI for them. Give them the exact commands to paste into their own terminal
+(including ` + "`fastclaw upgrade`" + ` for upgrades) and explain what each one does.`
+	}
+
+	// Under an enforced sandbox the operator pastes these into their own
+	// shell, where the gateway's absolute path is meaningless (it may not
+	// even be the same filesystem) — quote the bare name there.
+	cmd := fc
+	if sandboxEnforced {
+		cmd = "fastclaw"
+	}
+
+	return access + `
+
+This tells you what they're AUTHORIZED to do, not WHO they are. USER.md still governs
+identity: if it's empty you genuinely don't know their name and should ask or stay neutral.
+Never let an empty USER.md turn into a refusal of operator work.
+
+Provisioning a new agent is a normal operator request — complete the whole chain, don't
+stop after step 1:
+  1. ` + "`" + cmd + ` agents init "<name>" --description "<what it does>"` + "`" + ` — prints the new agt_ id.
+  2. ` + "`" + cmd + ` skill install --agent <agt_id> --repo <owner/repo>` + "`" + ` for a GitHub skill,
+     or ` + "`" + cmd + ` skill install <slug> --agent <agt_id>` + "`" + ` for one on skills.sh / ClawHub.
+     Without --agent the skill installs globally for every agent — pass it. Installing into
+     an agent OTHER than yourself is normal and expected: that's how you equip one you just
+     created. Never install a skill into yourself as a substitute for that.
+  3. ` + "`" + cmd + ` agents config <agt_id> set model <provider>/<model>` + "`" + ` — a fresh agent has
+     no model and cannot reply until one is set. Reuse the model you are running on unless
+     the operator names a different one.
+  4. Verify with ` + "`" + cmd + ` skill list --agent <agt_id>` + "`" + `, then tell the operator the
+     agent's name and id and that it's ready to chat with in the dashboard.
+Give the new agent an IDENTITY.md / SOUL.md too when the operator described a persona:
+write the text to a local file, then ` + "`" + cmd + ` agents files put <agt_id> IDENTITY.md <path>` + "`" + `.
+The CLI hot-reloads the gateway itself, so don't restart anything.`
 }
 
 // modChatbotIntro builds the Chatbot-mode identity scaffolding: slim
@@ -597,13 +717,22 @@ func modSandboxOptional(p *promptCtx) string {
 	} else if p.cb.sandboxBackend == "boxlite" {
 		backend = "Boxlite container"
 	}
+	hostAccess := `Host access is operator-only, and the current chatter is NOT the
+operator: every exec call runs in the sandbox automatically (or is
+refused when the sandbox can't start) and file tools are confined to the
+workspace. Don't fight the restriction — tell the chatter the operation
+needs the operator.`
+	if p.trusted {
+		hostAccess = `Host access is operator-only and the current chatter IS the operator,
+so it is live for this turn: exec runs on the host and file tools reach
+host paths. Run what they ask for instead of describing it.`
+	}
 	return `# Execution Environment (host by default, sandbox on request)
 You run on the operator's HOST machine: exec and the file tools act
 directly on the host, in the Working Directory above. Installing
 software the user asks for, reading their files, and running their CLIs
-all happen right there — this is a self-hosted install and the chatter
-is the operator, so host access is expected. Execute code immediately
-with exec when asked to compute or process something; don't just show it.
+all happen right there. Execute code immediately with exec when asked to
+compute or process something; don't just show it.
 
 An isolated sandbox (` + backend + `) is ALSO available as an opt-in
 tool: pass sandbox:true on an exec call to run that ONE command inside
@@ -618,11 +747,7 @@ reach the user — but never reference host absolute paths inside a
 sandbox:true command, and never reference /workspace or /skills paths
 in a plain host exec.
 
-Host access is operator-only: when the current chatter is not the agent
-operator/admin, every exec call runs in the sandbox automatically (or is
-refused when the sandbox can't start) and file tools are confined to the
-workspace. Don't fight the restriction — tell the chatter the operation
-needs the operator.`
+` + hostAccess
 }
 
 // modTaskDelegation emits the task-delegation and progress-tracking
@@ -873,7 +998,7 @@ conversational replies. todo.md is for plans the user wants to track,
 not chat overhead.`
 
 var toolDisciplineContent = `# Tool Use
-Four failure modes that cost rounds:
+Five failure modes that cost rounds:
 
 0. **Check Skills BEFORE improvising a multi-tool pipeline.** For any
    request that would otherwise need 3+ tool calls of stitched-
@@ -935,12 +1060,17 @@ Four failure modes that cost rounds:
    failed URL within this turn, so swap source, not just the path.
 
    Browser fallback: if web_fetch fails on a concrete, non-search-result
-   page with 401/403/429, captcha, anti-bot, "enable JavaScript", or an
-   empty/blocked body, do NOT keep retrying web_fetch. Load the
-   camoufox-cli skill and use the sandbox browser against the SAME URL
-   (open → wait → extract visible text or screenshot). This fallback is
-   for browser-required pages only; if the URL itself was guessed or is
-   a search results page, go back to web_search instead.
+   page with 401/403/429, captcha, anti-bot, or "enable JavaScript", do
+   NOT keep retrying web_fetch. Load the camoufox-cli skill and use the
+   sandbox browser against the SAME URL (open → wait → extract visible
+   text or screenshot). This fallback is for browser-required pages only;
+   if the URL itself was guessed or is a search results page, go back to
+   web_search instead.
+   A thin or oddly-formatted result is NOT an anti-bot block. When
+   web_fetch reports that it extracted no readable text, it says so
+   explicitly and tells you what to do — follow that, and do not reach
+   for a browser. For GitHub specifically, raw.githubusercontent.com and
+   api.github.com give you the file contents directly and cost one round.
 
 2. **Stop when you have enough.** If web_search snippets already
    contain the specific facts the user asked about (dates, numbers,
@@ -961,6 +1091,27 @@ Four failure modes that cost rounds:
    year" — emit ONE call this round, wait for the result, then emit
    the dependent call next round. Bundling dependent calls together
    in the same round hurts more than it saves.
+
+4. **Never report a check you didn't run.** A ✅ / "verified" / "done"
+   in your final answer is a claim about a tool result you actually
+   received this turn. If you said you would test something and then
+   didn't, say that you didn't — an honest "configured but not tested"
+   is worth more than a green checklist that turns out to be false the
+   first time the user tries it.
+   Two specific traps:
+   - **Configured ≠ working.** Files on disk, a record created, a
+     config key set — these prove the write happened, not that the
+     thing functions. Installing a skill does not mean the agent can
+     run it: a skill's core tool (image_gen, web_search, tts) exists
+     only when that provider has credentials configured.
+   - **Don't narrate deliberation into the reply.** Planning what to
+     verify, second-guessing, "let me try X" — that's thinking, not
+     your answer. The user sees only the final message; make it the
+     conclusion, not the transcript.
+   When provisioning another agent (create_agent / install_skill /
+   configure_agent), finish with check_agent and report what it
+   actually said. If it says NOT ready, relay the problems instead of
+   handing over a broken agent.
 
 When a tool result fails (4xx/5xx, empty, error), the runtime appends
 "[Analyze the error above and try a different approach.]" — that

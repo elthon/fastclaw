@@ -230,3 +230,149 @@ func TestUpdateSameToolFailStreak(t *testing.T) {
 	})
 }
 
+
+// The tool-call budget is the limit that actually fires in practice, yet
+// it warned nobody until now — only the wall-clock budget did. A turn
+// that plans five steps and gets cut off after four ends by reporting
+// the fifth as done, because the model never learned it was running out.
+func TestMaybeInjectIterationBudgetWarning_FiresOnceNearTheCap(t *testing.T) {
+	ctx := context.Background()
+	base := []provider.Message{{Role: "user", Content: "go"}}
+
+	// 13 of 20 used: 7 left, above the 30% threshold — stay quiet.
+	got, fired := maybeInjectIterationBudgetWarning(ctx, 13, 20, base, false)
+	if fired || len(got) != len(base) {
+		t.Fatalf("must not fire while budget is comfortable (fired=%v, msgs=%d)", fired, len(got))
+	}
+
+	// 14 of 20: 6 left, exactly at 30% — warn.
+	got, fired = maybeInjectIterationBudgetWarning(ctx, 14, 20, base, false)
+	if !fired {
+		t.Fatal("expected the warning to fire with 30% of the budget left")
+	}
+	if len(got) != len(base)+1 {
+		t.Fatalf("expected one appended system message, got %d", len(got))
+	}
+	warn := got[len(got)-1]
+	if warn.Role != "system" {
+		t.Errorf("warning should be a system message, got role %q", warn.Role)
+	}
+	for _, want := range []string{"Tool budget warning", "verification"} {
+		if !strings.Contains(warn.Content, want) {
+			t.Errorf("warning missing %q: %s", want, warn.Content)
+		}
+	}
+
+	// Already fired — never append twice in one turn.
+	got2, fired2 := maybeInjectIterationBudgetWarning(ctx, 18, 20, got, true)
+	if !fired2 || len(got2) != len(got) {
+		t.Errorf("warning must fire at most once per turn")
+	}
+}
+
+// A budget already spent has nothing to warn about — the cap nudge takes
+// over at that point.
+func TestMaybeInjectIterationBudgetWarning_NoBudgetNoFire(t *testing.T) {
+	ctx := context.Background()
+	base := []provider.Message{{Role: "user", Content: "go"}}
+	if _, fired := maybeInjectIterationBudgetWarning(ctx, 20, 20, base, false); fired {
+		t.Error("must not fire when the budget is already exhausted")
+	}
+	if _, fired := maybeInjectIterationBudgetWarning(ctx, 0, 0, base, false); fired {
+		t.Error("must not fire when no cap is configured")
+	}
+}
+
+// The cap-reached banner is rendered by exactly one consumer — the web
+// chat UI. On every other channel the metadata is dropped, so without an
+// in-band notice a guillotined turn arrives looking like a finished,
+// confident answer.
+func TestIterationCapNoticeReachesNonWebChannels(t *testing.T) {
+	if notice := iterationCapNotice("web", 20); notice != "" {
+		t.Errorf("web renders its own badge; text notice would duplicate it: %q", notice)
+	}
+	for _, ch := range []string{"wechat", "discord", "feishu", "line", "api", ""} {
+		notice := iterationCapNotice(ch, 20)
+		if notice == "" {
+			t.Errorf("channel %q silently drops the cap metadata and needs an in-band notice", ch)
+			continue
+		}
+		if !strings.Contains(notice, "20") {
+			t.Errorf("notice for %q should name the limit: %q", ch, notice)
+		}
+		if !strings.Contains(notice, "not necessarily verified") {
+			t.Errorf("notice for %q should undercut completion claims: %q", ch, notice)
+		}
+	}
+}
+
+// The forced-synthesis nudge used to push purely toward "deliver
+// content", which is how a truncated turn produced a confident
+// completion report with a tick next to a step that never ran.
+func TestCapReachedNudgeDemandsHonestyAboutTruncation(t *testing.T) {
+	msg := capReachedNudge(20)
+	if msg.Role != "system" {
+		t.Fatalf("nudge role = %q", msg.Role)
+	}
+	for _, want := range []string{
+		"ran out of tool budget",
+		"did not run",
+		"unless a tool result",
+		"configured but not verified",
+	} {
+		if !strings.Contains(msg.Content, want) {
+			t.Errorf("nudge should require honesty about %q:\n%s", want, msg.Content)
+		}
+	}
+}
+
+// The checklist is rendered beside the answer, so the two must not
+// contradict each other. A turn that firefights a mid-turn failure and
+// never returns to todo.md ends with a reply saying "all done" next to a
+// panel reading 1/5, and nothing tells the user which is true.
+func TestUncheckedTodoItemsParsesTheUIConvention(t *testing.T) {
+	body := `- [x] 1. 创建新 agent (anthropic-art)
+- [ ] 2. 为新 agent 配置模型
+Some prose that is not a checkbox.
+  - [ ] 3. 安装 skill
+- [X] 4. 写入 IDENTITY.md
+- [ ]
+`
+	got := uncheckedTodoItems(body)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unchecked items, got %d: %v", len(got), got)
+	}
+	if got[0] != "2. 为新 agent 配置模型" || got[1] != "3. 安装 skill" {
+		t.Errorf("unexpected items: %v", got)
+	}
+	// Uppercase [X] counts as done, matching the panel's parser.
+	for _, item := range got {
+		if strings.Contains(item, "IDENTITY") {
+			t.Errorf("[X] should count as completed: %v", got)
+		}
+	}
+	if items := uncheckedTodoItems("- [x] all done\n"); len(items) != 0 {
+		t.Errorf("a fully checked list has nothing pending, got %v", items)
+	}
+	if items := uncheckedTodoItems("no checkboxes here"); len(items) != 0 {
+		t.Errorf("prose is not a checklist, got %v", items)
+	}
+}
+
+func TestTodoReconcileNudgeAllowsHonestIncompleteness(t *testing.T) {
+	msg := todoReconcileNudge([]string{"2. configure model", "5. verify"})
+	if msg.Role != "system" {
+		t.Fatalf("nudge role = %q", msg.Role)
+	}
+	if !strings.Contains(msg.Content, "2. configure model") || !strings.Contains(msg.Content, "5. verify") {
+		t.Errorf("nudge should name the pending items: %s", msg.Content)
+	}
+	// Leaving an item unchecked is legitimate when the work didn't
+	// happen — what's forbidden is the mismatch, not the incompleteness.
+	if !strings.Contains(msg.Content, "which steps did not get done") {
+		t.Errorf("nudge must accept an honest 'not done' resolution: %s", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "Do not claim the task is complete") {
+		t.Errorf("nudge must forbid the contradiction: %s", msg.Content)
+	}
+}
