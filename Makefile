@@ -34,9 +34,17 @@ bundle-skills:
 	@cp -R skills/skill-creator internal/agent/bundled_skills/skill-creator
 	@rm -rf internal/agent/bundled_skills/find-skills
 	@cp -R skills/find-skills internal/agent/bundled_skills/find-skills
+	@rm -rf internal/agent/bundled_skills/local-coding-agents
+	@cp -R skills/local-coding-agents internal/agent/bundled_skills/local-coding-agents
 	@echo "==> bundled skills synced"
 
-build: build-web bundle-skills
+# bundle-docs copies docs served by the binary into its embed tree
+# (/skills/agent-integration/SKILL.md). TestIntegrationDocMatchesSkill fails when it's stale.
+bundle-docs:
+	@cp skills/agent-integration/SKILL.md internal/setup/apidocs/agent-integration.md
+	@echo "==> bundled docs synced"
+
+build: build-web bundle-skills bundle-docs
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/fastclaw ./cmd/fastclaw
 
 install: build
@@ -52,14 +60,39 @@ install: build
 test:
 	go test ./...
 
-dev: build-web
-	air
+# dev runs the Go gateway under air (Go-only rebuilds) and the web UI under
+# `next dev` on WEB_PORT. The gateway proxies page requests to it, so keep
+# using http://localhost:$(DEV_PORT) (printed once the gateway is up; ignore
+# the URL next dev prints for itself) and web edits hot-reload. The embedded
+# export is only built once so the binary compiles; `make build-web` refreshes it.
+#
+# Local secrets for dev (e.g. FASTCLAW_CONNANY_URL / FASTCLAW_CONNANY_API_KEY)
+# go in an untracked .env.dev at the repo root; it's sourced if present.
+#
+# Dev data is isolated from the release install: its own FASTCLAW_HOME
+# (sqlite db, workspaces, skills, pid, logs) and port, so both can run
+# side by side. Point the CLI at it with the same two env vars, e.g.
+#   FASTCLAW_HOME=~/.fastclaw-dev FASTCLAW_PORT=18955 fastclaw chat
+WEB_PORT ?= 18954
+DEV_PORT ?= 18955
+DEV_HOME ?= $(HOME)/.fastclaw-dev
+dev:
+	@test -f internal/setup/web/index.html || $(MAKE) build-web
+	@cd web && pnpm install --frozen-lockfile --silent
+	@trap 'kill 0' EXIT INT TERM; \
+	if [ -f .env.dev ]; then set -a; . ./.env.dev; set +a; fi; \
+	(cd web && pnpm exec next dev --hostname 127.0.0.1 --port $(WEB_PORT)) & \
+	(until curl -sf --noproxy '*' -o /dev/null http://127.0.0.1:$(DEV_PORT)/; do sleep 1; done; \
+	 printf '\n\033[1;32m  ➜ FastClaw dev: http://localhost:%s\033[0m  (data: %s; :%s is next dev, behind the gateway)\n\n' \
+	   $(DEV_PORT) $(DEV_HOME) $(WEB_PORT)) & \
+	FASTCLAW_HOME=$(DEV_HOME) FASTCLAW_PORT=$(DEV_PORT) \
+	FASTCLAW_DEV_SKIP_WEB=1 FASTCLAW_DEV_WEB_URL=http://127.0.0.1:$(WEB_PORT) air
 
 clean:
 	rm -rf bin/ dist/ tmp/
 
 # Build all platforms
-release-local: build-web bundle-skills
+release-local: build-web bundle-skills bundle-docs
 	@mkdir -p dist
 	@# macOS
 	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o dist/fastclaw_darwin_arm64/fastclaw  ./cmd/fastclaw

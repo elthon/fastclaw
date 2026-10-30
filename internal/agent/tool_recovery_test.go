@@ -270,3 +270,20 @@ func TestScrubLeakedToolCallContentForDisplay(t *testing.T) {
 		t.Fatalf("scrubbed display content = %q; want preamble only", got)
 	}
 }
+
+// A `<｜｜DSML｜｜ calls>` wrapper normalizes to `<DSML｜｜ calls>`; it
+// must be stripped along with the recovered invokes, not saved as text.
+func TestRecoverToolCallsStripsBareCallsDSMLWrapper(t *testing.T) {
+	in := "<｜｜DSML｜｜ calls>\n" +
+		`<｜｜DSML｜｜invoke name="exec">` + "\n" +
+		`<｜｜DSML｜｜parameter name="command" string="true">date</｜｜DSML｜｜parameter>` + "\n" +
+		"</｜｜DSML｜｜invoke>\n" +
+		"</｜｜DSML｜｜ calls>"
+	calls, residual := recoverToolCallsFromContent(in)
+	if len(calls) != 1 || calls[0].Function.Name != "exec" {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if residual != "" {
+		t.Fatalf("residual = %q, want empty", residual)
+	}
+}

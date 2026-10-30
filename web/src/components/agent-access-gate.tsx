@@ -4,6 +4,12 @@ import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import { Bot } from "lucide-react";
 import { getAgentStatus } from "@/lib/api";
+import { useLocale } from "@/components/locale-provider";
+import { useChatRoute } from "@/lib/chat-route";
+import {
+  hasRememberedAgentAccess,
+  rememberAgentAccess,
+} from "@/lib/agent-access-cache";
 
 // Pull the agent id straight from the URL. Under output:'export' the
 // HTML served for /agents/agt_xxx/chat/ is actually the prebuilt
@@ -15,13 +21,13 @@ function agentIdFromPath(pathname: string | null | undefined): string {
   if (!pathname) return "";
   // Match /agents/<id>(/...)? — strict on the prefix so we don't
   // accidentally pull an id off some other route.
-  const m = pathname.match(/^\/agents\/([^/]+)/);
+  const m = pathname.match(/^\/(?:console\/)?agents\/([^/]+)/);
   return m ? m[1] : "";
 }
 
 // AgentAccessGate probes /api/agents/{id} once on mount and:
-//   - 200: renders children (caller is owner / super_admin / public-link
-//     visitor / apikey ACL grantee)
+//   - 200: renders children (caller is owner / public-link visitor /
+//     apikey ACL grantee / super_admin using the actAs audit flow)
 //   - 401: redirects to /login (handled at apiFetch level normally)
 //   - 403/404 or any other failure: shows a "no access" screen that
 //     overlays the entire viewport (sidebar included), so a non-owner
@@ -38,32 +44,40 @@ export default function AgentAccessGate({
 }: {
   children: React.ReactNode;
 }) {
+  const { tr } = useLocale();
   const pathname = usePathname();
-  const agentId = agentIdFromPath(pathname);
-  const [state, setState] = useState<"checking" | "ok" | "denied">("checking");
+  const chatRoute = useChatRoute();
+  // /chat/<sessionId> doesn't name the agent; AppShell resolved it.
+  const agentId = chatRoute.status === "ready" && chatRoute.target.kind === "agent"
+    ? chatRoute.target.agentId
+    : agentIdFromPath(pathname);
+  const [results, setResults] = useState<Partial<Record<string, "ok" | "denied">>>({});
+  const state: "checking" | "ok" | "denied" =
+    !agentId || agentId === "default" || hasRememberedAgentAccess(agentId)
+      ? "ok"
+      : results[agentId] || "checking";
 
   useEffect(() => {
     // The "default" id is the prebuilt static-export placeholder, not
     // a real agent — skip the probe and let children render. The real
     // /agents/default/* route is super_admin's local-mode dashboard
     // which has its own server-side gating already.
-    if (!agentId || agentId === "default") {
-      setState("ok");
-      return;
-    }
+    if (!agentId || agentId === "default" || hasRememberedAgentAccess(agentId)) return;
     let aborted = false;
-    setState("checking");
     getAgentStatus(agentId)
       .then(({ status, agent }) => {
         if (aborted) return;
         if (status === 200 && agent) {
-          setState("ok");
+          rememberAgentAccess(agentId);
+          setResults((current) => ({ ...current, [agentId]: "ok" }));
           return;
         }
-        setState("denied");
+        setResults((current) => ({ ...current, [agentId]: "denied" }));
       })
       .catch(() => {
-        if (!aborted) setState("denied");
+        if (!aborted) {
+          setResults((current) => ({ ...current, [agentId]: "denied" }));
+        }
       });
     return () => {
       aborted = true;
@@ -88,11 +102,9 @@ export default function AgentAccessGate({
           <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-muted/60">
             <Bot className="h-7 w-7 text-muted-foreground" />
           </div>
-          <h2 className="text-lg font-semibold">No access to this agent</h2>
+          <h2 className="text-lg font-semibold">{tr("No access to this agent", "无权访问此 Agent")}</h2>
           <p className="text-sm text-muted-foreground">
-            This agent is private to its owner, or the link is no longer
-            valid. If the owner shares it publicly, the chat URL will
-            start working for you automatically.
+            {tr("This agent is private to its owner, or the link is no longer valid. If the owner shares it publicly, the chat URL will start working for you automatically.", "此 Agent 仅对所有者开放，或当前链接已失效。所有者公开分享后，此对话链接会自动恢复可用。")}
           </p>
         </div>
       </div>

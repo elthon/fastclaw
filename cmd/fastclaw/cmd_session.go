@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 )
 
@@ -131,16 +132,16 @@ func parseChatURL(raw string) (string, string, error) {
 }
 
 // openStoreAt opens a DBStore at an explicit sqlite path. Empty
-// dbPath defaults to ~/.fastclaw/fastclaw.db with the same pragma
+// dbPath defaults to $FASTCLAW_HOME/fastclaw.db with the same pragma
 // tuning the daemon uses, so a CLI export against a live db doesn't
 // hit lock contention.
 func openStoreAt(dbPath string) (*store.DBStore, func(), error) {
 	if dbPath == "" {
-		home, err := os.UserHomeDir()
+		home, err := config.HomeDir()
 		if err != nil {
 			return nil, nil, fmt.Errorf("resolve home dir: %w", err)
 		}
-		dbPath = filepath.Join(home, ".fastclaw", "fastclaw.db")
+		dbPath = filepath.Join(home, "fastclaw.db")
 	}
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, nil, fmt.Errorf("db file: %w", err)
@@ -187,18 +188,18 @@ func lookupSessionUser(ctx context.Context, st *store.DBStore, agentID, sessionK
 }
 
 // resolveOutputPath returns the user's -o value if set, else
-// ~/.fastclaw/logs/<sessionKey>.json. Per-session filename so a
+// $FASTCLAW_HOME/logs/<sessionKey>.json. Per-session filename so a
 // batch of exports doesn't overwrite each other; same parent dir as
 // the daemon's own logs so the analyzer can sweep one place.
 func resolveOutputPath(explicit, sessionKey string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
 	}
-	home, err := os.UserHomeDir()
+	home, err := config.HomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
-	return filepath.Join(home, ".fastclaw", "logs", sessionKey+".json"), nil
+	return filepath.Join(home, "logs", sessionKey+".json"), nil
 }
 
 func writeJSON(path string, payload any) error {

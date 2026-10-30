@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"os"
 	"log/slog"
 
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
@@ -35,7 +36,7 @@ func (g *Gateway) InvalidateAgent(agentID string) {
 		if sp.Agents == nil {
 			continue
 		}
-		if sp.Agents.AgentByID(agentID) != nil {
+		if sp.Agents.Has(agentID) {
 			g.users.invalidate(sp.UserID)
 		}
 	}
@@ -130,15 +131,21 @@ func (g *Gateway) UnregisterChannel(channelType, accountID string) {
 	if g.chanMgr == nil {
 		return
 	}
+	// Adapters bound to a linked device (WhatsApp) unlink it, so it
+	// doesn't linger under the phone's linked devices.
+	if u, ok := g.chanMgr.Get(channelType, accountID).(interface{ Unlink() }); ok {
+		go u.Unlink()
+	}
 	g.chanMgr.Unregister(channelType, accountID)
 }
 
 // DispatchLINEWebhook hands a raw LINE webhook POST body off to the
 // adapter for accountID. Signature is the value of the `x-line-signature`
 // header — the adapter checks it against HMAC-SHA256(channel_secret,
-// body). Returns the response body + status the HTTP handler should
-// write back; LINE retries on non-2xx.
-func (g *Gateway) DispatchLINEWebhook(accountID string, body []byte, signature string) (responseBody []byte, status int, err error) {
+// body). publicBase is the scheme://host the request arrived on, which
+// the adapter uses for outbound media URLs. Returns the response body +
+// status the HTTP handler should write back; LINE retries on non-2xx.
+func (g *Gateway) DispatchLINEWebhook(accountID string, body []byte, signature, publicBase string) (responseBody []byte, status int, err error) {
 	if g.chanMgr == nil {
 		return nil, 503, errors.New("channel manager not running")
 	}
@@ -150,7 +157,20 @@ func (g *Gateway) DispatchLINEWebhook(accountID string, body []byte, signature s
 	if !ok {
 		return nil, 500, errors.New("registered channel is not a LINE adapter")
 	}
-	return ln.HandleWebhook(body, signature)
+	return ln.HandleWebhook(body, signature, publicBase)
+}
+
+// ServeLINEMedia returns an outbound media file the LINE adapter for
+// accountID stored for LINE to fetch (see channels.LINE.ServeMedia).
+func (g *Gateway) ServeLINEMedia(accountID, name string) ([]byte, string, error) {
+	if g.chanMgr == nil {
+		return nil, "", errors.New("channel manager not running")
+	}
+	ln, ok := g.chanMgr.Get("line", accountID).(*channels.LINE)
+	if !ok {
+		return nil, "", os.ErrNotExist
+	}
+	return ln.ServeMedia(name)
 }
 
 // DispatchFeishuWebhook hands a raw Feishu webhook POST body off to the

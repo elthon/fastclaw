@@ -1,5 +1,12 @@
+# The web and Go stages run on the build machine's own architecture
+# (--platform=$BUILDPLATFORM) and cross-compile: the web export is static
+# files and the binary is CGO-free, so neither depends on the target.
+# Running them under QEMU for the arm64 image was slow and crashed
+# Next.js's static generation with SIGILL. Only the runtime stage is
+# built per target platform.
+
 # --- Stage 1: Build web UI ---
-FROM node:22-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:22-alpine AS web-builder
 WORKDIR /src/web
 # Pin pnpm: `latest` started pulling v11, which made
 # pnpm-workspace.yaml's onlyBuiltDependencies allow-list ineffective
@@ -13,7 +20,7 @@ COPY web/ .
 RUN pnpm build
 
 # --- Stage 2: Build Go binary ---
-FROM golang:1.25-alpine AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go-builder
 RUN apk add --no-cache git
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -24,13 +31,16 @@ COPY --from=web-builder /src/web/out internal/setup/web
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG DATE=unknown
+# Set by buildx from --platform; the binary targets the image's platform.
+ARG TARGETOS
+ARG TARGETARCH
 # Stamp BOTH symbol sets — `main.*` for the legacy `fastclaw version` CLI
 # consumer and `internal/buildinfo.*` for the agent runtime + the About
 # page in the web UI. Mirrors the Makefile / scripts/release.sh ldflags
 # so a docker-built image identifies itself the same way the released
 # binary does; without the buildinfo line the About page silently shows
 # "dev" on every published image (the symptom that triggered this fix).
-RUN CGO_ENABLED=0 go build \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags "-s -w \
       -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE} \
       -X github.com/fastclaw-ai/fastclaw/internal/buildinfo.Version=${VERSION} \

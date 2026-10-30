@@ -23,13 +23,74 @@ type EventEnvelope struct {
 // pub/sub or similar (same shape as the WebChannel limitation called
 // out elsewhere).
 type EventHub struct {
-	mu   sync.RWMutex
-	subs map[string][]chan EventEnvelope
+	mu     sync.RWMutex
+	subs   map[string][]chan EventEnvelope
+	queues map[string][]*EventQueue
 }
 
 // NewEventHub returns an empty hub.
 func NewEventHub() *EventHub {
-	return &EventHub{subs: make(map[string][]chan EventEnvelope)}
+	return &EventHub{subs: make(map[string][]chan EventEnvelope), queues: make(map[string][]*EventQueue)}
+}
+
+// EventQueue is a subscription that never drops: Publish appends to an
+// unbounded queue without blocking, so a slow reader cannot lose events
+// or stall the agent loop. Meant for the one connection that owns a turn
+// (the chat stream POST), whose life is bounded by that turn.
+type EventQueue struct {
+	mu    sync.Mutex
+	items []EventEnvelope
+	ready chan struct{}
+}
+
+func (q *EventQueue) push(env EventEnvelope) {
+	q.mu.Lock()
+	q.items = append(q.items, env)
+	q.mu.Unlock()
+	select {
+	case q.ready <- struct{}{}:
+	default: // a wake-up is already pending
+	}
+}
+
+// Ready receives after one or more events were published.
+func (q *EventQueue) Ready() <-chan struct{} { return q.ready }
+
+// Take returns every queued event in publish order and empties the queue.
+// Events published before the call are always included.
+func (q *EventQueue) Take() []EventEnvelope {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	items := q.items
+	q.items = nil
+	return items
+}
+
+// SubscribeQueue registers a lossless subscriber; the cleanup func MUST be
+// deferred.
+func (h *EventHub) SubscribeQueue(userID, agentID, sessionKey string) (*EventQueue, func()) {
+	key := hubKey(userID, agentID, sessionKey)
+	q := &EventQueue{ready: make(chan struct{}, 1)}
+	h.mu.Lock()
+	if h.queues == nil {
+		h.queues = make(map[string][]*EventQueue)
+	}
+	h.queues[key] = append(h.queues[key], q)
+	h.mu.Unlock()
+	return q, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		list := h.queues[key]
+		for i, item := range list {
+			if item == q {
+				h.queues[key] = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+		if len(h.queues[key]) == 0 {
+			delete(h.queues, key)
+		}
+	}
 }
 
 // Subscribe registers a buffered channel for one (user, agent,
@@ -65,13 +126,16 @@ func (h *EventHub) Subscribe(userID, agentID, sessionKey string) (<-chan EventEn
 func (h *EventHub) Publish(userID, agentID, sessionKey string, env EventEnvelope) {
 	key := hubKey(userID, agentID, sessionKey)
 	h.mu.RLock()
-	subs := append([]chan EventEnvelope(nil), h.subs[key]...)
-	h.mu.RUnlock()
-	for _, ch := range subs {
+	// Keep cleanup from closing a subscriber during the nonblocking send.
+	defer h.mu.RUnlock()
+	for _, ch := range h.subs[key] {
 		select {
 		case ch <- env:
 		default:
 		}
+	}
+	for _, q := range h.queues[key] {
+		q.push(env)
 	}
 }
 

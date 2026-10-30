@@ -27,9 +27,7 @@ import (
 func (s *Server) HandleProvisionAppUser(w http.ResponseWriter, r *http.Request) {
 	ident, ok := auth.FromContext(r.Context())
 	if !ok || ident.AuthMethod != "apikey" || ident.APIKeyID == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{
-			"error": map[string]string{"message": "api_key required", "type": "authentication_error"},
-		})
+		writeAPIError(w, http.StatusUnauthorized, errTypeAuthentication, codeUnauthorized, "api_key required")
 		return
 	}
 
@@ -38,16 +36,12 @@ func (s *Server) HandleProvisionAppUser(w http.ResponseWriter, r *http.Request) 
 		DisplayName string `json:"display_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": "invalid request body", "type": "invalid_request_error"},
-		})
+		writeAPIError(w, http.StatusBadRequest, errTypeInvalidRequest, codeInvalidRequest, "invalid request body")
 		return
 	}
 	req.ExternalID = strings.TrimSpace(req.ExternalID)
 	if req.ExternalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": "external_id is required", "type": "invalid_request_error"},
-		})
+		writeAPIError(w, http.StatusBadRequest, errTypeInvalidRequest, codeInvalidRequest, "external_id is required")
 		return
 	}
 
@@ -58,9 +52,7 @@ func (s *Server) HandleProvisionAppUser(w http.ResponseWriter, r *http.Request) 
 	// pure provisioning call, not a passthrough.
 	switched, err := s.authResolver.SwitchToAppUser(r.Context(), ident, req.ExternalID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "server_error"},
-		})
+		writeAPIError(w, http.StatusInternalServerError, errTypeServer, codeInternal, err.Error())
 		return
 	}
 

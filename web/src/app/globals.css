@@ -156,24 +156,39 @@ html.theme-transition *::after {
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 4px;
+  height: 4px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  border-radius: 3px;
-  background: oklch(0.5 0 0 / 30%);
+  border-radius: 999px;
+  background: oklch(0.5 0 0 / 22%);
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: oklch(0.5 0 0 / 50%);
+  background: oklch(0.5 0 0 / 40%);
 }
 .dark ::-webkit-scrollbar-thumb {
-  background: oklch(0.7 0 0 / 20%);
+  background: oklch(0.7 0 0 / 16%);
 }
 .dark ::-webkit-scrollbar-thumb:hover {
-  background: oklch(0.7 0 0 / 35%);
+  background: oklch(0.7 0 0 / 30%);
+}
+
+/* Keep markdown aligned with the user bubble's theme-aware foreground while
+   preserving code-block fills. */
+.user-chat-bubble .chat-md {
+  --tw-prose-body: currentColor;
+  --tw-prose-headings: currentColor;
+  --tw-prose-lead: currentColor;
+  --tw-prose-links: currentColor;
+  --tw-prose-bold: currentColor;
+  --tw-prose-counters: currentColor;
+  --tw-prose-bullets: currentColor;
+  --tw-prose-quotes: currentColor;
+  --tw-prose-quote-borders: currentColor;
+  --tw-prose-captions: currentColor;
 }
 
 /* Typing dots animation */
@@ -271,6 +286,11 @@ html.theme-transition *::after {
   .chat-md [data-streamdown="horizontal-rule"] { @apply my-3; }
   .chat-md [data-streamdown="blockquote"] { @apply my-2; }
   .chat-md [data-streamdown="list-item"] { @apply py-0; }
+  /* Lists, top-level and nested, have no indent (Streamdown nests at 24px
+     via [li_&]:pl-6, prose at ~26px). Markers are list-inside, so they stay
+     visible: a top-level marker lines up with the paragraph, a nested one
+     with its parent item's marker. */
+  .chat-md :is([data-streamdown="unordered-list"], [data-streamdown="ordered-list"]) { @apply pl-0; }
   .chat-md > div { @apply space-y-2; }
 
   /* Inline code only (not fenced) — immune to Streamdown's wrappers so it
@@ -284,7 +304,13 @@ html.theme-transition *::after {
   /* Wipe typography's <pre> defaults (a hardcoded dark bg that buries Shiki's
      theme); keep ad-hoc <pre>/<img> bounded. */
   .chat-md pre { @apply !bg-transparent !text-inherit !p-0 !my-0 !rounded-none max-w-full overflow-x-auto; }
-  .chat-md img { @apply max-w-full h-auto; }
+  .chat-md img { @apply h-auto max-h-96 w-auto max-w-[min(100%,28rem)] cursor-zoom-in rounded-lg; }
+  .chat-md a img { @apply cursor-pointer; }
+  /* Streamdown wraps images with a hover tint over the whole wrapper; prose
+     margins on the <img> made the wrapper taller, so the tint showed as grey
+     bands above and below the picture. Keep only the download button. */
+  .chat-md [data-streamdown="image"] { @apply my-0 block; }
+  .chat-md [data-streamdown="image-wrapper"] > div.pointer-events-none { @apply !hidden; }
 
   /* Code block — strip card, bound width, anchor the floating pill. */
   .chat-md [data-streamdown="code-block"] {

@@ -48,6 +48,8 @@ func RegisterKnowledgeSearch(r *Registry, searcher KnowledgeSearcher) {
 
 func makeKnowledgeSearch(r *Registry, searcher KnowledgeSearcher) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args knowledgeSearchArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)

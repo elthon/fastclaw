@@ -9,6 +9,7 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  useSidebarOptional,
 } from "@/components/ui/sidebar";
 import type { LucideIcon } from "lucide-react";
 
@@ -45,6 +46,9 @@ export function NavMain({
 }) {
   const pathname = usePathname();
   const router = useRouter();
+  // On phones the sidebar is a sheet over the page; close it once an item
+  // is chosen so the destination is visible.
+  const sidebar = useSidebarOptional();
 
   // Prefetch target routes on idle so soft nav is ready when the user
   // clicks — mirrors what <Link> does automatically, but we're opting out
@@ -64,15 +68,21 @@ export function NavMain({
   return (
     <SidebarGroup>
       {label && <SidebarGroupLabel>{label}</SidebarGroupLabel>}
-      <SidebarMenu>
+      <SidebarMenu className="gap-1">
         {items.map((item) => {
           const active =
             item.active ?? (item.url ? isActive(pathname, item.url) : false);
-          const handleClick = item.onClick
+          const go = item.onClick
             ? item.onClick
             : item.url
               ? () => router.push(item.url!)
               : undefined;
+          const handleClick = go
+            ? () => {
+                sidebar?.setOpenMobile(false);
+                go();
+              }
+            : undefined;
           return (
             <SidebarMenuItem key={item.url ?? item.title}>
               <SidebarMenuButton

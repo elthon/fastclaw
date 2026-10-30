@@ -6,28 +6,47 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 )
 
-// Shared-identity channels resolve the chatter to the channel owner's
-// web user id, so an owner-bound personal channel is admin in DMs with
-// zero extra configuration. Groups on such channels must NOT inherit
-// that: routing rewrites every group speaker to the owner id, so owner
-// equality proves nothing there.
-func TestAdminChatterSharedIdentity(t *testing.T) {
+// On IM channels the owner is recognised by pairing: the gateway flags
+// FromChannelOwner when the sender is the account paired to the channel,
+// and the channel's binder (OwnerUserID) must own the agent. Shared
+// identity rewriting UserID to the owner id must not grant anything by
+// itself — a stranger DMing the owner's bot carries the same rewrite.
+func TestAdminChatterPairedOwner(t *testing.T) {
 	a := &Agent{ownerUserID: "u_owner"}
 
-	dm := bus.InboundMessage{
-		Channel:        "telegram",
-		UserID:         "u_owner",
+	owner := bus.InboundMessage{
+		Channel:          "feishu",
+		UserID:           "u_chatter",
+		OwnerUserID:      "u_owner",
+		PeerKind:         "dm",
+		FromChannelOwner: true,
+	}
+	if !a.isAdminChatter(owner) {
+		t.Fatal("paired owner on the agent owner's channel should be admin")
+	}
+	inGroup := owner
+	inGroup.PeerKind = "group"
+	if !a.isAdminChatter(inGroup) {
+		t.Fatal("paired owner speaking in a group is still verified by sender id")
+	}
+
+	// Someone else connected their own bot to this (shared) agent and
+	// paired it: they own the channel, not the agent.
+	foreign := owner
+	foreign.OwnerUserID = "u_other"
+	if a.isAdminChatter(foreign) {
+		t.Fatal("paired owner of another user's channel must not be admin")
+	}
+
+	stranger := bus.InboundMessage{
+		Channel:        "feishu",
+		UserID:         "u_owner", // shared-identity rewrite
+		OwnerUserID:    "u_owner",
 		PeerKind:       "dm",
 		SharedIdentity: true,
 	}
-	if !a.isAdminChatter(dm) {
-		t.Fatal("shared-identity DM resolved to owner should be admin")
-	}
-
-	group := dm
-	group.PeerKind = "group"
-	if a.isAdminChatter(group) {
-		t.Fatal("group speaker on shared-identity channel must not be admin")
+	if a.isAdminChatter(stranger) {
+		t.Fatal("shared-identity rewrite without pairing must not be admin")
 	}
 }
 

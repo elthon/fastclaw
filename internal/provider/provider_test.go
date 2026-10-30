@@ -9,8 +9,8 @@ import (
 func TestLLMResponseHeaderTimeoutDefault(t *testing.T) {
 	t.Setenv("FASTCLAW_LLM_RESPONSE_HEADER_TIMEOUT_SEC", "")
 
-	if got := llmResponseHeaderTimeout(); got != 60*time.Second {
-		t.Fatalf("llmResponseHeaderTimeout() = %v, want 60s", got)
+	if got := llmResponseHeaderTimeout(); got != 180*time.Second {
+		t.Fatalf("llmResponseHeaderTimeout() = %v, want 180s", got)
 	}
 }
 
@@ -32,8 +32,8 @@ func TestLLMResponseHeaderTimeoutInvalidEnvFallsBack(t *testing.T) {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("FASTCLAW_LLM_RESPONSE_HEADER_TIMEOUT_SEC", value)
 
-			if got := llmResponseHeaderTimeout(); got != 60*time.Second {
-				t.Fatalf("llmResponseHeaderTimeout() = %v, want 60s", got)
+			if got := llmResponseHeaderTimeout(); got != 180*time.Second {
+				t.Fatalf("llmResponseHeaderTimeout() = %v, want 180s", got)
 			}
 		})
 	}

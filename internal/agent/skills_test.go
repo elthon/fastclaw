@@ -144,3 +144,36 @@ BODY_SHOULD_NOT_INLINE_WHEN_GATED`
 		t.Fatalf("summary should not inline gated skill body:\n%s", summary)
 	}
 }
+
+// A skill needing a binary the server lacks (a slim image without
+// python3) is still usable when its commands run in the sandbox.
+func TestSandboxedSkillsSkipHostBinaryChecks(t *testing.T) {
+	t.Setenv("FASTCLAW_HOME", t.TempDir())
+	home := t.TempDir()
+	skillDir := filepath.Join(home, "skills", "fal-image")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `---
+name: fal-image
+description: Generate or edit images.
+metadata:
+  fastclaw:
+    requires:
+      anyBins: [no-such-binary-on-this-host]
+---
+`
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	host := NewSkillsLoaderWithGlobal(home, t.TempDir(), "", config.SkillsConfig{}, config.SkillsCfg{}).LoadSkills()
+	if len(host) != 1 || !host[0].Gated {
+		t.Fatalf("on the host the skill should be gated: %+v", host)
+	}
+	sandboxed := NewSkillsLoaderWithGlobal(home, t.TempDir(), "", config.SkillsConfig{}, config.SkillsCfg{}).
+		WithSandbox(true).LoadSkills()
+	if len(sandboxed) != 1 || sandboxed[0].Gated {
+		t.Fatalf("in the sandbox the skill should be available: %+v", sandboxed)
+	}
+}

@@ -51,6 +51,8 @@ func registerBashOutput(r *Registry) {
 		},
 		"required": []string{"bash_id"},
 	}, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args bashOutputArgs
 		if err := json.Unmarshal(raw, &args); err != nil {
 			return "", fmt.Errorf("bash_output: parse args: %w", err)
@@ -130,6 +132,8 @@ func registerKillShell(r *Registry) {
 		},
 		"required": []string{"bash_id"},
 	}, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args killShellArgs
 		if err := json.Unmarshal(raw, &args); err != nil {
 			return "", fmt.Errorf("kill_shell: parse args: %w", err)

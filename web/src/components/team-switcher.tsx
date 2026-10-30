@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
+import { agentChatHref } from "@/lib/chat-route";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -18,6 +19,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Bot, ChevronsUpDownIcon, PlusIcon } from "lucide-react";
+import { useLocale } from "@/components/locale-provider";
 
 // AgentAvatar shows the agent's uploaded /api/agents/{id}/files/avatar.png
 // when available, falls back to the FastClaw logo for the platform header
@@ -25,15 +27,17 @@ import { Bot, ChevronsUpDownIcon, PlusIcon } from "lucide-react";
 // avatar yet (the image 404s).
 function AgentAvatar({
   agentId,
+  avatarUrl,
   size = 32,
 }: {
   agentId?: string | null;
+  avatarUrl?: string;
   size?: number;
 }) {
   const [failed, setFailed] = React.useState(false);
   React.useEffect(() => {
     setFailed(false);
-  }, [agentId]);
+  }, [agentId, avatarUrl]);
 
   if (!agentId) {
     return (
@@ -60,7 +64,7 @@ function AgentAvatar({
   return (
     // eslint-disable-next-line @next/next/no-img-element
     <img
-      src={`/api/agents/${agentId}/files/avatar.png`}
+      src={avatarUrl || `/api/agents/${agentId}/files/avatar.png`}
       alt=""
       width={size}
       height={size}
@@ -75,6 +79,9 @@ export interface AgentSwitcherItem {
   id: string;
   name?: string;
   model?: string;
+  description?: string;
+  avatarUrl?: string;
+  createdAt?: string;
 }
 
 // AgentSwitcher renders the sidebar header.
@@ -105,6 +112,7 @@ export function AgentSwitcher({
 }) {
   const { isMobile } = useSidebar();
   const router = useRouter();
+  const { tr } = useLocale();
 
   const active = activeAgentId
     ? agents.find((a) => a.id === activeAgentId) ?? null
@@ -113,7 +121,7 @@ export function AgentSwitcher({
   const goto = React.useCallback(
     (id: string) => {
       if (onSelect) onSelect(id);
-      else router.push(`/agents/${id}/chat/`);
+      else router.push(agentChatHref(id));
     },
     [onSelect, router],
   );
@@ -125,7 +133,7 @@ export function AgentSwitcher({
       <SidebarMenu>
         <SidebarMenuItem>
           <SidebarMenuButton size="lg" className="cursor-default">
-            <AgentAvatar agentId={active?.id} size={32} />
+            <AgentAvatar agentId={active?.id} avatarUrl={active?.avatarUrl} size={32} />
             <div className="grid flex-1 text-left text-sm leading-tight">
               <span className="truncate font-medium">{headerLabel}</span>
             </div>
@@ -147,7 +155,7 @@ export function AgentSwitcher({
               />
             }
           >
-            <AgentAvatar agentId={active?.id} size={32} />
+            <AgentAvatar agentId={active?.id} avatarUrl={active?.avatarUrl} size={32} />
             <div className="grid flex-1 text-left text-sm leading-tight">
               <span className="truncate font-medium">{headerLabel}</span>
             </div>
@@ -163,7 +171,7 @@ export function AgentSwitcher({
               <>
                 <DropdownMenuGroup>
                   <DropdownMenuLabel className="text-xs text-muted-foreground">
-                    Agents
+                    {tr("Agents", "Agent")}
                   </DropdownMenuLabel>
                   {agents.map((a) => (
                     <DropdownMenuItem
@@ -171,7 +179,7 @@ export function AgentSwitcher({
                       onClick={() => goto(a.id)}
                       className="gap-2 p-2"
                     >
-                      <AgentAvatar agentId={a.id} size={24} />
+                      <AgentAvatar agentId={a.id} avatarUrl={a.avatarUrl} size={24} />
                       <span className="flex-1 truncate">{a.name || a.id}</span>
                     </DropdownMenuItem>
                   ))}
@@ -182,13 +190,13 @@ export function AgentSwitcher({
             <DropdownMenuGroup>
               <DropdownMenuItem
                 className="gap-2 p-2"
-                onClick={() => router.push("/agents/")}
+                onClick={() => router.push("/console/agents/")}
               >
                 <div className="flex size-6 items-center justify-center rounded-md border bg-transparent">
                   <PlusIcon className="size-4" />
                 </div>
                 <div className="font-medium text-muted-foreground">
-                  Manage agents
+                  {tr("Manage agents", "管理 Agent")}
                 </div>
               </DropdownMenuItem>
             </DropdownMenuGroup>

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
@@ -11,22 +12,26 @@ import (
 
 // HandleGetUsage handles GET /v1/usage.
 //
-// Returns per-day, per-agent token consumption for the authenticated
-// user (or the user specified by the `user_id` query param when the
-// caller owns that app_user). Upstream SaaS apps poll this to populate
-// their billing dashboards.
+// Returns per-day token consumption so integrating apps can bill their
+// own users. Each daily row carries agentId, userId and — for app_users —
+// endUser (the app's external id), so an app can roll usage up by agent
+// and by end-user.
 //
 // Query params:
 //
-//	days   — lookback window (default 30, max 90)
-//	user_id — optional; when set, returns usage for that specific
-//	          app_user instead of the apikey owner. The caller must
-//	          own the apikey that minted that user (enforced below).
+//	days     — lookback window (default 30, max 90)
+//	agent_id — only usage of this agent
+//	end_user — only usage of this end-user (the app's external id, as
+//	           sent in X-Fastclaw-End-User / `user`)
+//	scope    — "app": the app owner plus every end-user it minted
+//	user_id  — legacy: a FastClaw user id; must be the app itself or one
+//	           of its end-users
+//
+// Without end_user / scope / user_id the result covers the caller's own
+// namespace: the app, or the end-user named by X-Fastclaw-End-User.
 func (s *Server) HandleGetUsage(w http.ResponseWriter, r *http.Request) {
 	if s.meter == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]string{"message": "usage metering not configured", "type": "server_error"},
-		})
+		writeAPIError(w, http.StatusServiceUnavailable, errTypeServer, codeNotConfigured, "usage metering not configured")
 		return
 	}
 
@@ -35,44 +40,97 @@ func (s *Server) HandleGetUsage(w http.ResponseWriter, r *http.Request) {
 		writeUnauth(w, "authentication required")
 		return
 	}
-
-	// Determine target user_id.
-	targetUser := ident.UserID
-	if quid := r.URL.Query().Get("user_id"); quid != "" {
-		targetUser = quid
-	}
+	qs := r.URL.Query()
 
 	days := 30
-	if d := r.URL.Query().Get("days"); d != "" {
-		if n, err := strconv.Atoi(d); err == nil && n > 0 && n <= 90 {
-			days = n
+	if d := qs.Get("days"); d != "" {
+		n, err := strconv.Atoi(d)
+		if err != nil || n < 1 || n > 90 {
+			writeBadRequest(w, "days must be an integer between 1 and 90")
+			return
+		}
+		days = n
+	}
+	q := usage.Query{AgentID: strings.TrimSpace(qs.Get("agent_id")), Range: usage.LastN(days)}
+	resp := map[string]any{"days": days}
+	if q.AgentID != "" {
+		resp["agentId"] = q.AgentID
+	}
+
+	switch {
+	case strings.TrimSpace(qs.Get("end_user")) != "":
+		endUser := strings.TrimSpace(qs.Get("end_user"))
+		resp["endUser"] = endUser
+		uid, found := s.lookupEndUser(r, ident.AccountID(), endUser)
+		if !found {
+			// Never seen → no usage. Don't mint a user just to say so.
+			resp["daily"] = []usage.DailyUsage{}
+			resp["totals"] = usage.Totals{}
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		q.UserID = uid
+		resp["userId"] = uid
+	case qs.Get("scope") == "app":
+		q.AppOwnerID = ident.AccountID()
+		resp["scope"] = "app"
+		resp["userId"] = q.AppOwnerID
+	case qs.Get("user_id") != "":
+		uid := qs.Get("user_id")
+		if !s.userInApp(r, ident, uid) {
+			writeAPIError(w, http.StatusForbidden, errTypePermission, codeForbidden, "user_id is not this app or one of its end-users")
+			return
+		}
+		q.UserID = uid
+		resp["userId"] = uid
+	default:
+		q.UserID = ident.EffectiveUserID()
+		resp["userId"] = q.UserID
+		if ident.EndUser != "" {
+			resp["endUser"] = ident.EndUser
 		}
 	}
 
-	rang := usage.LastN(days)
-
-	daily, err := s.meter.DailyForUser(r.Context(), targetUser, rang)
+	daily, totals, err := s.meter.Query(r.Context(), q)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "server_error"},
-		})
+		writeServerError(w, err)
 		return
 	}
-
-	totals, err := s.meter.TotalsForUser(r.Context(), targetUser, rang)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "server_error"},
-		})
-		return
+	if daily == nil {
+		daily = []usage.DailyUsage{}
 	}
+	resp["daily"] = daily
+	resp["totals"] = totals
+	writeJSON(w, http.StatusOK, resp)
+}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"userId": targetUser,
-		"days":   days,
-		"daily":  daily,
-		"totals": totals,
-	})
+// lookupEndUser returns the app_user id for (app, externalID) without
+// creating one.
+func (s *Server) lookupEndUser(r *http.Request, appID, externalID string) (string, bool) {
+	if s.store == nil {
+		return "", false
+	}
+	u, err := s.store.GetUserByExternal(r.Context(), appID, externalID)
+	if err != nil || u == nil {
+		return "", false
+	}
+	return u.ID, true
+}
+
+// userInApp reports whether userID is the caller's app account or one of
+// the end-users (app_users) it minted. Platform admins may name anyone.
+func (s *Server) userInApp(r *http.Request, ident auth.Identity, userID string) bool {
+	if userID == "" {
+		return false
+	}
+	if ident.CanAdminPlatform() || userID == ident.AccountID() || userID == ident.EffectiveUserID() {
+		return true
+	}
+	if s.store == nil {
+		return false
+	}
+	u, err := s.store.GetUser(r.Context(), userID)
+	return err == nil && u != nil && u.OwnerUserID == ident.AccountID()
 }
 
 // HandleSetQuota handles PUT /v1/quota.
@@ -91,13 +149,11 @@ func (s *Server) HandleGetUsage(w http.ResponseWriter, r *http.Request) {
 //	}
 func (s *Server) HandleSetQuota(w http.ResponseWriter, r *http.Request) {
 	if s.quotaStore == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]string{"message": "quota management not configured", "type": "server_error"},
-		})
+		writeAPIError(w, http.StatusServiceUnavailable, errTypeServer, codeNotConfigured, "quota management not configured")
 		return
 	}
 
-	_, ok := auth.FromContext(r.Context())
+	ident, ok := auth.FromContext(r.Context())
 	if !ok {
 		writeUnauth(w, "authentication required")
 		return
@@ -110,15 +166,15 @@ func (s *Server) HandleSetQuota(w http.ResponseWriter, r *http.Request) {
 		ResetDay            int    `json:"reset_day"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": "invalid request body", "type": "invalid_request_error"},
-		})
+		writeAPIError(w, http.StatusBadRequest, errTypeInvalidRequest, codeInvalidRequest, "invalid request body")
 		return
 	}
 	if req.UserID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": "user_id is required", "type": "invalid_request_error"},
-		})
+		writeAPIError(w, http.StatusBadRequest, errTypeInvalidRequest, codeInvalidRequest, "user_id is required")
+		return
+	}
+	if !s.userInApp(r, ident, req.UserID) {
+		writeAPIError(w, http.StatusForbidden, errTypePermission, codeForbidden, "user_id is not this app or one of its end-users")
 		return
 	}
 	if req.ResetDay < 1 || req.ResetDay > 28 {
@@ -132,9 +188,7 @@ func (s *Server) HandleSetQuota(w http.ResponseWriter, r *http.Request) {
 		ResetDay:            req.ResetDay,
 	}
 	if err := s.quotaStore.SetQuota(r.Context(), q); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "server_error"},
-		})
+		writeAPIError(w, http.StatusInternalServerError, errTypeServer, codeInternal, err.Error())
 		return
 	}
 
@@ -150,13 +204,11 @@ func (s *Server) HandleSetQuota(w http.ResponseWriter, r *http.Request) {
 // Query params: user_id (required).
 func (s *Server) HandleGetQuota(w http.ResponseWriter, r *http.Request) {
 	if s.quotaStore == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]string{"message": "quota management not configured", "type": "server_error"},
-		})
+		writeAPIError(w, http.StatusServiceUnavailable, errTypeServer, codeNotConfigured, "quota management not configured")
 		return
 	}
 
-	_, ok := auth.FromContext(r.Context())
+	ident, ok := auth.FromContext(r.Context())
 	if !ok {
 		writeUnauth(w, "authentication required")
 		return
@@ -164,17 +216,17 @@ func (s *Server) HandleGetQuota(w http.ResponseWriter, r *http.Request) {
 
 	userID := r.URL.Query().Get("user_id")
 	if userID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": "user_id query param is required", "type": "invalid_request_error"},
-		})
+		writeAPIError(w, http.StatusBadRequest, errTypeInvalidRequest, codeInvalidRequest, "user_id query param is required")
+		return
+	}
+	if !s.userInApp(r, ident, userID) {
+		writeAPIError(w, http.StatusForbidden, errTypePermission, codeForbidden, "user_id is not this app or one of its end-users")
 		return
 	}
 
 	q, err := s.quotaStore.GetQuota(r.Context(), userID)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{
-			"error": map[string]string{"message": "no quota configured for this user", "type": "not_found_error"},
-		})
+		writeAPIError(w, http.StatusNotFound, errTypeNotFound, codeQuotaNotFound, "no quota configured for this user")
 		return
 	}
 
@@ -201,13 +253,11 @@ func (s *Server) HandleGetQuota(w http.ResponseWriter, r *http.Request) {
 // Query params: user_id (required).
 func (s *Server) HandleDeleteQuota(w http.ResponseWriter, r *http.Request) {
 	if s.quotaStore == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]string{"message": "quota management not configured", "type": "server_error"},
-		})
+		writeAPIError(w, http.StatusServiceUnavailable, errTypeServer, codeNotConfigured, "quota management not configured")
 		return
 	}
 
-	_, ok := auth.FromContext(r.Context())
+	ident, ok := auth.FromContext(r.Context())
 	if !ok {
 		writeUnauth(w, "authentication required")
 		return
@@ -215,16 +265,16 @@ func (s *Server) HandleDeleteQuota(w http.ResponseWriter, r *http.Request) {
 
 	userID := r.URL.Query().Get("user_id")
 	if userID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": "user_id query param is required", "type": "invalid_request_error"},
-		})
+		writeAPIError(w, http.StatusBadRequest, errTypeInvalidRequest, codeInvalidRequest, "user_id query param is required")
+		return
+	}
+	if !s.userInApp(r, ident, userID) {
+		writeAPIError(w, http.StatusForbidden, errTypePermission, codeForbidden, "user_id is not this app or one of its end-users")
 		return
 	}
 
 	if err := s.quotaStore.DeleteQuota(r.Context(), userID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "server_error"},
-		})
+		writeAPIError(w, http.StatusInternalServerError, errTypeServer, codeInternal, err.Error())
 		return
 	}
 

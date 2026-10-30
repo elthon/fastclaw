@@ -91,12 +91,8 @@ func rateLimitMiddleware(rl *rateLimiter, getUserID func(r *http.Request) string
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := getUserID(r)
 		if !rl.allow(uid) {
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{
-				"error": map[string]string{
-					"message": "rate limit exceeded — try again shortly",
-					"type":    "rate_limit_error",
-				},
-			})
+			writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", "rate_limited",
+				"rate limit exceeded — try again shortly")
 			return
 		}
 		next(w, r)

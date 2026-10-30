@@ -13,6 +13,8 @@ import { ChevronRightIcon, MoreHorizontal } from "lucide-react";
 import { moveChatSessionToProject } from "@/lib/api";
 import { ChannelIcon, channelLabel } from "@/components/channel-icon";
 import { ChatRowActions } from "@/components/chat-row-actions";
+import { useLocale } from "@/components/locale-provider";
+import { chatHref, rememberChatTarget } from "@/lib/chat-route";
 
 // MIME type carried in dataTransfer for chat-session drags. Custom
 // type so we don't react to unrelated drops (text dragged in from
@@ -27,6 +29,8 @@ const MAX_SIDEBAR_SESSIONS = 10;
 export interface SessionItem {
   id: string;
   title: string;
+  preview?: string;
+  updatedAt?: number;
   // Set when the session's first user turn carried an image attachment.
   // Renders as a small thumbnail before the title so multimodal chats
   // show "image + text" instead of just the text label.
@@ -47,6 +51,7 @@ export function NavSessions({
   agentId: string | null;
   sessions: SessionItem[];
 }) {
+  const { tr } = useLocale();
   const pathname = usePathname();
   const router = useRouter();
   // Drop-zone state for "drag a project chat back out into Chats".
@@ -82,6 +87,7 @@ export function NavSessions({
   if (!agentId) return null;
 
   const chatBase = `/agents/${agentId}/chat/`;
+  const looseSessions = sessions.filter((session) => !session.projectId);
 
   // Any mutation (rename / delete) broadcasts so AppSidebar re-fetches and
   // the chat page (if open) also re-syncs its local sessions list.
@@ -117,7 +123,7 @@ export function NavSessions({
       // so a console error + alert keeps the user from silently losing
       // the action.
       console.error("move chat to loose failed:", res.error);
-      window.alert(`Failed to move chat: ${res.error}`);
+      window.alert(tr("Failed to move chat: {{error}}", "移动对话失败：{{error}}", { error: res.error }));
       return;
     }
     broadcastChange();
@@ -141,7 +147,7 @@ export function NavSessions({
               (sectionCollapsed ? "rotate-0" : "rotate-90")
             }
           />
-          Chats
+          {tr("Chats", "对话")}
         </SidebarGroupLabel>
         {!sectionCollapsed && (
         <SidebarMenu
@@ -154,39 +160,43 @@ export function NavSessions({
           {/* Skip chats that belong to a project — they render nested
               under their project in NavProjectsList instead, so the flat
               "Chats" section keeps showing only loose chats. */}
-          {sessions.filter((s) => !s.projectId).slice(0, MAX_SIDEBAR_SESSIONS).map((s) => {
-            const href = `${chatBase}${encodeURIComponent(s.id)}/`;
-            // Path form: /agents/<aid>/chat/<sid>/. Match exactly so a
-            // sibling chat doesn't light up just because pathname
-            // shares the chat base.
-            const active = pathname === href || pathname === href.replace(/\/$/, "");
+          {looseSessions.slice(0, MAX_SIDEBAR_SESSIONS).map((s) => {
+            const href = chatHref(s.id);
+            // Path form: /chat/<sid>/ (old /agents/<aid>/chat/<sid>/ links
+            // too). Match exactly so a sibling chat doesn't light up just
+            // because pathname shares the chat base.
+            const oldHref = `${chatBase}${encodeURIComponent(s.id)}/`;
+            const active = [href, oldHref].some((h) => pathname === h || pathname === h.replace(/\/$/, ""));
             return (
               <SessionRow
                 key={s.id}
                 agentId={agentId}
                 session={s}
                 active={active}
-                onOpen={() => navigateOnce(href)}
+                onOpen={() => {
+                  rememberChatTarget(s.id, { kind: "agent", agentId });
+                  navigateOnce(href);
+                }}
                 onChanged={broadcastChange}
               />
             );
           })}
-          {sessions.length > MAX_SIDEBAR_SESSIONS && (
+          {looseSessions.length > MAX_SIDEBAR_SESSIONS && (
             <SidebarMenuItem>
               <SidebarMenuButton
                 onClick={() => navigateOnce(`/agents/${agentId}/chats`)}
-                tooltip="See all chats"
+                tooltip={tr("See all chats", "查看全部对话")}
                 className="text-muted-foreground"
               >
                 <MoreHorizontal className="size-4" />
-                <span>More</span>
+                <span>{tr("More", "更多")}</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           )}
-          {sessions.length === 0 && (
+          {looseSessions.length === 0 && (
             <SidebarMenuItem>
               <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                No chats yet
+                {tr("No chats yet", "还没有对话")}
               </div>
             </SidebarMenuItem>
           )}
@@ -229,7 +239,7 @@ function SessionRow({
         tooltip={`${channelLabel(session.channel)} · ${session.title}`}
         onClick={onOpen}
       >
-        {session.thumbnailUrl ? (
+        {(!session.channel || session.channel === "web") && session.thumbnailUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={session.thumbnailUrl}

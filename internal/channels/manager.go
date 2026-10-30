@@ -306,6 +306,23 @@ func (m *Manager) SendTyping(channel, accountID, chatID string) {
 	}
 }
 
+// StartMessageTyping starts a message-scoped typing cue on channels that
+// implement MessageTypingIndicator. Returns a no-op stop func otherwise.
+func (m *Manager) StartMessageTyping(channel, accountID, chatID, messageID string) (stop func()) {
+	key := channelKey(channel, accountID)
+	m.mu.Lock()
+	ch, ok := m.channels[key]
+	m.mu.Unlock()
+	if !ok {
+		return func() {}
+	}
+	ti, ok := ch.(MessageTypingIndicator)
+	if !ok {
+		return func() {}
+	}
+	return ti.StartMessageTyping(chatID, messageID)
+}
+
 // Has returns true when a channel with the given key is registered.
 // Used by handlers to short-circuit redundant hot-starts.
 func (m *Manager) Has(channel, accountID string) bool {

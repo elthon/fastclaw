@@ -493,6 +493,8 @@ func binaryRefusal(path string, size int) string {
 
 func makeReadFile(r *Registry) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args readFileArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -586,6 +588,8 @@ func makeReadFile(r *Registry) ToolFunc {
 
 func makeWriteFile(r *Registry) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args writeFileArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -678,6 +682,8 @@ func makeWriteFile(r *Registry) ToolFunc {
 
 func makeEditFile(r *Registry) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args editFileArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -815,6 +821,8 @@ func basenameIsSystemFile(path string) bool {
 
 func makeListDir(r *Registry) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args listDirArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -929,6 +937,8 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		},
 		"required": []string{"path"},
 	}, func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args readFileArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -1030,6 +1040,8 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		},
 		"required": []string{"path", "content"},
 	}, func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args writeFileArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -1099,6 +1111,8 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		},
 		"required": []string{"path"},
 	}, func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args listDirArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -1171,6 +1185,8 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 	})
 
 	r.Register("edit_file", editDescription, editSchema, func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args editFileArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)

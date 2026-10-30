@@ -61,6 +61,10 @@ type Store interface {
 
 	// --- Agents (atomic; agents.id is globally unique) ---
 	ListAgents(ctx context.Context, ownerUserID string) ([]AgentRecord, error)
+	// ListAgentIDs returns just the ids of the agents ownerUserID owns.
+	// Cheap enough to run per request (api-key ACL resolution) even for
+	// accounts with thousands of agents.
+	ListAgentIDs(ctx context.Context, ownerUserID string) ([]string, error)
 	ListPublicAgents(ctx context.Context) ([]AgentRecord, error)
 	GetAgent(ctx context.Context, agentID string) (*AgentRecord, error)
 	SaveAgent(ctx context.Context, agent *AgentRecord) error
@@ -77,6 +81,34 @@ type Store interface {
 	// LookupSessionOwner returns the user_id that owns the given session.
 	// Used to resolve the correct user_id for cross-user session reads.
 	LookupSessionOwner(ctx context.Context, agentID, sessionKey string) (string, error)
+	// FindSessionLocations finds where a URL session id lives for userID:
+	// their sessions whose key is sessionKey, their group-chat member
+	// sessions keyed "<sessionKey>-agent-<agentID>", and — as the agent's
+	// owner — another user's session on one of their agents (an API
+	// end-user's chat). The caller's own rows come first. Backs
+	// /chat/<sessionId>, whose URL no longer names the agent or group.
+	FindSessionLocations(ctx context.Context, userID, sessionKey string) ([]SessionLocation, error)
+	// HasChatSession reports whether userID has a session with agentID
+	// whose chat_id is chatID — the caller-chosen conversation id (e.g.
+	// the /v1 X-Fastclaw-Session-Key), which also names its workspace.
+	HasChatSession(ctx context.Context, userID, agentID, chatID string) (bool, error)
+
+	// Billing hooks — generic primitives an external billing system (e.g.
+	// a hosted FastClaw Cloud) builds on; FastClaw has no notion of money.
+	//
+	// GetBillingHold / SetBillingHold read and set an account's hold. A
+	// held account's model calls are refused until the hold is lifted.
+	GetBillingHold(ctx context.Context, userID string) (hold bool, reason string, err error)
+	SetBillingHold(ctx context.Context, userID string, hold bool, reason string) error
+	// ListUsageEvents returns token_usage_log rows with an id above
+	// afterID, oldest first (≤ limit). Rows become visible a few seconds
+	// after they are written, so incremental readers never skip one.
+	ListUsageEvents(ctx context.Context, afterID int64, limit int) ([]UsageEvent, error)
+	// CreateLoginToken / ConsumeLoginToken back single-use console
+	// sign-in links. Consume deletes the token and returns its user;
+	// ErrNotFound when unknown or expired.
+	CreateLoginToken(ctx context.Context, tokenHash, userID string, expiresAt time.Time) error
+	ConsumeLoginToken(ctx context.Context, tokenHash string) (string, error)
 	SaveSession(ctx context.Context, userID, agentID, sessionKey string, session *SessionRecord) error
 	ListSessions(ctx context.Context, userID, agentID string) ([]SessionMeta, error)
 	// ListSessionOwnerPairs returns every distinct (user_id, agent_id)
@@ -157,6 +189,12 @@ type Store interface {
 	// untouched by compaction. DeleteSession cascades to clean these up.
 	AppendSessionMessage(ctx context.Context, userID, agentID, sessionKey string, msg SessionMessage) error
 	ListSessionMessages(ctx context.Context, userID, agentID, sessionKey string) ([]SessionMessage, error)
+	// ListSessionMessagesPage returns the archived rows with seq in
+	// [start, before), where start is the seq of a user turn chosen so
+	// the page holds about limit rows and never splits a turn. before <
+	// 0 means "from the newest row". hasMore reports rows below start.
+	// An empty page with start = -1 means the session has no archive.
+	ListSessionMessagesPage(ctx context.Context, userID, agentID, sessionKey string, before int64, limit int) (msgs []SessionMessage, start int64, hasMore bool, err error)
 	// CountChatterUserMessages returns how many role='user' rows this
 	// chatter has accumulated under the agent — across all sessions,
 	// all channels. Used by the autoPersist gate as a *durable* "every
@@ -239,6 +277,11 @@ type Store interface {
 	SaveChannel(ctx context.Context, ch *ChannelRecord) error
 	DeleteChannel(ctx context.Context, id string) error
 	LookupChannel(ctx context.Context, channelType, accountID string) (*ChannelRecord, error)
+	// SetChannelBinding records (or, with empty boundUserID, clears) the
+	// paired platform sender and drops any outstanding pair code.
+	SetChannelBinding(ctx context.Context, id, boundUserID, boundUserName string) error
+	// SetChannelPairCode stores a one-time /pair code (empty clears it).
+	SetChannelPairCode(ctx context.Context, id, code string, expiresAt time.Time) error
 
 	// --- Cron jobs (per agent) ---
 	//
@@ -398,6 +441,28 @@ type AgentRecord struct {
 	UpdatedAt time.Time              `json:"updatedAt"`
 }
 
+// UsageEvent is one model call from token_usage_log, for billing export.
+// AccountID is the account that pays: UserID itself, or the account that
+// owns UserID when it is an end-user (app_user) or IM chatter.
+type UsageEvent struct {
+	ID                  int64     `json:"id"`
+	AccountID           string    `json:"account_id"`
+	UserID              string    `json:"user_id"`
+	EndUser             string    `json:"end_user,omitempty"`
+	AgentID             string    `json:"agent_id"`
+	SessionKey          string    `json:"session_key"`
+	Provider            string    `json:"provider"`
+	Model               string    `json:"model"`
+	InputTokens         int64     `json:"input_tokens"`
+	OutputTokens        int64     `json:"output_tokens"`
+	CacheReadTokens     int64     `json:"cache_read_tokens"`
+	CacheCreationTokens int64     `json:"cache_creation_tokens"`
+	DurationMs          int64     `json:"duration_ms"`
+	Channel             string    `json:"channel"`
+	ChatterUserID       string    `json:"chatter_user_id,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
 // KnowledgeDoc is one raw owner-uploaded knowledge source file
 // (an agent_files row under the knowledge/ prefix).
 type KnowledgeDoc struct {
@@ -438,6 +503,13 @@ type SessionRecord struct {
 	ProjectID string           `json:"projectId,omitempty"`
 	Messages  []SessionMessage `json:"messages"`
 	UpdatedAt time.Time        `json:"updatedAt"`
+}
+
+// SessionLocation is one session row a URL session id resolves to.
+type SessionLocation struct {
+	AgentID    string
+	SessionKey string
+	ProjectID  string
 }
 
 // SessionMessage is a single message in a session.
@@ -633,10 +705,24 @@ type ChannelRecord struct {
 	// owner share sessions and memory across multiple personal channels
 	// (e.g. WeChat + Feishu + Telegram all resolving as the same user).
 	// Default false — each platform sender gets an isolated chatter.
-	SharedIdentity bool                   `json:"sharedIdentity"`
-	Data           map[string]interface{} `json:"data,omitempty"` // extra config (accounts map, etc.)
-	CreatedAt      time.Time              `json:"createdAt"`
-	UpdatedAt      time.Time              `json:"updatedAt"`
+	SharedIdentity bool `json:"sharedIdentity"`
+	// BoundUserID is the platform-side sender ID (Feishu open_id, iLink
+	// user id, Telegram numeric id, …) of the person who paired this
+	// channel — normally the binder themselves, proven either by the
+	// connect-time QR scan or by sending the console-issued /pair code
+	// from that account. Empty = unpaired: the gateway answers every
+	// inbound with a "not paired" notice instead of routing it. Only
+	// messages from this sender may act as the channel's owner.
+	BoundUserID   string `json:"boundUserId,omitempty"`
+	BoundUserName string `json:"boundUserName,omitempty"`
+	// PairCode is the outstanding one-time /pair code, valid until
+	// PairCodeExpiresAt. Written only by SetChannelPairCode; SaveChannel
+	// leaves pairing columns alone so reconnects keep the pairing.
+	PairCode          string                 `json:"-"`
+	PairCodeExpiresAt time.Time              `json:"-"`
+	Data              map[string]interface{} `json:"data,omitempty"` // extra config (accounts map, etc.)
+	CreatedAt         time.Time              `json:"createdAt"`
+	UpdatedAt         time.Time              `json:"updatedAt"`
 }
 
 // computeConfigScope derives the scope label from the (userID, agentID)

@@ -37,6 +37,10 @@ func chatCmd() *cobra.Command {
 		Short: "Chat with a FastClaw agent in the terminal",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Flags parsed: a failure from here on is a runtime error, not a
+			// usage mistake. Callers that capture stderr (Douchat, scripts)
+			// otherwise get the full help text appended to the real cause.
+			cmd.SilenceUsage = true
 			if opts.query == "" && len(args) > 0 {
 				opts.query = strings.Join(args, " ")
 			}
@@ -383,7 +387,8 @@ func plainStream(ctx context.Context, c *cliclient.Client, agentID, sessionID, m
 	})
 	if err != nil {
 		clearStatus()
-		return err
+		// Name the session so the failed turn can be inspected or resumed.
+		return fmt.Errorf("%w (session %s)", err, sessionID)
 	}
 	return nil
 }

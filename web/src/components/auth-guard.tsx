@@ -13,19 +13,18 @@ interface AuthGuardProps {
 // authoritatively; the client gate just stops non-admins from landing on a
 // page that would render an empty / 403'd shell.
 //
-// /settings, /models, and /apikeys are intentionally NOT here —
-// settings hides Runtime; models merges system+user with badges;
-// apikeys lets non-admins issue type=user/agent (only type=admin
-// requires super_admin and that gate lives inside the create handler).
+// /settings and the console's user-level pages (/console, agents, models,
+// skills, apikeys) are intentionally NOT here — they show the caller's own
+// configuration; apikeys lets non-admins issue type=user/agent (only
+// type=admin requires super_admin and that gate lives inside the create
+// handler).
 const ADMIN_PATH_PREFIXES = [
   "/admin/",
-  "/skills",
-  "/providers",
-  "/channels",
-  "/channels-config",
-  "/plugins",
-  "/tools",
-  "/cron",
+  "/console/providers",
+  "/console/channels",
+  "/console/channels-config",
+  "/console/plugins",
+  "/console/cron",
 ];
 
 function isAdminPath(pathname: string): boolean {
@@ -84,7 +83,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
         const me = await getMe();
         if (me.ok && me.user) {
           if (isAdminPath(pathname) && me.user.role !== "super_admin") {
-            router.replace("/overview/");
+            router.replace("/console/");
             return;
           }
           setAuthed(true);

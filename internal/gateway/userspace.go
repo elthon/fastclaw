@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,33 +25,32 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/skills"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
+	"github.com/fastclaw-ai/fastclaw/internal/users"
 	"github.com/fastclaw-ai/fastclaw/internal/workspace"
 )
 
-// loadAgentSkillEntries collects every agent-scope skills.entries row
-// owned by this user. Mirrors the same logic in the HTTP layer; kept
-// here so the runtime gateway never imports the setup handlers package.
-func loadAgentSkillEntries(ctx context.Context, st store.Store, userID string) (map[string]map[string]config.SkillEntryCfg, error) {
+// loadAgentSkillEntries collects the agent-scope skills.entries rows for
+// the given agents. Mirrors the same logic in the HTTP layer; kept here so
+// the runtime gateway never imports the setup handlers package. Callers
+// pass only the agents they are about to build: an on-demand UserSpace
+// must not issue one query per agent the account owns.
+func loadAgentSkillEntries(ctx context.Context, st store.Store, agentIDs []string) map[string]map[string]config.SkillEntryCfg {
 	if st == nil {
-		return nil, nil
-	}
-	agents, err := st.ListAgents(ctx, userID)
-	if err != nil {
-		return nil, err
+		return nil
 	}
 	out := map[string]map[string]config.SkillEntryCfg{}
-	for _, ar := range agents {
-		rec, err := st.GetConfigByName(ctx, store.KindSetting, "", ar.ID, "skills.entries")
+	for _, id := range agentIDs {
+		rec, err := st.GetConfigByName(ctx, store.KindSetting, "", id, "skills.entries")
 		if err != nil || rec == nil || len(rec.Data) == 0 {
 			continue
 		}
 		blob, _ := json.Marshal(rec.Data)
 		var entries map[string]config.SkillEntryCfg
 		if json.Unmarshal(blob, &entries) == nil && len(entries) > 0 {
-			out[ar.ID] = entries
+			out[id] = entries
 		}
 	}
-	return out, nil
+	return out
 }
 
 // ensureAgentHome idempotently creates the agent's local FS layout. Only
@@ -261,17 +261,12 @@ func assembleConfig(ctx context.Context, st store.Store, userID, agentID string)
 	if err := scope.SettingInto(ctx, st, NSSkillsEntries, userID, agentID, &cfg.Skills.Entries); err != nil {
 		return nil, err
 	}
-	// Per-agent skill env overrides used to live in a single user-scope
-	// row keyed by agentID; they now persist as one scope=agent row each
-	// at name=skills.entries (same namespace, narrower scope). Collect
-	// every agent owned by this user — the agent runtime still wants
-	// the keyed-by-agent map shape via cfg.Skills.AgentEntries.
-	if userID != "" {
-		entries, err := loadAgentSkillEntries(ctx, st, userID)
-		if err != nil {
-			return nil, err
-		}
-		if len(entries) > 0 {
+	// Per-agent skill env overrides persist as one scope=agent row each
+	// at name=skills.entries. They are NOT collected here: loadUserSpace
+	// and EnsureAgent add the rows for exactly the agents they build, so
+	// assembling an account's config costs the same with 5 agents or 5000.
+	if agentID != "" {
+		if entries := loadAgentSkillEntries(ctx, st, []string{agentID}); len(entries) > 0 {
 			cfg.Skills.AgentEntries = entries
 		}
 	}
@@ -336,8 +331,78 @@ type UserSpace struct {
 	// lazy-built agents also gain the coding-agent preview tools. Nil
 	// when no runtime is configured.
 	ProjectRuntime *coderuntime.Manager
+	// AppOwnerUserID is set when this space belongs to an app_user (an
+	// end-user namespace minted for an API key). It names the account
+	// that owns the app — and therefore the agents the end-user talks to.
+	// Agents owned by that account are treated as the space's own agents
+	// rather than foreign ones (owner model/provider config always applies).
+	AppOwnerUserID string
+	// OnDemand is true when the account owns more agents than
+	// eagerAgentLimit. Only pinned agents are built at load; everything
+	// else is attached on first use and dropped again when idle.
+	OnDemand bool
+	// pinned lists agents that must stay loaded in an on-demand space:
+	// agents bound to IM channels and agents with enabled cron jobs.
+	pinned map[string]bool
 
 	mu sync.Mutex
+}
+
+// defaultEagerAgentLimit is how many owned agents a UserSpace builds
+// eagerly. Self-hosted installs and ordinary accounts stay well under
+// it and keep loading every agent up front; an app that provisions an
+// agent per end-user crosses it and switches to on-demand loading.
+const defaultEagerAgentLimit = 50
+
+// eagerAgentLimit returns the eager-load ceiling, overridable through
+// FASTCLAW_EAGER_AGENT_LIMIT (0 forces on-demand loading for everyone).
+func eagerAgentLimit() int {
+	if v := strings.TrimSpace(os.Getenv("FASTCLAW_EAGER_AGENT_LIMIT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultEagerAgentLimit
+}
+
+// IsPinned reports whether agentID must stay loaded in this space.
+// pinned is fixed at load, so this takes no lock — it runs inside
+// Manager.EvictIdle, which holds the manager lock, and must not order
+// against sp.mu (EnsureAgent takes sp.mu, then the manager lock).
+func (sp *UserSpace) IsPinned(agentID string) bool {
+	if sp == nil {
+		return false
+	}
+	return sp.pinned[agentID]
+}
+
+// ownsAgent reports whether rec belongs to this space's account — either
+// directly or, for an app_user space, through the app owner.
+func (sp *UserSpace) ownsAgent(rec *store.AgentRecord) bool {
+	if rec == nil || rec.UserID == "" {
+		return false
+	}
+	return rec.UserID == sp.UserID || (sp.AppOwnerUserID != "" && rec.UserID == sp.AppOwnerUserID)
+}
+
+// EnsureOwnedAgent attaches agentID only when this space's account owns
+// it. Routing paths (cron, web chat targets) use it to load an on-demand
+// agent without opening a path to arbitrary foreign agents.
+func (sp *UserSpace) EnsureOwnedAgent(ctx context.Context, st store.Store, mb *bus.MessageBus, ws workspace.Store, agentID string) error {
+	if sp == nil || sp.Agents == nil || agentID == "" {
+		return fmt.Errorf("EnsureOwnedAgent: nil UserSpace or empty agent id")
+	}
+	if sp.Agents.AgentByID(agentID) != nil {
+		return nil
+	}
+	if st == nil {
+		return fmt.Errorf("EnsureOwnedAgent: store required")
+	}
+	rec, err := st.GetAgent(ctx, agentID)
+	if err != nil || rec == nil || !sp.ownsAgent(rec) {
+		return fmt.Errorf("EnsureOwnedAgent: agent %q not owned by %q", agentID, sp.UserID)
+	}
+	return sp.EnsureAgent(ctx, st, mb, ws, agentID)
 }
 
 // readUserScopeAgentDefaults reads the (user=X, agent=”) agents.defaults
@@ -430,7 +495,9 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 	// fall through the owner/agent overlays since the chatter doesn't
 	// have UI to set them per-agent.
 	chatterPin := readUserScopeAgentDefaults(ctx, st, sp.UserID)
-	isForeign := rec.UserID != "" && rec.UserID != sp.UserID
+	// An app_user's agents belong to the app owner; they are the space's
+	// own agents, not foreign ones, so the owner's config always applies.
+	isForeign := rec.UserID != "" && !sp.ownsAgent(rec)
 	// Default true when the key is absent — keep aligned with
 	// setup.agentShareModelConfig.
 	shareCfg := true
@@ -438,7 +505,10 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 		shareCfg = v
 	}
 	applyOwnerOverlays := !isForeign || shareCfg
-	if isForeign && applyOwnerOverlays {
+	// The owner's user-scope settings and providers aren't in this space's
+	// config whenever the space user isn't the owner — a foreign viewer,
+	// or an app's end-user (app_user) space running the app's agent.
+	if rec.UserID != "" && rec.UserID != sp.UserID && applyOwnerOverlays {
 		if ownerCfg, err := assembleConfig(ctx, st, rec.UserID, ""); err == nil && ownerCfg != nil {
 			ovr := ownerCfg.Agents.Defaults
 			if ovr.Model != "" {
@@ -521,6 +591,10 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 				v := *ovr.AutoPersist
 				rc.AutoPersist = &v
 			}
+			if ovr.WorkspaceHistory != nil {
+				v := *ovr.WorkspaceHistory
+				rc.WorkspaceHistory = &v
+			}
 		}
 	}
 	if chatterPin.Model != "" {
@@ -596,6 +670,11 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 	if err := sp.Agents.AddAgentWithSkillsCfg(rc, sp.Provider, mb, skillsCfg); err != nil {
 		return fmt.Errorf("EnsureAgent: add agent: %w", err)
 	}
+	// Same per-agent tool chains (web_search, image_gen, …) the eager
+	// load path registers, so an on-demand agent has identical tools.
+	if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
+		registerAgentToolChains(sp.Config, []*agent.Agent{ag})
+	}
 	if sp.SandboxPool != nil {
 		if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
 			ag.SetSandboxPool(sp.SandboxPool)
@@ -623,8 +702,12 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			registerHookPluginsForAgent(ctx, sp.PluginMgr, st, ag)
 		}
 	}
-	slog.Info("agent injected into foreign user space",
-		"caller", sp.UserID, "agent", rc.ID, "owner", rec.UserID)
+	if isForeign {
+		slog.Info("agent injected into foreign user space",
+			"caller", sp.UserID, "agent", rc.ID, "owner", rec.UserID)
+	} else {
+		slog.Info("agent loaded on demand", "user", sp.UserID, "agent", rc.ID)
+	}
 	return nil
 }
 
@@ -663,6 +746,12 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	if err != nil {
 		return nil, fmt.Errorf("list agents: %w", err)
 	}
+	// An app_user space runs agents owned by the app (the api key's owner
+	// account); remember the owner so EnsureAgent treats them as owned.
+	appOwner := ""
+	if u, uerr := st.GetUser(ctx, userID); uerr == nil && u != nil && u.Role == users.RoleAppUser {
+		appOwner = u.OwnerUserID
+	}
 
 	// Public agents owned by other users are NOT loaded eagerly here —
 	// they get lazy-attached via UserSpace.EnsureAgent the first time
@@ -672,17 +761,38 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	// agent identity (SOUL/IDENTITY/skills) is shared from the
 	// owner's row.
 
-	entries := make([]config.AgentEntry, 0, len(agentRecords))
-	for _, ar := range agentRecords {
-		entries = append(entries, config.AgentEntry{ID: ar.ID, UserID: ar.UserID, Name: ar.Name})
-	}
-
 	// Bindings used to live in their own kind=setting/name=bindings
 	// row. After the configs schema refactor, channel rows carry
 	// agent_id directly, so we synthesize Bindings from the channel
 	// table itself — every row whose agent_id == one of this user's
 	// owned agents contributes one Binding per Account in its data.
 	cfg.Bindings = append(cfg.Bindings, bindingsFromChannelRows(ctx, st, userID, agentRecords)...)
+
+	// Accounts with many agents (an app provisioning one per end-user)
+	// load on demand: only agents that must work with nobody watching —
+	// channel-bound or cron-scheduled — are built now. The rest attach
+	// via EnsureAgent on first use and are evicted when idle.
+	onDemand := len(agentRecords) > eagerAgentLimit()
+	var pinned map[string]bool
+	eager := agentRecords
+	if onDemand {
+		pinned = backgroundAgents(ctx, st, userID, cfg.Bindings)
+		eager = make([]store.AgentRecord, 0, len(pinned))
+		for _, ar := range agentRecords {
+			if pinned[ar.ID] {
+				eager = append(eager, ar)
+			}
+		}
+	}
+	entries := make([]config.AgentEntry, 0, len(eager))
+	eagerIDs := make([]string, 0, len(eager))
+	for _, ar := range eager {
+		entries = append(entries, config.AgentEntry{ID: ar.ID, UserID: ar.UserID, Name: ar.Name})
+		eagerIDs = append(eagerIDs, ar.ID)
+	}
+	if ae := loadAgentSkillEntries(ctx, st, eagerIDs); len(ae) > 0 {
+		cfg.Skills.AgentEntries = ae
+	}
 	resolved := config.ResolveAgents(cfg, entries)
 	for i := range resolved {
 		// Layer the agent-scope agents.defaults on top of the
@@ -782,6 +892,9 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		}
 	}
 
+	// Assigned once the space is built; message_agent only runs during a
+	// turn, which is after that.
+	var space *UserSpace
 	managerOpts := []agent.ManagerOption{
 		agent.WithUserID(userID),
 		agent.WithGlobalSkillsCfg(cfg.Skills),
@@ -797,6 +910,24 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		agent.WithToolAvailability(func(_ context.Context, agentID string) (map[string]bool, error) {
 			return agentToolAvailability(cfg, agentID), nil
 		}),
+		// message_agent's lookup: another agent of this account by id or
+		// display name, loaded on demand (agents may be evicted when idle).
+		agent.WithAgentResolver(func(ctx context.Context, ref string) (*agent.Agent, error) {
+			if space == nil {
+				return nil, fmt.Errorf("user space is still loading")
+			}
+			id, err := resolveOwnedAgentRef(ctx, st, userID, ref)
+			if err != nil {
+				return nil, err
+			}
+			if err := space.EnsureOwnedAgent(ctx, st, mb, ws, id); err != nil {
+				return nil, err
+			}
+			if ag := space.Agents.AgentByID(id); ag != nil {
+				return ag, nil
+			}
+			return nil, fmt.Errorf("agent %q is not available", ref)
+		}),
 	}
 	if ws != nil {
 		managerOpts = append(managerOpts, agent.WithWorkspaceStore(ws))
@@ -810,6 +941,10 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	agentMgr, err := agent.NewManager(resolved, prov, mb, managerOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create agent manager for user %q: %w", userID, err)
+	}
+
+	if onDemand {
+		agentMgr.ClearDefaultAgent()
 	}
 
 	registerAgentToolChains(cfg, agentMgr.All())
@@ -835,9 +970,14 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		}
 	}
 
-	slog.Info("loaded user space", "user", userID, "agents", agentMgr.Names())
+	if onDemand {
+		slog.Info("loaded user space (on-demand agents)", "user", userID,
+			"owned", len(agentRecords), "pinned", agentMgr.Names())
+	} else {
+		slog.Info("loaded user space", "user", userID, "agents", agentMgr.Names())
+	}
 
-	return &UserSpace{
+	space = &UserSpace{
 		UserID:         userID,
 		Config:         cfg,
 		Provider:       prov,
@@ -845,7 +985,11 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		SandboxPool:    pool,
 		PluginMgr:      pluginMgr,
 		ProjectRuntime: projectRuntime,
-	}, nil
+		AppOwnerUserID: appOwner,
+		OnDemand:       onDemand,
+		pinned:         pinned,
+	}
+	return space, nil
 }
 
 // registerHookPluginsForAgent walks every running hook-type plugin
@@ -1087,6 +1231,15 @@ func (r *userSpaceRegistry) evictIdle() int {
 			evicted++
 			slog.Info("evicted idle user space", "user", uid,
 				"idle", time.Since(e.lastUsed).Round(time.Second))
+			continue
+		}
+		// A busy on-demand space stays loaded, but agents in it that
+		// nobody has used for idleTTL are dropped; pinned (channel /
+		// cron) agents are never dropped.
+		if sp := e.space; sp != nil && sp.OnDemand && sp.Agents != nil {
+			if ids := sp.Agents.EvictIdle(cutoff, sp.IsPinned); len(ids) > 0 {
+				slog.Info("evicted idle on-demand agents", "user", uid, "agents", ids)
+			}
 		}
 	}
 	return evicted
@@ -1264,4 +1417,58 @@ func expandChannelBindings(rows []store.ConfigRecord, agentID string) []config.B
 		}
 	}
 	return out
+}
+
+// backgroundAgents returns the agents that must keep working while no
+// client is connected: agents bound to an IM channel and agents with an
+// enabled cron job. An on-demand UserSpace builds these at load and never
+// evicts them, so a restart doesn't leave a bot silent until someone
+// happens to open its chat.
+func backgroundAgents(ctx context.Context, st store.Store, userID string, bindings []config.Binding) map[string]bool {
+	out := map[string]bool{}
+	for _, b := range bindings {
+		if b.AgentID != "" {
+			out[b.AgentID] = true
+		}
+	}
+	if st != nil {
+		if jobs, err := st.ListCronJobsByOwner(ctx, userID); err == nil {
+			for _, j := range jobs {
+				if j.Enabled && j.AgentID != "" {
+					out[j.AgentID] = true
+				}
+			}
+		} else {
+			slog.Warn("list cron jobs for pinning failed", "user", userID, "error", err)
+		}
+	}
+	return out
+}
+
+// resolveOwnedAgentRef maps a message_agent target — an agent id or a
+// case-insensitive display name — to the id of an agent owned by userID.
+func resolveOwnedAgentRef(ctx context.Context, st store.Store, userID, ref string) (string, error) {
+	if st == nil {
+		return "", fmt.Errorf("agent lookup unavailable")
+	}
+	if rec, err := st.GetAgent(ctx, ref); err == nil && rec != nil && rec.UserID == userID {
+		return rec.ID, nil
+	}
+	recs, err := st.ListAgents(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	match := ""
+	for _, rec := range recs {
+		if strings.EqualFold(strings.TrimSpace(rec.Name), strings.TrimSpace(ref)) {
+			if match != "" {
+				return "", fmt.Errorf("more than one agent is named %q; use its id", ref)
+			}
+			match = rec.ID
+		}
+	}
+	if match == "" {
+		return "", fmt.Errorf("no agent named %q exists", ref)
+	}
+	return match, nil
 }

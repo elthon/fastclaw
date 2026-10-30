@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // OpenAIProvider implements the Provider interface for OpenAI-compatible APIs.
@@ -18,6 +19,8 @@ type OpenAIProvider struct {
 	apiBase       string
 	customHeaders map[string]string
 	client        *http.Client
+	// thinkingModels remembers models requiring reasoning echo.
+	thinkingModels sync.Map
 }
 
 // NewOpenAI creates a new OpenAI-compatible provider. apiBase is taken
@@ -104,7 +107,13 @@ type sseUsage struct {
 // by tool messages`. We strip the offending tool_calls (and any
 // orphan tool replies) at wire-build time so the request goes through
 // — the session keeps its historical record untouched.
-func toAPIMessages(msgs []Message) []json.RawMessage {
+func toAPIMessages(msgs []Message, model string) []json.RawMessage {
+	return toAPIMessagesEcho(msgs, needsReasoningEcho(msgs, model))
+}
+
+// toAPIMessagesEcho is toAPIMessages with the reasoning_content echo
+// decided by the caller.
+func toAPIMessagesEcho(msgs []Message, echoReasoning bool) []json.RawMessage {
 	orphanAssistant, orphanTool := findOrphanToolCalls(msgs)
 	out := make([]json.RawMessage, 0, len(msgs))
 	for i, m := range msgs {
@@ -117,7 +126,11 @@ func toAPIMessages(msgs []Message) []json.RawMessage {
 		// unless the cached message has orphan tool_calls, in which
 		// case rebuild it without them.
 		if m.Role == "assistant" && len(m.RawAssistant) > 0 && !orphanAssistant[i] {
-			out = append(out, m.RawAssistant)
+			raw := m.RawAssistant
+			if echoReasoning {
+				raw = withReasoningContent(raw)
+			}
+			out = append(out, raw)
 			continue
 		}
 
@@ -139,7 +152,55 @@ func toAPIMessages(msgs []Message) []json.RawMessage {
 			am.Content, _ = json.Marshal(m.Content)
 		}
 		raw, _ := json.Marshal(am)
+		if echoReasoning && m.Role == "assistant" {
+			raw = withReasoningContent(raw)
+		}
 		out = append(out, raw)
+	}
+	return out
+}
+
+// needsReasoningEcho reports whether the upstream is (likely) a thinking-
+// mode model that rejects any assistant message without
+// `reasoning_content` — DeepSeek answers 400 "The reasoning_content in the
+// thinking mode must be passed back to the API". That happens when an
+// assistant turn has no reasoning to echo: the model skipped thinking for
+// that step, or a routing model (e.g. "autojev/fast") served it from a
+// non-thinking backend. Sending an empty reasoning_content satisfies the
+// check. We only add it when the model name or the history says thinking
+// mode is in play, because strict OpenAI-compatible APIs reject unknown
+// message fields; a routing model that only sometimes lands on a thinking
+// backend is caught by the 400 instead (shouldRetryWithReasoningEcho).
+func needsReasoningEcho(msgs []Message, model string) bool {
+	if strings.Contains(strings.ToLower(model), "deepseek") {
+		return true
+	}
+	for _, m := range msgs {
+		if m.Role != "assistant" {
+			continue
+		}
+		if m.Thinking != "" || bytes.Contains(m.RawAssistant, []byte(`"reasoning_content"`)) {
+			return true
+		}
+	}
+	return false
+}
+
+// withReasoningContent adds `"reasoning_content":""` to a wire-format
+// assistant message that lacks the field. Anything that isn't an
+// OpenAI-shaped assistant object is returned unchanged.
+func withReasoningContent(raw json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return raw
+	}
+	if _, ok := obj["reasoning_content"]; ok || string(obj["role"]) != `"assistant"` {
+		return raw
+	}
+	obj["reasoning_content"] = json.RawMessage(`""`)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
 	}
 	return out
 }
@@ -255,6 +316,7 @@ type sseResponse struct {
 type openAIRequestMode struct {
 	maxCompletionTokens bool
 	omitTemperature     bool
+	echoReasoning       bool
 }
 
 func initialOpenAIRequestMode(model string) openAIRequestMode {
@@ -272,7 +334,7 @@ func initialOpenAIRequestMode(model string) openAIRequestMode {
 func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, stream bool, mode openAIRequestMode) (*http.Request, error) {
 	req := chatRequest{
 		Model:    StripProviderPrefix(model),
-		Messages: toAPIMessages(messages),
+		Messages: toAPIMessagesEcho(messages, mode.echoReasoning || needsReasoningEcho(messages, model)),
 		Stream:   stream,
 	}
 	if !mode.omitTemperature {
@@ -300,7 +362,7 @@ func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, t
 	}
 
 	url := p.apiBase + "/chat/completions"
-	slog.Info("openai request", "url", url, "model", req.Model)
+	slog.Info("openai request", "url", url, "model", req.Model, "request_bytes", len(body))
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -342,6 +404,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 		toolCalls := make(map[int]*ToolCall)
 		var contentBuilder, reasoningBuilder strings.Builder
 		var usage Usage
+		truncated := false
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -387,6 +450,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 					Thinking:     reasoning,
 					Usage:        usage,
 					RawAssistant: raw,
+					Truncated:    truncated,
 				}:
 				case <-ctx.Done():
 				}
@@ -410,6 +474,9 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 				continue
 			}
 
+			if chunk.Choices[0].FinishReason == "length" {
+				truncated = true
+			}
 			delta := chunk.Choices[0].Delta
 
 			// Accumulate tool calls
@@ -463,8 +530,9 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 
 func (p *OpenAIProvider) doChatRequest(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, stream bool) (*http.Response, error) {
 	mode := initialOpenAIRequestMode(model)
+	_, mode.echoReasoning = p.thinkingModels.Load(model)
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 4; attempt++ {
 		httpReq, err := p.buildRequest(ctx, messages, tools, model, maxTokens, temperature, stream, mode)
 		if err != nil {
 			return nil, err
@@ -491,6 +559,12 @@ func (p *OpenAIProvider) doChatRequest(ctx context.Context, messages []Message, 
 			mode.omitTemperature = true
 			continue
 		}
+		if !mode.echoReasoning && shouldRetryWithReasoningEcho(resp.StatusCode, body) {
+			slog.Warn("upstream wants reasoning_content echoed — retrying with it", "model", model)
+			p.thinkingModels.Store(model, true)
+			mode.echoReasoning = true
+			continue
+		}
 
 		return nil, lastErr
 	}
@@ -503,6 +577,19 @@ func shouldRetryWithMaxCompletionTokens(status int, body string) bool {
 	}
 	lower := strings.ToLower(body)
 	return strings.Contains(lower, "max_tokens") && strings.Contains(lower, "max_completion_tokens")
+}
+
+// shouldRetryWithReasoningEcho matches DeepSeek's thinking-mode 400 for
+// an assistant message without reasoning_content ("The `reasoning_content`
+// in the thinking mode must be passed back to the API"). A routing model
+// can send one step to a plain backend and the next to DeepSeek thinking
+// mode, so the model name alone can't predict it.
+func shouldRetryWithReasoningEcho(status int, body string) bool {
+	if status < 400 || status >= 500 {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "reasoning_content") && strings.Contains(lower, "passed back")
 }
 
 func shouldRetryWithoutTemperature(status int, body string) bool {
@@ -522,6 +609,7 @@ func (p *OpenAIProvider) parseSSE(reader io.Reader) (*Response, error) {
 	var reasoningBuilder strings.Builder
 	toolCalls := make(map[int]*ToolCall)
 	var usage Usage
+	truncated := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -550,6 +638,9 @@ func (p *OpenAIProvider) parseSSE(reader io.Reader) (*Response, error) {
 			continue
 		}
 
+		if chunk.Choices[0].FinishReason == "length" {
+			truncated = true
+		}
 		delta := chunk.Choices[0].Delta
 
 		if delta.Content != "" {
@@ -591,9 +682,10 @@ func (p *OpenAIProvider) parseSSE(reader io.Reader) (*Response, error) {
 
 	reasoning := reasoningBuilder.String()
 	result := &Response{
-		Content:  contentBuilder.String(),
-		Thinking: reasoning,
-		Usage:    usage,
+		Content:   contentBuilder.String(),
+		Thinking:  reasoning,
+		Usage:     usage,
+		Truncated: truncated,
 	}
 	for i := 0; i < len(toolCalls); i++ {
 		if tc, ok := toolCalls[i]; ok {

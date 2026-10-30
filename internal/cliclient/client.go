@@ -213,7 +213,7 @@ func (c *Client) StreamImages(ctx context.Context, agentID, sessionID, message s
 		switch event.Type {
 		case "error":
 			on(event)
-			return errors.New(event.Str("message"))
+			return streamError(event)
 		case "done":
 			on(event)
 			return nil
@@ -228,6 +228,23 @@ func (c *Client) StreamImages(ctx context.Context, agentID, sessionID, message s
 	// The gateway keeps the turn running server-side; surface that
 	// instead of pretending the turn completed.
 	return errors.New("stream closed before the turn finished (the agent keeps running; reopen the session to see the reply)")
+}
+
+// streamError never returns an empty error: a blank gateway message used to
+// surface as a failed turn with no cause at all.
+func streamError(event Event) error {
+	message := strings.TrimSpace(event.Str("message"))
+	code := strings.TrimSpace(event.Str("code"))
+	switch {
+	case message != "" && code != "" && !strings.Contains(message, code):
+		return fmt.Errorf("%s [%s]", message, code)
+	case message != "":
+		return errors.New(message)
+	case code != "":
+		return fmt.Errorf("the agent turn failed [%s]", code)
+	default:
+		return errors.New("the agent turn failed without an error message; check `fastclaw log`")
+	}
 }
 
 func responseError(resp *http.Response) error {

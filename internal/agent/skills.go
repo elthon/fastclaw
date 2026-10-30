@@ -122,6 +122,13 @@ type SkillsLoader struct {
 	// other agent they chat with. Empty disables this layer (legacy /
 	// single-user installs that pre-date per-user skills).
 	userID string
+	// sandboxed is set when commands never run on this host (enforced
+	// sandbox deploys). The host's PATH then says nothing about a skill's
+	// required binaries (a slim server image has no python3 while the
+	// sandbox does), so those checks are skipped. It follows the deploy
+	// mode, not the agent's own sandbox flag: hosted agents get the
+	// sandbox pool after they're built, whatever that flag says.
+	sandboxed bool
 }
 
 // NewSkillsLoader creates a new skills loader.
@@ -156,6 +163,13 @@ func (sl *SkillsLoader) WithObjectStore(ws workspace.Store, agentID string) *Ski
 // this pod's disk. Empty userID disables the layer.
 func (sl *SkillsLoader) WithUserID(userID string) *SkillsLoader {
 	sl.userID = userID
+	return sl
+}
+
+// WithSandbox marks the agent's commands as running in the sandbox, so
+// skills aren't gated on binaries missing from this host.
+func (sl *SkillsLoader) WithSandbox(enforced bool) *SkillsLoader {
+	sl.sandboxed = enforced
 	return sl
 }
 
@@ -274,6 +288,9 @@ func (sl *SkillsLoader) LoadSkills() []Skill {
 	// is not installed.
 	result := make([]Skill, 0, len(skillsMap))
 	for _, s := range skillsMap {
+		if sl.sandboxed {
+			s.Gated, s.GateReason = checkGating(s.Metadata, false)
+		}
 		if s.Gated {
 			slog.Debug("skill gated", "name", s.Name, "reason", s.GateReason)
 		}
@@ -390,6 +407,8 @@ func firstSentence(s string) string {
 // reflexive `pip install` calls for tasks a published skill would handle.
 const skillsDirective = `<skill_usage_rules>
 The skills listed below are pre-installed for this agent. Only the catalog is always in context. Before using a skill, call the "load_skill" tool with its name to load the full SKILL.md instructions, then follow those instructions exactly. If an always-loaded skill is included inline below, you may use those inline instructions directly.
+
+A skill's configured secrets (API keys such as FAL_KEY) are injected only into commands that run its scripts under /skills/<name>/, so ` + "`env`" + ` or ` + "`echo $KEY`" + ` in any other command never shows them. Don't check for them first: run the skill's script, and only if it reports a missing key, tell the user to configure it in the skill's settings.
 
 The sandbox image already has: python3 + pip, uv + uvx, node + npm + npx, the camoufox-cli anti-detect browser (run as ` + "`camoufox-cli open <url>`" + ` then ` + "`camoufox-cli snapshot -i`" + ` for refs; Camoufox/Firefox is pre-downloaded), git, curl, requests / pillow / beautifulsoup4 / lxml. DO NOT reinstall any of these — wasted tool calls and timeouts. If you see "command not found", check the spelling before reaching for npm/pip.
 
@@ -546,7 +565,7 @@ func discoverSkillsEnhanced(dir string, layer string) map[string]Skill {
 		}
 
 		// Apply gating
-		gated, gateReason := checkGating(meta)
+		gated, gateReason := checkGating(meta, true)
 
 		name := entry.Name()
 		if fm != nil && fm.Name != "" {
@@ -716,7 +735,9 @@ func convertYAMLToJSON(v interface{}) interface{} {
 
 // checkGating validates whether a skill's requirements are met.
 // Returns (gated, reason). gated=true means the skill should be skipped.
-func checkGating(meta *SkillMetadata) (bool, string) {
+// hostBins checks required binaries on this host's PATH; it is false when
+// commands run in the sandbox instead.
+func checkGating(meta *SkillMetadata, hostBins bool) (bool, string) {
 	if meta == nil || meta.Meta() == nil {
 		return false, ""
 	}
@@ -745,24 +766,25 @@ func checkGating(meta *SkillMetadata) (bool, string) {
 		return false, ""
 	}
 
-	// Check required binaries
-	for _, bin := range oc.Requires.Bins {
-		if _, err := exec.LookPath(bin); err != nil {
-			return true, fmt.Sprintf("required binary %q not found on PATH", bin)
-		}
-	}
-
-	// Check anyBins (at least one must exist)
-	if len(oc.Requires.AnyBins) > 0 {
-		found := false
-		for _, bin := range oc.Requires.AnyBins {
-			if _, err := exec.LookPath(bin); err == nil {
-				found = true
-				break
+	// Check required binaries (only on the host that runs the commands)
+	if hostBins {
+		for _, bin := range oc.Requires.Bins {
+			if _, err := exec.LookPath(bin); err != nil {
+				return true, fmt.Sprintf("required binary %q not found on PATH", bin)
 			}
 		}
-		if !found {
-			return true, fmt.Sprintf("none of required binaries %v found on PATH", oc.Requires.AnyBins)
+		// anyBins: at least one must exist
+		if len(oc.Requires.AnyBins) > 0 {
+			found := false
+			for _, bin := range oc.Requires.AnyBins {
+				if _, err := exec.LookPath(bin); err == nil {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return true, fmt.Sprintf("none of required binaries %v found on PATH", oc.Requires.AnyBins)
+			}
 		}
 	}
 

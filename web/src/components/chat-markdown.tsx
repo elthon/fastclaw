@@ -6,7 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
-import { Streamdown, defaultUrlTransform, type Components, type UrlTransform } from "streamdown";
+import { Streamdown, defaultRehypePlugins, defaultUrlTransform, type Components, type UrlTransform } from "streamdown";
 import { createCodePlugin } from "@streamdown/code";
 import { mermaid } from "@streamdown/mermaid";
 import { math } from "@streamdown/math";
@@ -39,9 +39,9 @@ const streamdownPlugins = { code, mermaid, math, cjk: cjkWithBreaks };
 const PROSE_CLASS =
   "chat-md text-[13.5px] leading-normal prose prose-sm max-w-none dark:prose-invert min-w-0 wrap-anywhere " +
   "prose-p:my-1.5 " +
-  // Tighter, shallower lists: smaller indent (pl-5 ≈ 20px vs prose's ~26px),
-  // less gap between the marker and text, and snug item spacing.
-  "prose-ul:my-1.5 prose-ol:my-1.5 prose-ul:pl-4 prose-ol:pl-4 " +
+  // Tighter lists: snug item spacing. The indent is set in globals.css
+  // (.chat-md lists) so top-level and nested lists share it.
+  "prose-ul:my-1.5 prose-ol:my-1.5 " +
   "prose-li:my-0.5 prose-li:pl-0 prose-li:marker:text-muted-foreground/60 " +
   "prose-headings:font-semibold prose-headings:mt-2.5 prose-headings:mb-1 " +
   "prose-h1:text-[15px] prose-h2:text-[14px] prose-h3:text-[13.5px] prose-h4:text-[13.5px] prose-h5:text-[13.5px] prose-h6:text-[13.5px] " +
@@ -50,6 +50,100 @@ const PROSE_CLASS =
   "prose-table:my-2 prose-table:text-[13px] prose-th:bg-muted/40 prose-th:font-medium prose-th:border-border prose-td:border-border " +
   "prose-th:py-1 prose-th:px-2 prose-td:py-1 prose-td:px-2 prose-td:leading-snug " +
   "prose-hr:my-3";
+
+// agentWorkspacePath classifies a markdown URL that points into the agent's
+// workspace: an absolute host path under workspaces/<agentId>/ yields its
+// path from the agent root; a relative path yields itself with
+// relative=true (the caller scopes it to the session). null for anything
+// else (another scheme, an in-page anchor, an app route, a path outside
+// this agent's workspace).
+function agentWorkspacePath(url: string, agentId: string): { path: string; relative: boolean } | null {
+  if (!url || /^[a-z][a-z0-9+.-]*:/i.test(url) || /^[#?]/.test(url) || url.startsWith("//")) return null;
+  if (url.startsWith("/")) {
+    const marker = `/workspaces/${agentId}/`;
+    const at = url.indexOf(marker);
+    return at >= 0 ? { path: url.slice(at + marker.length), relative: false } : null;
+  }
+  const rel = url.replace(/^(\.\/)+/, "");
+  // Stay inside the workspace; the server rejects escapes anyway.
+  return rel && !rel.split("/").includes("..") ? { path: rel, relative: true } : null;
+}
+
+// resolveWorkspaceUrl maps a URL the model wrote for a workspace file to its
+// path relative to the agent root (what the file viewer takes) and the URL
+// that serves it, or null when it isn't one. Sandbox `/workspace/<name>` and
+// host-mode relative paths are both session-scoped (the docker bind-mount and
+// the host exec cwd are the session workspace), so the server resolves them
+// against the session's folder; an absolute host path under
+// workspaces/<agentId>/ is exact.
+function resolveWorkspaceUrl(url: string, agentId: string, sessionId?: string): { path: string; url: string } | null {
+  const scoped = (rel: string) => sessionId
+    ? { path: `sessions/${sessionId}/${rel}`, url: fileUrl(agentId, rel, false, sessionId) }
+    : { path: rel, url: fileUrl(agentId, rel) };
+  if (url.startsWith("/workspace/")) return scoped(url.slice("/workspace/".length));
+  const target = agentWorkspacePath(url, agentId);
+  if (!target) return null;
+  return target.relative ? scoped(target.path) : { path: target.path, url: fileUrl(agentId, target.path) };
+}
+
+const IMAGE_PATH_RE = /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i;
+
+type RehypePlugins =NonNullable<ComponentProps<typeof Streamdown>["rehypePlugins"]>;
+
+type HastNode = { type?: string; tagName?: string; properties?: Record<string, unknown>; children?: HastNode[] };
+
+// rehypeWorkspaceUrls rewrites workspace file references on <img src> and
+// <a href> to the authenticated file API. It must run BEFORE rehype-harden:
+// harden blocks any URL it can't parse, and a bare relative path like
+// `report.html` isn't parseable — urlTransform runs too late to save it, so
+// such links rendered as "report.html [blocked]".
+function rehypeWorkspaceUrls(options: { agentId: string; sessionId?: string }) {
+  return (tree: HastNode) => {
+    // Pictures the reply already embeds, so a link to one stays a link.
+    const embedded = new Set<string>();
+    const collect = (node: HastNode) => {
+      const src = node.tagName === "img" ? node.properties?.src : undefined;
+      const target = typeof src === "string" ? resolveWorkspaceUrl(src, options.agentId, options.sessionId) : null;
+      if (target) embedded.add(target.path);
+      node.children?.forEach(collect);
+    };
+    collect(tree);
+    const walk = (node: HastNode) => {
+      if (node.type === "element" && node.properties) {
+        const attr = node.tagName === "img" ? "src" : node.tagName === "a" ? "href" : "";
+        const value = attr ? node.properties[attr] : undefined;
+        if (typeof value === "string") {
+          const target = resolveWorkspaceUrl(value, options.agentId, options.sessionId);
+          if (target) {
+            const { path: rel, url } = target;
+            // Models often link a picture they made ([cat.png](cat.png))
+            // instead of embedding it; show the picture itself. A link that
+            // wraps other markup (e.g. an image) is left alone.
+            if (attr === "href" && IMAGE_PATH_RE.test(rel) && !embedded.has(rel) && node.children?.every((c) => c.type === "text")) {
+              embedded.add(rel);
+              const alt = node.children.map((c) => (c as { value?: string }).value ?? "").join("");
+              node.tagName = "img";
+              node.properties = { src: url, alt };
+              node.children = [];
+              return;
+            }
+            node.properties[attr] = url;
+            if (attr === "href") node.properties.dataWorkspacePath = rel;
+          }
+        }
+      }
+      node.children?.forEach(walk);
+      // Streamdown wraps each image in a <div>, and only unwraps a paragraph
+      // whose sole child is the image; text beside it ("Here: ![](a.png)")
+      // would leave a <div> inside <p>, which is invalid HTML.
+      if (node.type === "element" && node.tagName === "p" && node.children?.some((c) => c.type === "element" && c.tagName === "img")) {
+        node.tagName = "div";
+        node.properties = { ...node.properties, className: "my-1.5" };
+      }
+    };
+    walk(tree);
+  };
+}
 
 /**
  * ChatMarkdown is the single markdown rendering primitive for chat bubbles and
@@ -69,6 +163,7 @@ export function ChatMarkdown({
   bareCode = false,
   knowledgeSources,
   onKnowledgeCitationClick,
+  onWorkspaceFileClick,
 }: {
   text: string;
   agentId?: string;
@@ -78,6 +173,9 @@ export function ChatMarkdown({
   bareCode?: boolean;
   knowledgeSources?: KnowledgeSource[];
   onKnowledgeCitationClick?: (source: KnowledgeSource) => void;
+  // Opens a workspace file (agent-root-relative path) in the in-app viewer.
+  // Without it, workspace links open in a new tab.
+  onWorkspaceFileClick?: (path: string) => void;
 }) {
   const knowledgeByID = useMemo(() => {
     const map = new Map<string, KnowledgeSource>();
@@ -115,9 +213,26 @@ export function ChatMarkdown({
           </button>
         );
       }
+      const workspacePath = (props as Record<string, unknown>)["data-workspace-path"];
+      if (typeof workspacePath === "string" && workspacePath) {
+        return (
+          <a
+            {...props}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(event) => {
+              // Plain click previews in-app; modifier clicks keep the
+              // browser's open-in-new-tab behaviour.
+              if (!onWorkspaceFileClick || event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
+              event.preventDefault();
+              onWorkspaceFileClick(workspacePath);
+            }}
+          />
+        );
+      }
       return <ExternalAnchor {...props} />;
     },
-  }), [knowledgeByID, onKnowledgeCitationClick]);
+  }), [knowledgeByID, onKnowledgeCitationClick, onWorkspaceFileClick]);
 
   // Build the URL transform once per agent/session. A stable identity keeps
   // Streamdown (a memo component) from re-rendering on every streamed keystroke,
@@ -126,16 +241,18 @@ export function ChatMarkdown({
     return (url, key, node) => {
       // Inline base64 images pass through (the default transform strips data:).
       if (key === "src" && url.startsWith("data:image/")) return url;
-      // Remap sandbox `/workspace/<name>` (image src + link href) to the
-      // authenticated file API. The docker bind-mount is session-scoped, so
-      // prepend sessions/<sid>/ or the file API resolves against the agent root
-      // and 404s.
-      if (agentId && (key === "src" || key === "href") && url.startsWith("/workspace/")) {
-        const rel = url.slice("/workspace/".length);
-        return fileUrl(agentId, sessionId ? `sessions/${sessionId}/${rel}` : rel);
-      }
+      // Workspace paths were already rewritten by rehypeWorkspaceUrls.
       return defaultUrlTransform(url, key, node);
     };
+  }, []);
+
+  // Default chain is [raw, sanitize, harden]; the workspace rewrite slots in
+  // right before harden so harden validates the final /api/… URL.
+  const rehypePlugins = useMemo<RehypePlugins>(() => {
+    const { harden, ...rest } = defaultRehypePlugins;
+    if (!agentId) return [...Object.values(rest), harden];
+    const workspaceUrls = [rehypeWorkspaceUrls, { agentId, sessionId }] as RehypePlugins[number];
+    return [...Object.values(rest), workspaceUrls, harden];
   }, [agentId, sessionId]);
 
   // Click anywhere on a mermaid diagram → fullscreen. Streamdown renders a
@@ -164,6 +281,7 @@ export function ChatMarkdown({
         parseIncompleteMarkdown
         plugins={streamdownPlugins}
         urlTransform={urlTransform}
+        rehypePlugins={rehypePlugins}
         components={components}
         controls={{
           table: true,

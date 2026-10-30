@@ -171,6 +171,7 @@ const (
 	SourceBuiltin ToolSource = iota // built-in tool
 	SourceMCP                       // MCP server tool
 	SourcePlugin                    // plugin-provided tool
+	SourceConnector                 // the person's connected accounts (connectors tool)
 )
 
 // Registry holds all registered tools.
@@ -602,6 +603,28 @@ func (r *Registry) SetCodingRootScope(v bool) {
 	r.codingRootScope = v
 }
 
+// HostWorkDir is the on-disk directory of the current turn's workspace
+// scope (sessions/<sid>, projects/<pid>/<sid>, …) — the same place
+// write_file puts relative paths. Host-mode exec runs there and the
+// system prompt advertises it as the Working Directory, so the shell and
+// the file tools agree on where "./out.png" is. "" when the workspace
+// store has no local directory (S3/R2) — callers fall back to their
+// previous behavior.
+func (r *Registry) HostWorkDir() string {
+	if r.workspaceStore == nil || r.agentID == "" {
+		return ""
+	}
+	ls, ok := r.workspaceStore.(workspace.LocalScoper)
+	if !ok {
+		return ""
+	}
+	dir, ok := ls.LocalScopeDir(r.agentID, r.projectID, r.scopeSessionID())
+	if !ok {
+		return ""
+	}
+	return dir
+}
+
 // scopeSessionID is the session segment the file tools pass to the
 // workspace store. It collapses to "" in coding-root-scope mode so writes
 // land at the project root the dev server serves.
@@ -771,7 +794,9 @@ func (r *Registry) GetFunc(name string) ToolFunc {
 	if !ok {
 		return nil
 	}
-	return t.fn
+	return func(ctx context.Context, args json.RawMessage) (string, error) {
+		return t.fn(context.WithValue(ctx, turnRegistryKey{}, r), args)
+	}
 }
 
 // Definitions returns all tool definitions for the LLM.
@@ -894,7 +919,7 @@ func (r *Registry) Execute(ctx context.Context, name string, args string) (strin
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
 
-	result, err := tool.fn(ctx, json.RawMessage(args))
+	result, err := tool.fn(context.WithValue(ctx, turnRegistryKey{}, r), json.RawMessage(args))
 	if err != nil {
 		return result + "\n[Analyze the error above and try a different approach.]", err
 	}

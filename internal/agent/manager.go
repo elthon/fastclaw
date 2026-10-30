@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
 	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
@@ -59,10 +62,19 @@ type managerOpts struct {
 	// derived here. Nil makes check_agent report tool status as
 	// unverified instead of guessing.
 	toolAvailability func(ctx context.Context, agentID string) (map[string]bool, error)
+	// agentResolver finds (loading on demand) another agent of the same
+	// account for message_agent. Nil leaves the tool unregistered.
+	agentResolver AgentResolver
 	// onAgentChanged is invoked after in-chat provisioning mutates an
 	// agent, so a running gateway can reload rather than require a
 	// restart.
 	onAgentChanged func()
+}
+
+// WithAgentResolver supplies the lookup behind message_agent: an agent of
+// the same account by id or display name, loaded if it was evicted.
+func WithAgentResolver(fn AgentResolver) ManagerOption {
+	return func(o *managerOpts) { o.agentResolver = fn }
 }
 
 // WithToolAvailability supplies the capability probe behind check_agent.
@@ -137,8 +149,15 @@ func WithGlobalSkillsCfg(cfg config.SkillsCfg) ManagerOption {
 
 // Manager loads and manages all agent instances.
 type Manager struct {
+	// mu guards agents, defaultAgent and lastUsed. Agents are attached
+	// on demand (UserSpace.EnsureAgent) while other goroutines look
+	// them up, so every map access goes through it.
+	mu           sync.RWMutex
 	agents       map[string]*Agent
 	defaultAgent *Agent
+	// lastUsed records when each agent was last looked up by ID, so an
+	// on-demand UserSpace can drop agents nobody has touched recently.
+	lastUsed map[string]*atomic.Int64
 	// opts is retained so AddAgent (hot-reload after onboard / agent
 	// create) can apply the same store wiring the constructor did.
 	// Without this the freshly-added agent's tool registry never gets
@@ -151,7 +170,8 @@ type Manager struct {
 // NewManager creates agents from resolved configs.
 func NewManager(resolved []config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, opts ...ManagerOption) (*Manager, error) {
 	m := &Manager{
-		agents: make(map[string]*Agent),
+		agents:   make(map[string]*Agent),
+		lastUsed: make(map[string]*atomic.Int64),
 	}
 	for _, o := range opts {
 		o(&m.opts)
@@ -168,6 +188,7 @@ func NewManager(resolved []config.ResolvedAgent, prov provider.Provider, mb *bus
 	for _, rc := range resolved {
 		ag := m.buildAgent(rc, prov, mb)
 		m.agents[rc.ID] = ag
+		m.touchLocked(rc.ID)
 
 		slog.Info("loaded agent",
 			"id", rc.ID,
@@ -192,14 +213,21 @@ func NewManager(resolved []config.ResolvedAgent, prov provider.Provider, mb *bus
 // AddAgent's hot-reload path so a freshly-onboarded agent picks up the
 // same DB-backed identity / memory / workspace plumbing.
 func (m *Manager) buildAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus) *Agent {
+	return m.buildAgentWithSkillsCfg(rc, prov, mb, m.opts.globalSkillsCfg)
+}
+
+// buildAgentWithSkillsCfg is buildAgent with an explicit skills cfg, so a
+// one-off override never has to mutate the shared m.opts.
+func (m *Manager) buildAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, skillsCfg config.SkillsCfg) *Agent {
 	homeDir, _ := config.HomeDir()
 	// Pass the global SkillsCfg through so SkillsLoader sees the
 	// admin-UI-configured per-skill apiKey + env (and the per-agent
 	// override map). Plain NewAgent constructs the loader with a
 	// zero-value SkillsCfg, which is why FAL_KEY / REPLICATE_API_TOKEN
 	// were never reaching the sandbox.
-	ag := NewAgentWithSkillsCfg(rc, providerForAgent(rc, prov), mb, homeDir, m.opts.globalSkillsCfg)
+	ag := NewAgentWithSkillsCfg(rc, providerForAgent(rc, prov), mb, homeDir, skillsCfg)
 	ag.SetOwnerUserID(m.uid)
+	ag.SetAgentOwnerID(rc.UserID)
 	// Per-user skills bucket: chat-time `skills/...` writes route to
 	// ~/.fastclaw/users/<uid>/, where SkillsLoader's "personal" layer
 	// also scans (see SkillsLoader.WithUserID). Set userID on the
@@ -315,6 +343,9 @@ func (m *Manager) buildAgent(rc config.ResolvedAgent, prov provider.Provider, mb
 			ToolAvailability: m.opts.toolAvailability,
 			OnChanged:        m.opts.onAgentChanged,
 		})
+		// Agent-to-agent private messages (message_agent), scoped to the
+		// same owner account as provisioning.
+		ag.registerMessageAgent(m.opts.agentResolver, ownerID)
 		// install_skill / search_skills were written but never registered —
 		// the tools existed as dead code, which is why provisioning had to
 		// shell out to the CLI in the first place.
@@ -340,11 +371,30 @@ func (m *Manager) buildAgent(rc config.ResolvedAgent, prov provider.Provider, mb
 
 // AddAgent creates and registers a new agent dynamically (for hot-reload).
 func (m *Manager) AddAgent(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus) error {
-	if _, exists := m.agents[rc.ID]; exists {
-		return fmt.Errorf("agent %q already exists", rc.ID)
+	if err := m.insert(rc.ID, func() *Agent { return m.buildAgent(rc, prov, mb) }); err != nil {
+		return err
 	}
-	m.agents[rc.ID] = m.buildAgent(rc, prov, mb)
 	slog.Info("agent added dynamically", "id", rc.ID, "model", rc.Model)
+	return nil
+}
+
+// insert builds an agent outside the lock (building does IO) and adds it
+// under the lock, refusing ids that are already loaded.
+func (m *Manager) insert(id string, build func() *Agent) error {
+	m.mu.RLock()
+	_, exists := m.agents[id]
+	m.mu.RUnlock()
+	if exists {
+		return fmt.Errorf("agent %q already exists", id)
+	}
+	ag := build()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.agents[id]; exists {
+		return fmt.Errorf("agent %q already exists", id)
+	}
+	m.agents[id] = ag
+	m.touchLocked(id)
 	return nil
 }
 
@@ -356,28 +406,25 @@ func (m *Manager) AddAgent(rc config.ResolvedAgent, prov provider.Provider, mb *
 // caller's UserSpace cfg doesn't carry it because the agent isn't owned
 // by the caller.
 //
-// The override is local: m.opts.globalSkillsCfg is restored before
-// returning so the next AddAgent on the same manager goes back to the
-// caller's own cfg. Held under no extra lock — callers (UserSpace.
-// EnsureAgent) already serialize via sp.mu.
+// The override is local to this build: m.opts.globalSkillsCfg is never
+// mutated, so concurrent AddAgent calls keep the caller's own cfg.
 func (m *Manager) AddAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bus.MessageBus, cfg config.SkillsCfg) error {
-	if _, exists := m.agents[rc.ID]; exists {
-		return fmt.Errorf("agent %q already exists", rc.ID)
+	if err := m.insert(rc.ID, func() *Agent { return m.buildAgentWithSkillsCfg(rc, prov, mb, cfg) }); err != nil {
+		return err
 	}
-	prev := m.opts.globalSkillsCfg
-	m.opts.globalSkillsCfg = cfg
-	m.agents[rc.ID] = m.buildAgent(rc, prov, mb)
-	m.opts.globalSkillsCfg = prev
 	slog.Info("agent added dynamically with override skills cfg", "id", rc.ID, "model", rc.Model)
 	return nil
 }
 
 // RemoveAgent unregisters an agent by ID. No-op if the agent is not loaded.
 func (m *Manager) RemoveAgent(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, ok := m.agents[id]; !ok {
 		return
 	}
 	delete(m.agents, id)
+	delete(m.lastUsed, id)
 	if m.defaultAgent != nil && m.defaultAgent.Name() == id {
 		m.defaultAgent = nil
 	}
@@ -386,16 +433,87 @@ func (m *Manager) RemoveAgent(id string) {
 
 // AgentByID returns an agent by its ID.
 func (m *Manager) AgentByID(id string) *Agent {
-	return m.agents[id]
+	m.mu.RLock()
+	ag := m.agents[id]
+	ts := m.lastUsed[id]
+	m.mu.RUnlock()
+	if ts != nil {
+		ts.Store(time.Now().UnixNano())
+	}
+	return ag
+}
+
+// Has reports whether id is loaded, without counting as a use.
+func (m *Manager) Has(id string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.agents[id]
+	return ok
+}
+
+// touchLocked stamps id as used now. Caller holds m.mu for writing.
+func (m *Manager) touchLocked(id string) {
+	ts := m.lastUsed[id]
+	if ts == nil {
+		ts = new(atomic.Int64)
+		m.lastUsed[id] = ts
+	}
+	ts.Store(time.Now().UnixNano())
+}
+
+// EvictIdle removes agents that have not been looked up since cutoff,
+// skipping any id for which keep returns true. Returns the evicted ids.
+// Used by on-demand UserSpaces so an app with thousands of agents only
+// holds the ones that are actually in use.
+func (m *Manager) EvictIdle(cutoff time.Time, keep func(id string) bool) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var evicted []string
+	for id := range m.agents {
+		if keep != nil && keep(id) {
+			continue
+		}
+		ts := m.lastUsed[id]
+		if ts != nil && time.Unix(0, ts.Load()).After(cutoff) {
+			continue
+		}
+		delete(m.agents, id)
+		delete(m.lastUsed, id)
+		if m.defaultAgent != nil && m.defaultAgent.Name() == id {
+			m.defaultAgent = nil
+		}
+		evicted = append(evicted, id)
+	}
+	return evicted
+}
+
+// Len returns the number of loaded agents.
+func (m *Manager) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.agents)
+}
+
+// ClearDefaultAgent drops the implicit default. An on-demand UserSpace
+// calls it because "exactly one agent loaded" there says nothing about
+// how many agents the account owns.
+func (m *Manager) ClearDefaultAgent() {
+	m.mu.Lock()
+	m.defaultAgent = nil
+	m.mu.Unlock()
 }
 
 // DefaultAgent returns the default agent (set when only one agent exists).
 func (m *Manager) DefaultAgent() *Agent {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.defaultAgent
 }
 
 // All returns all loaded agents.
 func (m *Manager) All() []*Agent {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	result := make([]*Agent, 0, len(m.agents))
 	for _, ag := range m.agents {
 		result = append(result, ag)
@@ -405,6 +523,8 @@ func (m *Manager) All() []*Agent {
 
 // Names returns all agent IDs.
 func (m *Manager) Names() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	names := make([]string, 0, len(m.agents))
 	for name := range m.agents {
 		names = append(names, name)
@@ -417,6 +537,8 @@ func (m *Manager) Names() []string {
 // shadowing the shared one) keep their dedicated provider — this call
 // only affects agents that were using the shared instance.
 func (m *Manager) UpdateProvider(prov provider.Provider) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for _, ag := range m.agents {
 		ag.provider = prov
 	}
@@ -431,6 +553,8 @@ func (m *Manager) UpdateProviderResolved(shared provider.Provider, resolved []co
 	for _, rc := range resolved {
 		byID[rc.ID] = rc
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for id, ag := range m.agents {
 		if rc, ok := byID[id]; ok {
 			ag.provider = providerForAgent(rc, shared)

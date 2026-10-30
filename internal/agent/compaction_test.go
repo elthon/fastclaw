@@ -92,6 +92,22 @@ func TestCompactionPreservesContentWhenShortCircuits(t *testing.T) {
 	}
 }
 
+func TestEstimateTokensIncludesMultimodalParts(t *testing.T) {
+	text := strings.Repeat("x", 400)
+	messages := []provider.Message{{
+		Role: "user",
+		ContentParts: []provider.ContentPart{
+			{Type: "text", Text: text},
+			inlineImage("data:image/png;base64,AAAA"),
+		},
+	}}
+
+	want := len(text)/4 + estimatedInlineImageTokens
+	if got := EstimateTokens(messages); got != want {
+		t.Fatalf("EstimateTokens() = %d, want %d", got, want)
+	}
+}
+
 // --- safeCompactionCutoff coverage ---
 //
 // The cutoff guard is the load-bearing fix for the OpenAI 400

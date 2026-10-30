@@ -28,7 +28,7 @@ import (
 // mutating DefaultTransport would affect every other consumer in the
 // process (it's a documented global shared resource).
 //
-// 60s is conservative for LLM APIs: response headers come back well
+// 180s is conservative for LLM APIs: response headers come back well
 // under 1s on a healthy path; 60s catches a hung connection without
 // false-positives on a slow but live network. Deployments with slow
 // upstream gateways can override this with
@@ -40,7 +40,7 @@ func newLLMHTTPClient() *http.Client {
 }
 
 func llmResponseHeaderTimeout() time.Duration {
-	const defaultTimeout = 60 * time.Second
+	const defaultTimeout = 180 * time.Second
 	v := strings.TrimSpace(os.Getenv("FASTCLAW_LLM_RESPONSE_HEADER_TIMEOUT_SEC"))
 	if v == "" {
 		return defaultTimeout
@@ -87,6 +87,7 @@ func validHeaderName(name string) bool {
 const (
 	OriginUser        = "" // default — pre-existing producers stay correct without edits
 	OriginGoalContext = "goal_context"
+	OriginConnector   = "connector"
 )
 
 // Message represents a chat message.
@@ -232,6 +233,10 @@ type Response struct {
 	Thinking     string          // model's reasoning/thinking content (extracted for memory)
 	Usage        Usage           // token counts for metering (zero when provider didn't report)
 	RawAssistant json.RawMessage // exact API response message JSON (for cache-safe replay)
+	// Truncated is set when the model stopped at the output token limit
+	// (OpenAI finish_reason "length", Anthropic stop_reason "max_tokens"):
+	// the text and any tool call's arguments may be cut off.
+	Truncated bool
 }
 
 // HasToolCalls returns true if the response contains tool calls.
@@ -261,6 +266,9 @@ type StreamChunk struct {
 	// thinking mode) sees the correct top-level `reasoning_content` on
 	// replay, which it does not auto-generate.
 	RawAssistant json.RawMessage
+	// Truncated is set on the final (Done) chunk when the model stopped
+	// at the output token limit; see Response.Truncated.
+	Truncated bool
 }
 
 // StreamReader reads streaming chunks from an LLM response.

@@ -99,3 +99,24 @@ func TestNewSessionID(t *testing.T) {
 		t.Fatalf("session IDs unexpectedly equal: %q", a)
 	}
 }
+
+func TestStreamErrorAlwaysCarriesACause(t *testing.T) {
+	cases := map[string]string{
+		`{"message":"invalid api key"}`:                                                           "invalid api key",
+		`{"message":"provider missing","code":"llm_provider_not_configured"}`:                     "provider missing [llm_provider_not_configured]",
+		`{"message":"llm_provider_not_configured: set one","code":"llm_provider_not_configured"}`: "llm_provider_not_configured: set one",
+		`{"code":"llm_provider_not_configured"}`:                                                  "the agent turn failed [llm_provider_not_configured]",
+		`{}`:                                                                                      "the agent turn failed without an error message; check `fastclaw log`",
+	}
+	for data, want := range cases {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"error\",\"data\":" + data + "}\n\n"))
+		}))
+		err := NewWithHTTPClient(server.URL, "tok", server.Client()).Stream(context.Background(), "a", "s", "msg", func(Event) {})
+		server.Close()
+		if err == nil || err.Error() != want {
+			t.Fatalf("data %s: error = %v, want %q", data, err, want)
+		}
+	}
+}

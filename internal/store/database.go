@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -168,6 +169,9 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateChannelsAddSharedIdentity(ctx); err != nil {
 		return fmt.Errorf("migrate channels shared_identity: %w", err)
 	}
+	if err := d.migrateChannelsAddPairing(ctx); err != nil {
+		return fmt.Errorf("migrate channels pairing: %w", err)
+	}
 	if err := d.migrateChannelsFromConfigs(ctx); err != nil {
 		return fmt.Errorf("migrate channels from configs: %w", err)
 	}
@@ -180,6 +184,194 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	// earlier failure_count / user_id steps don't depend on this one).
 	if err := d.migrateCronJobsTimestampTZ(ctx); err != nil {
 		return fmt.Errorf("migrate cron_jobs timestamptz: %w", err)
+	}
+	if err := d.migrateDropApps(ctx); err != nil {
+		return fmt.Errorf("migrate drop apps: %w", err)
+	}
+	if err := d.migrateBillingHooks(ctx); err != nil {
+		return fmt.Errorf("migrate billing hooks: %w", err)
+	}
+	return nil
+}
+
+// migrateBillingHooks adds what an external billing system (e.g. a hosted
+// FastClaw Cloud) needs, without FastClaw itself knowing about money:
+//   - users.billing_hold / billing_hold_reason: a hold blocks the
+//     account's model calls until lifted;
+//   - a stable, increasing id on token_usage_log for incremental export
+//     (Postgres gets a BIGSERIAL column; SQLite uses its implicit rowid);
+//   - login_tokens: single-use tokens that sign a user into the console.
+func (d *DBStore) migrateBillingHooks(ctx context.Context) error {
+	for _, col := range []struct{ name, ddl string }{
+		{"billing_hold", `ALTER TABLE users ADD COLUMN billing_hold BOOLEAN NOT NULL DEFAULT FALSE`},
+		{"billing_hold_reason", `ALTER TABLE users ADD COLUMN billing_hold_reason TEXT NOT NULL DEFAULT ''`},
+	} {
+		has, err := d.tableHasColumn(ctx, "users", col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.db.ExecContext(ctx, col.ddl); err != nil {
+				return fmt.Errorf("add users.%s: %w", col.name, err)
+			}
+		}
+	}
+	if d.dialect == "postgres" {
+		has, err := d.tableHasColumn(ctx, "token_usage_log", "id")
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.db.ExecContext(ctx, `ALTER TABLE token_usage_log ADD COLUMN id BIGSERIAL`); err != nil {
+				return fmt.Errorf("add token_usage_log.id: %w", err)
+			}
+		}
+		if _, err := d.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_token_usage_log_id ON token_usage_log (id)`); err != nil {
+			return fmt.Errorf("index token_usage_log.id: %w", err)
+		}
+	}
+	if _, err := d.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS login_tokens (
+		token_hash TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		expires_at TIMESTAMP NOT NULL,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("create login_tokens: %w", err)
+	}
+	return nil
+}
+
+// --- Billing hooks ---
+
+func (d *DBStore) GetBillingHold(ctx context.Context, userID string) (bool, string, error) {
+	var hold bool
+	var reason string
+	err := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT billing_hold, billing_hold_reason FROM users WHERE id = %s`, d.ph(1)), userID).
+		Scan(&hold, &reason)
+	if err != nil {
+		return false, "", scanErr(err)
+	}
+	return hold, reason, nil
+}
+
+func (d *DBStore) SetBillingHold(ctx context.Context, userID string, hold bool, reason string) error {
+	if !hold {
+		reason = ""
+	}
+	res, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE users SET billing_hold = %s, billing_hold_reason = %s WHERE id = %s`, d.ph(1), d.ph(2), d.ph(3)),
+		hold, reason, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (d *DBStore) ListUsageEvents(ctx context.Context, afterID int64, limit int) ([]UsageEvent, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	// Rows are only exported once they are a few seconds old, so a row
+	// whose id was assigned earlier but committed later can't be skipped
+	// by a reader that already moved past it. The cutoff uses the
+	// database clock — created_at is written with CURRENT_TIMESTAMP.
+	idCol, settled := "t.id", "CURRENT_TIMESTAMP - INTERVAL '5 seconds'"
+	if d.dialect != "postgres" {
+		idCol, settled = "t.rowid", "datetime('now', '-5 seconds')"
+	}
+	// account_id is who pays: the row's user, or — for end-user
+	// (app_user) and IM-chatter (channel_user) rows — the account that
+	// owns them, up to two levels (a channel user under an app_user).
+	q := fmt.Sprintf(`
+		SELECT %[1]s, t.user_id,
+			CASE
+				WHEN u.role IN ('app_user', 'channel_user') AND u2.role IN ('app_user', 'channel_user') THEN COALESCE(u2.owner_user_id, '')
+				WHEN u.role IN ('app_user', 'channel_user') THEN COALESCE(u.owner_user_id, '')
+				ELSE t.user_id
+			END,
+			COALESCE(CASE WHEN u.role = 'app_user' THEN u.external_id END, ''),
+			t.agent_id, t.session_key, t.provider, t.model,
+			t.input_tokens, t.output_tokens, t.cache_read_tokens, t.cache_create_tokens,
+			t.duration_ms, t.channel, t.chatter_user_id, t.created_at
+		FROM token_usage_log t
+		LEFT JOIN users u ON u.id = t.user_id
+		LEFT JOIN users u2 ON u2.id = u.owner_user_id
+		WHERE %[1]s > %[2]s AND t.created_at <= %[3]s
+		ORDER BY %[1]s
+		LIMIT %[4]s`, idCol, d.ph(1), settled, d.ph(2))
+	rows, err := d.db.QueryContext(ctx, q, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageEvent
+	for rows.Next() {
+		var e UsageEvent
+		if err := rows.Scan(&e.ID, &e.UserID, &e.AccountID, &e.EndUser, &e.AgentID, &e.SessionKey,
+			&e.Provider, &e.Model, &e.InputTokens, &e.OutputTokens, &e.CacheReadTokens, &e.CacheCreationTokens,
+			&e.DurationMs, &e.Channel, &e.ChatterUserID, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		if e.AccountID == "" {
+			e.AccountID = e.UserID
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (d *DBStore) CreateLoginToken(ctx context.Context, tokenHash, userID string, expiresAt time.Time) error {
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO login_tokens (token_hash, user_id, expires_at) VALUES (%s, %s, %s)`, d.ph(1), d.ph(2), d.ph(3)),
+		tokenHash, userID, expiresAt.UTC())
+	return err
+}
+
+func (d *DBStore) ConsumeLoginToken(ctx context.Context, tokenHash string) (string, error) {
+	// DELETE … RETURNING makes the token single-use even under races.
+	var userID string
+	var expiresAt time.Time
+	err := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`DELETE FROM login_tokens WHERE token_hash = %s RETURNING user_id, expires_at`, d.ph(1)), tokenHash).
+		Scan(&userID, &expiresAt)
+	if err != nil {
+		return "", scanErr(err)
+	}
+	if time.Now().UTC().After(expiresAt.UTC()) {
+		return "", ErrNotFound
+	}
+	// Opportunistically drop other expired tokens.
+	_, _ = d.db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM login_tokens WHERE expires_at < %s`, d.ph(1)), time.Now().UTC())
+	return userID, nil
+}
+
+// migrateDropApps removes the short-lived "apps" tenant layer that only
+// ever existed in unreleased dev builds: the apps table and the app_id
+// columns on agents and apikeys. The account is the tenant. Idempotent and
+// a no-op on databases that never had them.
+func (d *DBStore) migrateDropApps(ctx context.Context) error {
+	for _, idx := range []string{"idx_agents_app", "idx_apikeys_app", "idx_apps_owner", "idx_apps_one_default"} {
+		if _, err := d.db.ExecContext(ctx, `DROP INDEX IF EXISTS `+idx); err != nil {
+			return fmt.Errorf("drop index %s: %w", idx, err)
+		}
+	}
+	for _, table := range []string{"agents", "apikeys"} {
+		has, err := d.tableHasColumn(ctx, table, "app_id")
+		if err != nil {
+			return err
+		}
+		if has {
+			if _, err := d.db.ExecContext(ctx, `ALTER TABLE `+table+` DROP COLUMN app_id`); err != nil {
+				return fmt.Errorf("drop %s.app_id: %w", table, err)
+			}
+		}
+	}
+	if _, err := d.db.ExecContext(ctx, `DROP TABLE IF EXISTS apps`); err != nil {
+		return fmt.Errorf("drop apps: %w", err)
 	}
 	return nil
 }
@@ -841,7 +1033,7 @@ func (d *DBStore) migrateCronJobsAddUserID(ctx context.Context) error {
 // migrateCronJobsAddChatterID retrofits chatter_id onto cron_jobs so a
 // job created by one chatter of a public agent is invisible to the
 // others (the list_cron_jobs tool filters on it). Legacy rows default to
-// '' — they predate per-chatter attribution, so they're treated as
+// ” — they predate per-chatter attribution, so they're treated as
 // owner/system-owned and only surface in the owner's web dashboard / CLI
 // (the agent tool layer hides empty-chatter rows from any chatter). A
 // partial index keeps the lookup cheap and legacy rows out of it.
@@ -1984,6 +2176,10 @@ func (d *DBStore) migrationSQL() []string {
 			base_url TEXT NOT NULL DEFAULT '',
 			platform_user_id TEXT NOT NULL DEFAULT '',
 			shared_identity INTEGER NOT NULL DEFAULT 0,
+			bound_user_id TEXT NOT NULL DEFAULT '',
+			bound_user_name TEXT NOT NULL DEFAULT '',
+			pair_code TEXT NOT NULL DEFAULT '',
+			pair_code_expires_at BIGINT NOT NULL DEFAULT 0,
 			data TEXT NOT NULL DEFAULT '{}',
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -2448,6 +2644,24 @@ func (d *DBStore) ListAgents(ctx context.Context, ownerUserID string) ([]AgentRe
 	return scanAgents(rows)
 }
 
+func (d *DBStore) ListAgentIDs(ctx context.Context, ownerUserID string) ([]string, error) {
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT id FROM agents WHERE user_id = %s`, d.ph(1)), ownerUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (d *DBStore) ListPublicAgents(ctx context.Context) ([]AgentRecord, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT `+agentSelectCols+` FROM agents WHERE is_public = TRUE ORDER BY updated_at DESC`)
@@ -2584,6 +2798,33 @@ func (d *DBStore) GetSession(ctx context.Context, userID, agentID, sessionKey st
 }
 
 // LookupSessionOwner returns the user_id that owns the given session row.
+func (d *DBStore) FindSessionLocations(ctx context.Context, userID, sessionKey string) ([]SessionLocation, error) {
+	// LIKE wildcards in the key are escaped so "a_b" can't match "axb".
+	escaped := strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(sessionKey)
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT agent_id, session_key, project_id FROM sessions
+			WHERE (user_id = %s AND (session_key = %s OR session_key LIKE %s ESCAPE '\'))
+			   OR (session_key = %s AND user_id <> %s AND agent_id IN (SELECT id FROM agents WHERE user_id = %s))
+			ORDER BY (user_id = %s) DESC, updated_at DESC`,
+			d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7)),
+		userID, sessionKey, escaped+"-agent-%", sessionKey, userID, userID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionLocation
+	for rows.Next() {
+		var loc SessionLocation
+		var project sql.NullString
+		if err := rows.Scan(&loc.AgentID, &loc.SessionKey, &project); err != nil {
+			return nil, err
+		}
+		loc.ProjectID = project.String
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
 func (d *DBStore) LookupSessionOwner(ctx context.Context, agentID, sessionKey string) (string, error) {
 	var uid string
 	err := d.db.QueryRowContext(ctx,
@@ -2594,6 +2835,18 @@ func (d *DBStore) LookupSessionOwner(ctx context.Context, agentID, sessionKey st
 		return "", scanErr(err)
 	}
 	return uid, nil
+}
+
+func (d *DBStore) HasChatSession(ctx context.Context, userID, agentID, chatID string) (bool, error) {
+	var n int
+	err := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM sessions WHERE user_id = %s AND agent_id = %s AND chat_id = %s`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		userID, agentID, chatID).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // GetSessionByKey loads a session by (agentID, sessionKey) without
@@ -3028,6 +3281,73 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 	if err != nil {
 		return nil, err
 	}
+	return scanSessionMessages(rows)
+}
+
+// ListSessionMessagesPage reads one page of the archive without loading
+// the rest of it, so opening a long conversation costs the same as a
+// short one. See the Store interface for the start / hasMore contract.
+func (d *DBStore) ListSessionMessagesPage(ctx context.Context, userID, agentID, sessionKey string, before int64, limit int) ([]SessionMessage, int64, bool, error) {
+	if before < 0 {
+		before = math.MaxInt32
+	}
+	limit = max(1, limit)
+	scope := fmt.Sprintf(`FROM session_messages WHERE user_id = %s AND agent_id = %s AND session_key = %s`,
+		d.ph(1), d.ph(2), d.ph(3))
+	args := []any{userID, agentID, sessionKey}
+	queryInt := func(query string, extra ...any) (sql.NullInt64, error) {
+		var v sql.NullInt64
+		err := d.db.QueryRowContext(ctx, query, append(append([]any{}, args...), extra...)...).Scan(&v)
+		return v, err
+	}
+
+	// The lowest seq among the limit newest rows below before.
+	candidate, err := queryInt(fmt.Sprintf(`SELECT MIN(seq) FROM (SELECT seq %s AND seq < %s ORDER BY seq DESC LIMIT %d) page`,
+		scope, d.ph(4), limit), before)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !candidate.Valid {
+		return nil, -1, false, nil
+	}
+	// Start on a visible user turn so a tool call and its results are
+	// never split across pages: the first one inside the window, else
+	// the one before it, else the beginning of the session.
+	userTurn := `role = 'user' AND origin = ''`
+	start, err := queryInt(fmt.Sprintf(`SELECT MIN(seq) %s AND seq >= %s AND seq < %s AND %s`,
+		scope, d.ph(4), d.ph(5), userTurn), candidate.Int64, before)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !start.Valid {
+		if start, err = queryInt(fmt.Sprintf(`SELECT MAX(seq) %s AND seq < %s AND %s`,
+			scope, d.ph(4), userTurn), candidate.Int64); err != nil {
+			return nil, 0, false, err
+		}
+	}
+	if !start.Valid {
+		start = sql.NullInt64{Valid: true}
+	}
+
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, provider, model
+			%s AND seq >= %s AND seq < %s ORDER BY seq ASC`, scope, d.ph(4), d.ph(5)),
+		userID, agentID, sessionKey, start.Int64, before)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	msgs, err := scanSessionMessages(rows)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	older, err := queryInt(fmt.Sprintf(`SELECT MAX(seq) %s AND seq < %s`, scope, d.ph(4)), start.Int64)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return msgs, start.Int64, older.Valid, nil
+}
+
+func scanSessionMessages(rows *sql.Rows) ([]SessionMessage, error) {
 	defer rows.Close()
 	var out []SessionMessage
 	for rows.Next() {
@@ -3695,7 +4015,7 @@ func scanConfigs(rows *sql.Rows) ([]ConfigRecord, error) {
 
 // --- Channels (IM bot bindings) ---
 
-const channelSelectCols = `id, user_id, agent_id, type, account_id, enabled, bot_token, base_url, platform_user_id, shared_identity, data, created_at, updated_at`
+const channelSelectCols = `id, user_id, agent_id, type, account_id, enabled, bot_token, base_url, platform_user_id, shared_identity, bound_user_id, bound_user_name, pair_code, pair_code_expires_at, data, created_at, updated_at`
 
 func (d *DBStore) ListChannels(ctx context.Context, userID, agentID string) ([]ChannelRecord, error) {
 	rows, err := d.db.QueryContext(ctx,
@@ -3754,7 +4074,8 @@ func (d *DBStore) SaveChannel(ctx context.Context, ch *ChannelRecord) error {
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 				ON CONFLICT (type, account_id) DO UPDATE SET
 				  user_id=$2, agent_id=$3, enabled=$6, bot_token=$7, base_url=$8,
-				  platform_user_id=$9, shared_identity=$10, data=$11, updated_at=$13`,
+				  platform_user_id=$9, shared_identity=$10, data=$11, updated_at=$13,
+				  `+channelPairingResetSQL,
 			ch.ID, ch.UserID, ch.AgentID, ch.Type, ch.AccountID, enabledInt, ch.BotToken, ch.BaseURL, ch.PlatformUserID, sharedIdent, string(dataBytes), ch.CreatedAt, ch.UpdatedAt)
 		return err
 	}
@@ -3765,8 +4086,40 @@ func (d *DBStore) SaveChannel(ctx context.Context, ch *ChannelRecord) error {
 			  user_id=excluded.user_id, agent_id=excluded.agent_id, enabled=excluded.enabled,
 			  bot_token=excluded.bot_token, base_url=excluded.base_url,
 			  platform_user_id=excluded.platform_user_id, shared_identity=excluded.shared_identity,
-			  data=excluded.data, updated_at=excluded.updated_at`,
+			  data=excluded.data, updated_at=excluded.updated_at,
+			  `+channelPairingResetSQL,
 		ch.ID, ch.UserID, ch.AgentID, ch.Type, ch.AccountID, enabledInt, ch.BotToken, ch.BaseURL, ch.PlatformUserID, sharedIdent, string(dataBytes), ch.CreatedAt, ch.UpdatedAt)
+	return err
+}
+
+// channelPairingResetSQL is the ON CONFLICT tail SaveChannel appends:
+// re-saving a channel (reconnect, credential refresh, settings toggle)
+// keeps its pairing, but a different binder taking over the same bot
+// starts unpaired — the old owner's platform account must not carry
+// over to someone else's row. RHS columns read the pre-update row in
+// both SQLite and Postgres.
+const channelPairingResetSQL = `bound_user_id = CASE WHEN channels.user_id = excluded.user_id THEN channels.bound_user_id ELSE '' END,
+			  bound_user_name = CASE WHEN channels.user_id = excluded.user_id THEN channels.bound_user_name ELSE '' END,
+			  pair_code = CASE WHEN channels.user_id = excluded.user_id THEN channels.pair_code ELSE '' END,
+			  pair_code_expires_at = CASE WHEN channels.user_id = excluded.user_id THEN channels.pair_code_expires_at ELSE 0 END`
+
+func (d *DBStore) SetChannelBinding(ctx context.Context, id, boundUserID, boundUserName string) error {
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE channels SET bound_user_id = %s, bound_user_name = %s, pair_code = '', pair_code_expires_at = 0, updated_at = %s WHERE id = %s`,
+			d.ph(1), d.ph(2), d.ph(3), d.ph(4)),
+		boundUserID, boundUserName, time.Now().UTC(), id)
+	return err
+}
+
+func (d *DBStore) SetChannelPairCode(ctx context.Context, id, code string, expiresAt time.Time) error {
+	var exp int64
+	if code != "" {
+		exp = expiresAt.Unix()
+	}
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE channels SET pair_code = %s, pair_code_expires_at = %s WHERE id = %s`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		code, exp, id)
 	return err
 }
 
@@ -3800,11 +4153,15 @@ func scanChannelRow(row rowScanner) (*ChannelRecord, error) {
 	var c ChannelRecord
 	var dataStr string
 	var enabledInt, sharedIdent int
-	if err := row.Scan(&c.ID, &c.UserID, &c.AgentID, &c.Type, &c.AccountID, &enabledInt, &c.BotToken, &c.BaseURL, &c.PlatformUserID, &sharedIdent, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	var pairExp int64
+	if err := row.Scan(&c.ID, &c.UserID, &c.AgentID, &c.Type, &c.AccountID, &enabledInt, &c.BotToken, &c.BaseURL, &c.PlatformUserID, &sharedIdent, &c.BoundUserID, &c.BoundUserName, &c.PairCode, &pairExp, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return nil, scanErr(err)
 	}
 	c.Enabled = enabledInt != 0
 	c.SharedIdentity = sharedIdent != 0
+	if pairExp > 0 {
+		c.PairCodeExpiresAt = time.Unix(pairExp, 0).UTC()
+	}
 	json.Unmarshal([]byte(dataStr), &c.Data)
 	return &c, nil
 }
@@ -3815,11 +4172,15 @@ func scanChannels(rows *sql.Rows) ([]ChannelRecord, error) {
 		var c ChannelRecord
 		var dataStr string
 		var enabledInt, sharedIdent int
-		if err := rows.Scan(&c.ID, &c.UserID, &c.AgentID, &c.Type, &c.AccountID, &enabledInt, &c.BotToken, &c.BaseURL, &c.PlatformUserID, &sharedIdent, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		var pairExp int64
+		if err := rows.Scan(&c.ID, &c.UserID, &c.AgentID, &c.Type, &c.AccountID, &enabledInt, &c.BotToken, &c.BaseURL, &c.PlatformUserID, &sharedIdent, &c.BoundUserID, &c.BoundUserName, &c.PairCode, &pairExp, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.Enabled = enabledInt != 0
 		c.SharedIdentity = sharedIdent != 0
+		if pairExp > 0 {
+			c.PairCodeExpiresAt = time.Unix(pairExp, 0).UTC()
+		}
 		json.Unmarshal([]byte(dataStr), &c.Data)
 		out = append(out, c)
 	}
@@ -4028,6 +4389,35 @@ func (d *DBStore) migrateChannelsAddSharedIdentity(ctx context.Context) error {
 	_, err = d.db.ExecContext(ctx,
 		`ALTER TABLE channels ADD COLUMN shared_identity INTEGER NOT NULL DEFAULT 0`)
 	return err
+}
+
+// migrateChannelsAddPairing retrofits the pairing columns (bound sender +
+// outstanding /pair code) onto the channels table. Existing WeChat rows
+// are pre-paired with the iLink account that scanned the login QR —
+// that scan already proved who the owner is on WeChat. Every other
+// existing channel starts unpaired and its owner pairs it once from
+// the console.
+func (d *DBStore) migrateChannelsAddPairing(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "channels", "bound_user_id")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	stmts := []string{
+		`ALTER TABLE channels ADD COLUMN bound_user_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE channels ADD COLUMN bound_user_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE channels ADD COLUMN pair_code TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE channels ADD COLUMN pair_code_expires_at BIGINT NOT NULL DEFAULT 0`,
+		`UPDATE channels SET bound_user_id = platform_user_id WHERE type = 'wechat' AND platform_user_id != ''`,
+	}
+	for _, q := range stmts {
+		if _, err := d.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("%w\nSQL: %s", err, q)
+		}
+	}
+	return nil
 }
 
 // --- Cron jobs ---

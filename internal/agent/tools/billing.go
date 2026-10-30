@@ -29,6 +29,8 @@ func RegisterBillingTools(r *Registry, meter usage.Meter, quotaStore usage.Quota
 
 func makeGetBillingUsage(meter usage.Meter, quotaStore usage.QuotaStore, r *Registry) ToolFunc {
 	return func(ctx context.Context, _ json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		billingUserID := r.OwnerUserID()
 		if billingUserID == "" {
 			billingUserID = r.EffectiveUserID()

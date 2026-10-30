@@ -242,3 +242,12 @@ type Channel interface {
 	// SendTyping sends a typing indicator to the specified chat.
 	SendTyping(chatID string) error
 }
+
+// MessageTypingIndicator is implemented by channels whose "typing" cue
+// hangs off the inbound message rather than the chat — e.g. Feishu, which
+// has no typing API for custom apps, so we add a "Typing" emoji reaction
+// to the user's message instead. Called once per turn; the returned stop
+// func clears the cue and is safe to call more than once.
+type MessageTypingIndicator interface {
+	StartMessageTyping(chatID, messageID string) (stop func())
+}

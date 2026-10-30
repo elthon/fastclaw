@@ -441,7 +441,7 @@ func isASCII(s string) bool {
 // Tool description / schema
 // -----------------------------------------------------------------------------
 
-const applyPatchDescription = `Apply a multi-file patch in OpenAI Codex DSL format. Use this instead of chained edit_file/write_file calls when a change touches ≥2 files or ≥2 hunks — one tool call performs every edit atomically (parse + hunk matching happens for every file before any write; if any hunk fails to anchor, NO file is modified).
+const applyPatchDescription = `Apply a multi-file patch in OpenAI Codex DSL format. Use this instead of chained edit_file/write_file calls when a change touches ≥2 files or ≥2 hunks. One tool call performs every edit atomically (parse + hunk matching happens for every file before any write; if any hunk fails to anchor, NO file is modified).
 
 Format:
 
@@ -657,28 +657,44 @@ func (r *Registry) deleteForPatchSandbox(ctx context.Context, ex sandbox.Executo
 
 func registerApplyPatch(r *Registry) {
 	r.Register("apply_patch", applyPatchDescription, applyPatchSchema, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args applyPatchArgs
 		if err := json.Unmarshal(raw, &args); err != nil {
 			return "", fmt.Errorf("apply_patch: parse args: %w", err)
 		}
 		return runApplyPatch(ctx, args.Input,
-			func(ctx context.Context, p string) (string, error) { return r.readForPatch(ctx, p) },
-			func(ctx context.Context, p, c string) error { return r.writeForPatch(ctx, p, c) },
-			func(ctx context.Context, p string) error { return r.deleteForPatch(ctx, p) },
+			func(ctx context.Context, p string) (string, error) {
+				return r.readForPatch(ctx, p)
+			},
+			func(ctx context.Context, p, c string) error {
+				return r.writeForPatch(ctx, p, c)
+			},
+			func(ctx context.Context, p string) error {
+				return r.deleteForPatch(ctx, p)
+			},
 		)
 	})
 }
 
 func registerSandboxedApplyPatch(r *Registry, ex sandbox.Executor) {
 	r.Register("apply_patch", applyPatchDescription, applyPatchSchema, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args applyPatchArgs
 		if err := json.Unmarshal(raw, &args); err != nil {
 			return "", fmt.Errorf("apply_patch: parse args: %w", err)
 		}
 		out, err := runApplyPatch(ctx, args.Input,
-			func(ctx context.Context, p string) (string, error) { return r.readForPatchSandbox(ctx, ex, p) },
-			func(ctx context.Context, p, c string) error { return r.writeForPatchSandbox(ctx, ex, p, c) },
-			func(ctx context.Context, p string) error { return r.deleteForPatchSandbox(ctx, ex, p) },
+			func(ctx context.Context, p string) (string, error) {
+				return r.readForPatchSandbox(ctx, ex, p)
+			},
+			func(ctx context.Context, p, c string) error {
+				return r.writeForPatchSandbox(ctx, ex, p, c)
+			},
+			func(ctx context.Context, p string) error {
+				return r.deleteForPatchSandbox(ctx, ex, p)
+			},
 		)
 		if err != nil {
 			return "", err

@@ -41,6 +41,12 @@ type channelOut struct {
 	SharedIdentity bool   `json:"sharedIdentity"`
 	UpdatedAt      string `json:"updatedAt,omitempty"`
 	Source         string `json:"source,omitempty"`
+	// Pairing state — see handlers_channel_pairing.go.
+	Paired            bool   `json:"paired"`
+	PairedName        string `json:"pairedName,omitempty"`
+	HostAccess        bool   `json:"hostAccess"`
+	PairCommand       string `json:"pairCommand,omitempty"`
+	PairCodeExpiresAt string `json:"pairCodeExpiresAt,omitempty"`
 }
 
 // resolveChannelBindingScope authorizes a connect/disconnect call and
@@ -129,18 +135,17 @@ func (s *Server) handleListAgentChannels(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	caller := s.effectiveUserID(r)
-	_ = rec // kept around in case future logic gates on agent ownership again
 
 	// Try the new channels table first. If it has rows for this agent,
 	// use them exclusively; otherwise fall back to the configs table.
 	out := make([]channelOut, 0)
 	if caller != "" {
 		if chRows, err := s.dataStore.ListChannels(r.Context(), caller, id); err == nil && len(chRows) > 0 {
-			out = append(out, flattenChannelRecords(chRows, "agent")...)
+			out = append(out, flattenChannelRecords(chRows, "agent", rec.UserID, true)...)
 		}
 	}
 	if chRows, err := s.dataStore.ListChannels(r.Context(), "", id); err == nil && len(chRows) > 0 {
-		out = append(out, flattenChannelRecords(chRows, "agent")...)
+		out = append(out, flattenChannelRecords(chRows, "agent", rec.UserID, false)...)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"channels": out})
 }
@@ -199,7 +204,8 @@ func flattenChannelRows(rows []store.ConfigRecord, source string, _, _ string, f
 }
 
 // flattenChannelRecords builds channelOut entries from ChannelRecord rows.
-func flattenChannelRecords(rows []store.ChannelRecord, source string) []channelOut {
+// agentOwnerID and exposePairCode feed applyChannelPairing.
+func flattenChannelRecords(rows []store.ChannelRecord, source, agentOwnerID string, exposePairCode bool) []channelOut {
 	out := make([]channelOut, 0, len(rows))
 	for _, rec := range rows {
 		cc := config.ChannelConfig{}
@@ -216,6 +222,7 @@ func flattenChannelRecords(rows []store.ChannelRecord, source string) []channelO
 				UpdatedAt:      rec.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 				Source:         source,
 			})
+			applyChannelPairing(&out[len(out)-1], rec, agentOwnerID, exposePairCode)
 			continue
 		}
 		for accountID, acct := range cc.Accounts {
@@ -233,6 +240,7 @@ func flattenChannelRecords(rows []store.ChannelRecord, source string) []channelO
 				UpdatedAt:      rec.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 				Source:         source,
 			})
+			applyChannelPairing(&out[len(out)-1], rec, agentOwnerID, exposePairCode)
 		}
 	}
 	return out
@@ -898,6 +906,7 @@ func (s *Server) handleAgentWeChatLoginStatus(w http.ResponseWriter, r *http.Req
 			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
+		s.pairChannelToScanner(r.Context(), "wechat", creds.ILinkBotID, creds.ILinkUserID)
 		wechatLogins.delete(sessionID)
 		jsonResponse(w, http.StatusOK, map[string]any{
 			"status":    "confirmed",
@@ -1181,36 +1190,9 @@ func (s *Server) handleConnectAgentFeishu(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cc := config.ChannelConfig{
-		Enabled: true,
-		Accounts: map[string]config.AccountConfig{
-			appID: {
-				BotToken:    appSecret,
-				UserID:      verificationToken, // see channels/feishu.go field-mapping note
-				EncryptKey:  encryptKey,
-				UseLongConn: useLongConn,
-			},
-		},
-	}
-	credKey := appID
-	if err := s.assertChannelCredentialUniqueOpt(r, "feishu", credKey, "", uid, aid, true); err != nil {
-		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
+	if status, err := s.persistFeishuAccount(r, uid, aid, id, appID, appSecret, verificationToken, encryptKey, useLongConn); err != nil {
+		jsonResponse(w, status, map[string]any{"error": err.Error()})
 		return
-	}
-	if err := s.saveChannelRecord(r.Context(), uid, aid, "feishu", appID, true, cc); err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := s.appendBinding(r, "", "", config.Binding{
-		AgentID: id,
-		Match:   config.Match{Channel: "feishu", AccountID: appID},
-	}); err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	s.invalidateOwner(uid, aid)
-	if ch, err := s.dataStore.LookupChannel(r.Context(), "feishu", credKey); err == nil && ch != nil {
-		s.hotRegisterChannelRecord(*ch)
 	}
 	resp := map[string]any{
 		"ok":          true,
@@ -1227,6 +1209,41 @@ func (s *Server) handleConnectAgentFeishu(w http.ResponseWriter, r *http.Request
 		resp["webhookUrl"] = feishuWebhookPathFor(r, appID)
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// persistFeishuAccount writes the kind=channel row + binding for a
+// Feishu app and hot-registers the adapter. Shared by the manual
+// connect handler and the QR one-click registration flow. Returns the
+// HTTP status the caller should surface on error.
+func (s *Server) persistFeishuAccount(r *http.Request, userID, agentIDArg, agentID, appID, appSecret, verificationToken, encryptKey string, useLongConn bool) (int, error) {
+	cc := config.ChannelConfig{
+		Enabled: true,
+		Accounts: map[string]config.AccountConfig{
+			appID: {
+				BotToken:    appSecret,
+				UserID:      verificationToken, // see channels/feishu.go field-mapping note
+				EncryptKey:  encryptKey,
+				UseLongConn: useLongConn,
+			},
+		},
+	}
+	if err := s.assertChannelCredentialUniqueOpt(r, "feishu", appID, "", userID, agentIDArg, true); err != nil {
+		return http.StatusConflict, err
+	}
+	if err := s.saveChannelRecord(r.Context(), userID, agentIDArg, "feishu", appID, true, cc); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if err := s.appendBinding(r, "", "", config.Binding{
+		AgentID: agentID,
+		Match:   config.Match{Channel: "feishu", AccountID: appID},
+	}); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	s.invalidateOwner(userID, agentIDArg)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "feishu", appID); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
+	}
+	return http.StatusOK, nil
 }
 
 // feishuWebhookPathFor builds the URL the user should paste into the
@@ -1284,8 +1301,10 @@ func (s *Server) handleConnectAgentLINE(w http.ResponseWriter, r *http.Request) 
 	}
 	channelToken := strings.TrimSpace(req.ChannelToken)
 	channelSecret := strings.TrimSpace(req.ChannelSecret)
-	if channelToken == "" {
-		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "channelToken required"})
+	// The secret is what authenticates the public webhook (HMAC); without
+	// it the adapter rejects every event, so refuse to connect.
+	if channelToken == "" || channelSecret == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "channelToken and channelSecret required"})
 		return
 	}
 
@@ -1338,6 +1357,12 @@ func (s *Server) handleConnectAgentLINE(w http.ResponseWriter, r *http.Request) 
 // as feishuWebhookPathFor — surfaces the public-facing host via the
 // usual reverse-proxy headers.
 func lineWebhookPathFor(r *http.Request, userID string) string {
+	return requestBaseURL(r) + "/api/line/webhook/" + userID
+}
+
+// requestBaseURL is the scheme://host a request was addressed to,
+// honoring X-Forwarded-Proto / X-Forwarded-Host from a reverse proxy.
+func requestBaseURL(r *http.Request) string {
 	scheme := "https"
 	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") == "" {
 		scheme = "http"
@@ -1349,7 +1374,7 @@ func lineWebhookPathFor(r *http.Request, userID string) string {
 	if h := r.Header.Get("X-Forwarded-Host"); h != "" {
 		host = h
 	}
-	return scheme + "://" + host + "/api/line/webhook/" + userID
+	return scheme + "://" + host
 }
 
 // saveChannelRecord writes a ChannelRecord to the channels table.
@@ -1408,4 +1433,79 @@ func (s *Server) deleteChannelRecord(ctx context.Context, channelType, accountID
 		slog.Warn("deleteChannelRecord failed (non-fatal)",
 			"type", channelType, "account", accountID, "error", err)
 	}
+}
+
+// --- WeCom (企业微信 smart bot) ---
+
+type connectWeComRequest struct {
+	BotID  string `json:"botId"`
+	Secret string `json:"secret"`
+}
+
+// handleConnectAgentWeCom connects a WeCom smart bot from a pasted Bot
+// ID + Secret (the manual path; handlers_wecom_register.go is the QR
+// path). The credentials are checked by completing one subscribe
+// handshake, which is only safe before the adapter runs (a subscribe
+// kicks the live connection) — hence the uniqueness check first.
+func (s *Server) handleConnectAgentWeCom(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWritable(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	uid, aid, ok := s.resolveChannelBindingScope(w, r, id)
+	if !ok {
+		return
+	}
+
+	var req connectWeComRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	botID := strings.TrimSpace(req.BotID)
+	secret := strings.TrimSpace(req.Secret)
+	if botID == "" || secret == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "botId and secret required"})
+		return
+	}
+	if err := s.assertChannelCredentialUniqueOpt(r, "wecom", botID, "", uid, aid, true); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := channels.WeComValidateCredentials(r.Context(), botID, secret); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if status, err := s.persistWeComAccount(r, uid, aid, id, botID, secret); err != nil {
+		jsonResponse(w, status, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "botId": botID})
+}
+
+// persistWeComAccount stores a bot as kind=channel + binding rows and
+// hot-registers the adapter. Storage: credKey = accountID = Bot ID,
+// AccountConfig.BotToken = Secret. Returns the HTTP status to use on error.
+func (s *Server) persistWeComAccount(r *http.Request, uid, aid, agentID, botID, secret string) (int, error) {
+	if err := s.assertChannelCredentialUniqueOpt(r, "wecom", botID, "", uid, aid, true); err != nil {
+		return http.StatusConflict, err
+	}
+	cc := config.ChannelConfig{
+		Enabled:  true,
+		Accounts: map[string]config.AccountConfig{botID: {BotToken: secret}},
+	}
+	if err := s.saveChannelRecord(r.Context(), uid, aid, "wecom", botID, true, cc); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if err := s.appendBinding(r, "", "", config.Binding{
+		AgentID: agentID,
+		Match:   config.Match{Channel: "wecom", AccountID: botID},
+	}); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	s.invalidateOwner(uid, aid)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "wecom", botID); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
+	}
+	return http.StatusOK, nil
 }

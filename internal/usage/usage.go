@@ -106,6 +106,10 @@ type Meter interface {
 	// one user. Backs the GET /v1/usage API so upstream SaaS apps
 	// can pull detailed consumption.
 	DailyForUser(ctx context.Context, userID string, r Range) ([]DailyUsage, error)
+	// Query returns per-day rows and totals for an app-facing usage
+	// query (GET /v1/usage): one user, or an app owner plus every
+	// end-user (app_user) it minted, optionally narrowed to one agent.
+	Query(ctx context.Context, q Query) ([]DailyUsage, Totals, error)
 	// RecordTokenLog appends one row per LLM call to token_usage_log.
 	// Unlike RecordTokens (which UPSERTs into daily buckets), this is
 	// append-only so every call is individually auditable. durationMs
@@ -114,10 +118,27 @@ type Meter interface {
 	Close() error
 }
 
-// DailyUsage is one day+agent row returned by DailyForUser.
+// Query selects usage rows for Meter.Query.
+type Query struct {
+	// UserID restricts rows to one user (an app owner or one app_user).
+	UserID string
+	// AppOwnerID, when UserID is empty, selects the app owner's own rows
+	// plus the rows of every app_user owned by it.
+	AppOwnerID string
+	// AgentID optionally restricts rows to one agent.
+	AgentID string
+	Range   Range
+}
+
+// DailyUsage is one day+agent row returned by DailyForUser and Query.
 type DailyUsage struct {
-	Day           string `json:"day"`
-	AgentID       string `json:"agentId"`
+	Day     string `json:"day"`
+	AgentID string `json:"agentId"`
+	// UserID is the FastClaw user the tokens were billed to; EndUser is
+	// the integrating app's external id for it when it is an app_user.
+	// Both are only filled in by Query.
+	UserID        string `json:"userId,omitempty"`
+	EndUser       string `json:"endUser,omitempty"`
 	Model         string `json:"model"`
 	InputTokens   int64  `json:"inputTokens"`
 	OutputTokens  int64  `json:"outputTokens"`
@@ -323,6 +344,54 @@ func (m *MemMeter) DailyForUser(_ context.Context, userID string, r Range) ([]Da
 		out = append(out, *v)
 	}
 	return out, nil
+}
+
+// Query on MemMeter has no users table, so AppOwnerID matches only the
+// owner's own rows and EndUser is never filled in.
+func (m *MemMeter) Query(_ context.Context, q Query) ([]DailyUsage, Totals, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	uid := q.UserID
+	if uid == "" {
+		uid = q.AppOwnerID
+	}
+	type groupKey struct {
+		day, agentID, userID, model string
+	}
+	agg := map[groupKey]*DailyUsage{}
+	var tot Totals
+	for k, c := range m.data {
+		if k.userID != uid || !inRange(k.day, q.Range) || (q.AgentID != "" && k.agentID != q.AgentID) {
+			continue
+		}
+		gk := groupKey{day: k.day.Format("2006-01-02"), agentID: k.agentID, userID: k.userID, model: k.model}
+		row, ok := agg[gk]
+		if !ok {
+			row = &DailyUsage{Day: gk.day, AgentID: gk.agentID, UserID: gk.userID, Model: gk.model}
+			agg[gk] = row
+		}
+		row.InputTokens += c.input
+		row.OutputTokens += c.output
+		row.CacheRead += c.cacheRead
+		row.CacheCreation += c.cacheCreate
+		row.Requests += c.requests
+		tot.Input += c.input
+		tot.Output += c.output
+		tot.CacheRead += c.cacheRead
+		tot.CacheCreation += c.cacheCreate
+		tot.Requests += c.requests
+	}
+	out := make([]DailyUsage, 0, len(agg))
+	for _, v := range agg {
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Day != out[j].Day {
+			return out[i].Day > out[j].Day
+		}
+		return out[i].AgentID < out[j].AgentID
+	})
+	return out, tot, nil
 }
 
 func (m *MemMeter) RecordTokenLog(_ context.Context, _, _, _, _, _ string, _ Tokens, _ int64) error {
@@ -561,6 +630,67 @@ func (s *SQLMeter) DailyForUser(ctx context.Context, userID string, r Range) ([]
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLMeter) Query(ctx context.Context, q Query) ([]DailyUsage, Totals, error) {
+	var where []string
+	var args []any
+	switch {
+	case q.UserID != "":
+		where = append(where, "t.user_id = ?")
+		args = append(args, q.UserID)
+	case q.AppOwnerID != "":
+		where = append(where, "(t.user_id = ? OR t.user_id IN (SELECT id FROM users WHERE owner_user_id = ? AND role = 'app_user'))")
+		args = append(args, q.AppOwnerID, q.AppOwnerID)
+	default:
+		return nil, Totals{}, fmt.Errorf("usage.Query: UserID or AppOwnerID required")
+	}
+	if q.AgentID != "" {
+		where = append(where, "t.agent_id = ?")
+		args = append(args, q.AgentID)
+	}
+	where = append(where, "t.day BETWEEN ? AND ?")
+	args = append(args, s.dayParam(q.Range.Since), s.dayParam(q.Range.Until))
+	query := s.rebind(`
+		SELECT
+			t.day,
+			t.agent_id,
+			t.user_id,
+			COALESCE(u.external_id, ''),
+			t.model,
+			COALESCE(SUM(t.input_tokens),0),
+			COALESCE(SUM(t.output_tokens),0),
+			COALESCE(SUM(t.cache_read_tokens),0),
+			COALESCE(SUM(t.cache_create_tokens),0),
+			COALESCE(SUM(t.request_count),0)
+		FROM token_usage_daily t
+		LEFT JOIN users u ON u.id = t.user_id AND u.role = 'app_user'
+		WHERE ` + strings.Join(where, " AND ") + `
+		GROUP BY t.day, t.agent_id, t.user_id, u.external_id, t.model
+		ORDER BY t.day DESC, t.agent_id, t.user_id`)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, Totals{}, err
+	}
+	defer rows.Close()
+	var out []DailyUsage
+	var tot Totals
+	for rows.Next() {
+		var d DailyUsage
+		var day time.Time
+		if err := rows.Scan(&day, &d.AgentID, &d.UserID, &d.EndUser, &d.Model,
+			&d.InputTokens, &d.OutputTokens, &d.CacheRead, &d.CacheCreation, &d.Requests); err != nil {
+			return nil, Totals{}, err
+		}
+		d.Day = day.Format("2006-01-02")
+		tot.Input += d.InputTokens
+		tot.Output += d.OutputTokens
+		tot.CacheRead += d.CacheRead
+		tot.CacheCreation += d.CacheCreation
+		tot.Requests += d.Requests
+		out = append(out, d)
+	}
+	return out, tot, rows.Err()
 }
 
 func (s *SQLMeter) RecordTokenLog(ctx context.Context, userID, agentID, sessionKey, prov, model string, t Tokens, durationMs int64) error {

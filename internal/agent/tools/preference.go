@@ -50,6 +50,8 @@ func RegisterPreferenceTool(r *Registry, st store.Store) {
 
 func makeSetPreference(st store.Store, r *Registry) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args setPreferenceArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)

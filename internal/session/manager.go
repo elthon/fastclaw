@@ -63,6 +63,10 @@ type Session struct {
 	// pending steer.
 	turnDepth int
 	steerBuf  []provider.Message
+	// turnTrusted is set while an in-flight turn runs with host access
+	// (MarkTurnTrusted). Steering from an untrusted sender is then
+	// refused so a group member can't inject into the owner's turn.
+	turnTrusted bool
 }
 
 // SessionKey returns the opaque session_key this Session is bound to.
@@ -317,8 +321,34 @@ func (m *Manager) SessionExists(sessionKey string) bool {
 		// on disk (empty file → empty Session, harmless).
 		return true
 	}
+	if checker, ok := m.store.(interface {
+		SessionExists(ctx context.Context, agentID, sessionKey string) (bool, error)
+	}); ok {
+		exists, err := checker.SessionExists(m.ctx(), m.agentID, sessionKey)
+		return err == nil && exists
+	}
 	msgs, err := m.store.GetSession(m.ctx(), m.agentID, sessionKey)
 	return err == nil && msgs != nil
+}
+
+// ArchivedMessagesPage reads one page of a session's archive straight
+// from the store, without loading the session's working set. ok is
+// false when there is no paged archive to read (file-backed mode or a
+// session that predates the archive); callers then fall back to
+// ArchivedMessages. start and hasMore follow
+// store.Store.ListSessionMessagesPage.
+func (m *Manager) ArchivedMessagesPage(sessionKey string, before int64, limit int) (msgs []provider.Message, start int64, hasMore, ok bool) {
+	pager, isPager := m.store.(interface {
+		ListMessagesPage(ctx context.Context, agentID, sessionKey string, before int64, limit int) ([]provider.Message, int64, bool, error)
+	})
+	if !isPager {
+		return nil, 0, false, false
+	}
+	msgs, start, hasMore, err := pager.ListMessagesPage(m.ctx(), m.agentID, sessionKey, before, limit)
+	if err != nil || start < 0 {
+		return nil, 0, false, false
+	}
+	return msgs, start, hasMore, true
 }
 
 // ResolveSessionKey turns a URL token (`?session=…`) into the
@@ -508,6 +538,21 @@ func (s *Session) GetMessages() []provider.Message {
 	return msgs
 }
 
+// TurnActive reports whether a turn is in flight for the cached session
+// with this key. Read-only: it never loads or creates a session, so
+// listing endpoints can call it for every row.
+func (m *Manager) TurnActive(sessionKey string) bool {
+	m.mu.Lock()
+	s := m.sessions[sessionKey]
+	m.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnDepth > 0
+}
+
 // BeginTurn marks a HandleMessage turn as in-flight for this session.
 // Paired with EndTurn. Steering messages are only accepted while at
 // least one turn is active.
@@ -527,6 +572,9 @@ func (s *Session) EndTurn() []provider.Message {
 	if s.turnDepth > 0 {
 		s.turnDepth--
 	}
+	if s.turnDepth == 0 {
+		s.turnTrusted = false
+	}
 	if s.turnDepth > 0 || len(s.steerBuf) == 0 {
 		return nil
 	}
@@ -544,6 +592,29 @@ func (s *Session) PushSteerIfActive(msg provider.Message) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.turnDepth == 0 {
+		return false
+	}
+	s.steerBuf = append(s.steerBuf, msg)
+	return true
+}
+
+// MarkTurnTrusted flags the in-flight turn as running with host access.
+// Call right after BeginTurn; cleared when the last turn ends.
+func (s *Session) MarkTurnTrusted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnDepth > 0 {
+		s.turnTrusted = true
+	}
+}
+
+// PushSteerIfActiveFrom is PushSteerIfActive for a sender whose trust
+// level is known: an untrusted sender is not folded into a trusted turn
+// (returns false, so the caller queues it as its own turn instead).
+func (s *Session) PushSteerIfActiveFrom(msg provider.Message, trusted bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnDepth == 0 || (s.turnTrusted && !trusted) {
 		return false
 	}
 	s.steerBuf = append(s.steerBuf, msg)
@@ -673,6 +744,7 @@ func (s *Session) appendToFile(msg provider.Message) {
 // pointing at a chat_id still resolve via the agent-side fallback
 // (ResolveSessionKey) so existing bookmarks don't break.
 type WebSession struct {
+	Status    string `json:"status,omitempty"`
 	ID        string `json:"id"`
 	Channel   string `json:"channel,omitempty"`
 	AccountID string `json:"accountId,omitempty"`
@@ -683,8 +755,13 @@ type WebSession struct {
 	ProjectID string `json:"projectId,omitempty"`
 	Title     string `json:"title"`
 	Preview   string `json:"preview"`
-	CreatedAt int64  `json:"createdAt"` // unix ms
-	UpdatedAt int64  `json:"updatedAt"` // unix ms
+	// LastMessage is the most recent user-visible user/assistant message,
+	// independent of Preview (which intentionally remains the opening user
+	// turn and is used as the default conversation title).
+	LastMessage   string `json:"lastMessage,omitempty"`
+	LastMessageAt int64  `json:"lastMessageAt,omitempty"` // unix ms
+	CreatedAt     int64  `json:"createdAt"`               // unix ms
+	UpdatedAt     int64  `json:"updatedAt"`               // unix ms
 	// ThumbnailURL is the first image_url attached to the FIRST user
 	// turn of the session, surfaced so the sidebar can show "image +
 	// text" instead of just the text label for multimodal chats.
@@ -723,9 +800,13 @@ func (m *Manager) ListWebSessions() []WebSession {
 			continue
 		}
 
-		// Read first user message as preview
+		// Read the first user message as the conversation preview, while also
+		// tracking the latest user-visible message for contact-list summaries.
 		preview := ""
+		assistantPreview := ""
 		thumb := ""
+		lastMessage := ""
+		var lastMessageAt int64
 		fh, err := os.Open(f)
 		if err != nil {
 			continue
@@ -742,13 +823,19 @@ func (m *Manager) ListWebSessions() []WebSession {
 				Role         string                 `json:"role"`
 				Content      string                 `json:"content"`
 				ContentParts []provider.ContentPart `json:"content_parts"`
+				Timestamp    int64                  `json:"timestamp"`
+				Origin       string                 `json:"origin"`
 			}
-			if json.Unmarshal(scanner.Bytes(), &msg) != nil || msg.Role != "user" {
+			if json.Unmarshal(scanner.Bytes(), &msg) != nil || msg.Origin != provider.OriginUser {
 				continue
 			}
-			text := msg.Content
+			if msg.Role != "user" && msg.Role != "assistant" {
+				continue
+			}
+
+			text := strings.TrimSpace(msg.Content)
 			img := ""
-			if text == "" {
+			if msg.Role == "user" && text == "" {
 				var parts []string
 				for _, p := range msg.ContentParts {
 					if p.Type == "text" && p.Text != "" {
@@ -757,30 +844,49 @@ func (m *Manager) ListWebSessions() []WebSession {
 				}
 				text = strings.Join(parts, "\n")
 			}
-			text = provider.StripAttachedPrefix(text)
-			for _, p := range msg.ContentParts {
-				if p.Type == "image_url" && p.ImageURL != nil && p.ImageURL.URL != "" {
-					img = p.ImageURL.URL
-					break
+			if msg.Role == "user" {
+				text = provider.StripAttachedPrefix(text)
+				for _, p := range msg.ContentParts {
+					if p.Type == "image_url" && p.ImageURL != nil && p.ImageURL.URL != "" {
+						img = p.ImageURL.URL
+						break
+					}
 				}
 			}
 			if text == "" && img == "" {
 				continue
 			}
-			preview = text
-			if preview == "" {
-				preview = "[image]"
+
+			messagePreview := compactMessagePreview(text)
+			if messagePreview == "" {
+				messagePreview = "[image]"
 			}
-			if len(preview) > 100 {
-				preview = preview[:100] + "..."
+			lastMessage = messagePreview
+			lastMessageAt = msg.Timestamp
+
+			if msg.Role == "user" && preview == "" {
+				preview = messagePreview
+				thumb = img
 			}
-			thumb = img
-			break
+			if msg.Role == "assistant" && assistantPreview == "" {
+				assistantPreview = messagePreview
+			}
 		}
 		fh.Close()
 
 		if preview == "" {
+			// Agent-initiated sessions (a group chat's private message)
+			// have no user turn; list them by their first reply.
+			preview = assistantPreview
+		}
+		if preview == "" {
 			continue // skip empty sessions
+		}
+		if lastMessage == "" {
+			lastMessage = preview
+		}
+		if lastMessageAt == 0 {
+			lastMessageAt = info.ModTime().UnixMilli()
 		}
 
 		// Read title from metadata file, fallback to preview
@@ -793,12 +899,14 @@ func (m *Manager) ListWebSessions() []WebSession {
 		}
 
 		sessions = append(sessions, WebSession{
-			ID:           sessionId,
-			Title:        title,
-			Preview:      preview,
-			ThumbnailURL: thumb,
-			CreatedAt:    info.ModTime().UnixMilli(),
-			UpdatedAt:    info.ModTime().UnixMilli(),
+			ID:            sessionId,
+			Title:         title,
+			Preview:       preview,
+			LastMessage:   lastMessage,
+			LastMessageAt: lastMessageAt,
+			ThumbnailURL:  listThumbnail(thumb),
+			CreatedAt:     info.ModTime().UnixMilli(),
+			UpdatedAt:     info.ModTime().UnixMilli(),
 		})
 	}
 

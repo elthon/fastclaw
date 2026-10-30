@@ -174,31 +174,36 @@ func slashRequiresAdmin(cmd string, msg bus.InboundMessage) bool {
 // slash command on this channel.
 //
 // Web / api: the chatter's UserID is the FastClaw user UUID — owner is
-// identified by direct equality with the agent's ownerUserID. No
-// per-platform allowlist needed.
+// identified by direct equality with the agent's real owner
+// (agents.user_id, trustOwnerID). Not the UserSpace user: an agent
+// attached into someone else's space (an app's end-user, a public-link
+// visitor) runs with that user as ownerUserID, and comparing against it
+// would make every such chatter the operator. No per-platform allowlist
+// needed.
 //
-// IM channels (discord, telegram, slack, ...): UserID is the platform's
-// own user ID (Discord snowflake, Telegram numeric ID, ...), which has
-// no inherent link to the agent's FastClaw owner. The owner registers
-// platform IDs in agent.json's `admins[channel]` to grant access — and,
-// to keep single-user dev installs from being locked out of their own
-// agent, an empty/absent allowlist for the channel falls through to
-// "anyone can run it" (the legacy behavior). Operators who care about
-// group-chat protection populate the list to lock it down.
+// IM channels (discord, telegram, slack, ...): the gateway has already
+// rewritten UserID to a per-sender chatter id, which has no inherent
+// link to the agent's FastClaw owner. The owner is recognised by
+// pairing instead: FromChannelOwner says the sender is the platform
+// account paired to the channel (QR scan or /pair code — see
+// gateway/pairing.go), and the channel's binder (OwnerUserID) must be
+// the agent's real owner. Someone else who connects their own bot to a
+// shared agent is the owner of that channel but not of the agent, so
+// they never qualify. agent.json's `admins[channel]` allowlist of
+// chatter ids remains as an explicit extra grant.
 func (a *Agent) isAdminChatter(msg bus.InboundMessage) bool {
 	// Web / api carry FastClaw UUIDs directly; owner check is sufficient.
 	if msg.Channel == "web" || msg.Channel == "api" {
-		return msg.UserID != "" && msg.UserID == a.ownerUserID
+		return msg.UserID != "" && msg.UserID == a.trustOwnerID()
 	}
-	// Shared-identity channels rewrite EVERY speaker's UserID to the
-	// channel owner's id (routing.processInbound), which makes the
-	// owner-equality check below meaningless in groups: any group member
-	// would pass as the owner. The platform-side sender id is gone by
-	// this point, so there's nothing to match against an allowlist
-	// either — deny. DMs on a shared-identity channel are fine: the
-	// owner marked the channel as personally theirs, and a DM sender on
-	// their own bot is them by construction.
-	if msg.SharedIdentity && msg.PeerKind == "group" {
+	if msg.FromChannelOwner && msg.OwnerUserID != "" && msg.OwnerUserID == a.trustOwnerID() {
+		return true
+	}
+	// Shared-identity channels rewrite the paired owner's UserID to the
+	// channel owner's id, so owner equality below would only restate
+	// FromChannelOwner — and a message that reached here without it is
+	// not from the paired account. Deny rather than trust the rewrite.
+	if msg.SharedIdentity {
 		return false
 	}
 	list, ok := a.admins[msg.Channel]
@@ -208,7 +213,7 @@ func (a *Agent) isAdminChatter(msg bus.InboundMessage) bool {
 		// user_id matches the agent owner, they're admin. Otherwise
 		// deny — an unconfigured allowlist should NOT grant admin
 		// to every anonymous chatter on a public-facing IM channel.
-		return msg.UserID != "" && msg.UserID == a.ownerUserID
+		return msg.UserID != "" && msg.UserID == a.trustOwnerID()
 	}
 	for _, id := range list {
 		if id == msg.UserID {
@@ -342,7 +347,7 @@ func (a *Agent) slashStatus(msg bus.InboundMessage) slashResult {
 		"Memory:      %d lines\n"+
 		"Workspace:   %s",
 		a.name, a.model, soul,
-		a.maxTokens, a.temperature, a.maxToolIterations,
+		a.maxTokens, a.temperature, a.toolIterationLimit(),
 		len(sessionMsgs), memLines, a.homePath,
 	)
 	return slashResult{handled: true, reply: status}

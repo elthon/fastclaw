@@ -1,8 +1,10 @@
 "use client";
 
 import * as React from "react";
-import { useSearchParams } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import { AppSidebar } from "@/components/app-sidebar";
+import { AppRail, APP_RAIL_WIDTH } from "@/components/app-rail";
+import { rememberLocation } from "@/lib/landing";
 import {
   SidebarInset,
   SidebarProvider,
@@ -37,6 +39,18 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
   // session, not the impersonated user — hiding it (and its collapse
   // toggle) keeps the surface focused on the conversation being inspected.
   const isActAsView = !!searchParams?.get("actAs");
+  const pathname = usePathname() || "";
+  const isConversationRoute =
+    /^\/chat\/[^/]+\/?$/.test(pathname) ||
+    /^\/agents\/[^/]+\/(chat|project|team)(?:\/|$)/.test(pathname) ||
+    /^\/teams\/[^/]+\/chat\/[^/]+(?:\/|$)/.test(pathname);
+
+  // Remember where the user is (chat vs console) so the next sign-in
+  // resumes there.
+  const search = searchParams?.toString() || "";
+  React.useEffect(() => {
+    rememberLocation(pathname, search ? `?${search}` : "");
+  }, [pathname, search]);
 
   const headerCtx = React.useMemo<PageHeaderContextValue>(
     () => ({ setNode: setHeaderNode }),
@@ -47,7 +61,11 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
     return (
       <PageHeaderContext.Provider value={headerCtx}>
         <div className="flex min-h-svh flex-col">
-          <header className="sticky top-0 z-20 flex h-12 items-center gap-2 bg-background/80 px-3 backdrop-blur">
+          <header
+            className={`sticky top-0 z-20 flex items-center bg-background/90 backdrop-blur ${
+              isConversationRoute ? "h-14" : "h-14 gap-2 px-3"
+            }`}
+          >
             {headerNode}
           </header>
           <div className="flex-1">{children}</div>
@@ -58,11 +76,33 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
 
   return (
     <PageHeaderContext.Provider value={headerCtx}>
-      <SidebarProvider>
+      <SidebarProvider
+        key={isConversationRoute ? "conversation-sidebar" : "platform-sidebar"}
+        resizeDefaultWidth={isConversationRoute ? 320 : undefined}
+        resizeMinWidth={isConversationRoute ? 240 : undefined}
+        resizeMaxWidth={isConversationRoute ? 420 : undefined}
+        resizeStorageKey={isConversationRoute ? "fastclaw:bot-sidebar-width" : undefined}
+        // 480px for the conversation pane plus the 56px app rail.
+        resizeViewportReserve={isConversationRoute ? 536 : undefined}
+        style={
+          {
+            "--sidebar-offset": APP_RAIL_WIDTH,
+          } as React.CSSProperties
+        }
+      >
+        <AppRail />
         <AppSidebar />
-        <SidebarInset>
-          <header className="sticky top-0 z-20 flex h-12 items-center gap-2 bg-background/80 px-3 backdrop-blur">
-            <SidebarTrigger className="-ml-1" />
+        <SidebarInset className={isConversationRoute ? "min-w-0 overflow-hidden" : undefined}>
+          <header
+            className={`sticky top-0 z-20 flex items-center bg-background/90 backdrop-blur ${
+              isConversationRoute
+                ? "h-14"
+                : "h-14 gap-2 px-3"
+            }`}
+          >
+            <SidebarTrigger
+              className={isConversationRoute ? "ml-3 shrink-0 text-muted-foreground" : "-ml-1"}
+            />
             {headerNode}
           </header>
           <div className="flex-1">{children}</div>

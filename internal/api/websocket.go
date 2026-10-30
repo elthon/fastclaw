@@ -8,6 +8,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
+	"github.com/fastclaw-ai/fastclaw/internal/config"
 )
 
 var upgrader = websocket.Upgrader{
@@ -149,4 +150,32 @@ func (s *Server) wsRespondError(conn *websocket.Conn, id string, msg string) {
 	if err := conn.WriteJSON(resp); err != nil {
 		slog.Error("websocket write error", "error", err)
 	}
+}
+
+// buildAgentList renders the agents loaded in space that ident may use,
+// for the websocket `agents.list` verb.
+func buildAgentList(space *UserSpaceView, ident auth.Identity) []map[string]string {
+	all := space.Agents.All()
+	modelMap := make(map[string]string)
+	if space.Config != nil {
+		for _, ra := range config.ResolveAgents(space.Config, nil) {
+			modelMap[ra.ID] = ra.Model
+		}
+	}
+	agents := make([]map[string]string, 0, len(all))
+	for _, ag := range all {
+		if !ident.CanAccessAgent(ag.Name()) {
+			continue
+		}
+		model := ag.Model()
+		if model == "" {
+			model = modelMap[ag.Name()]
+		}
+		agents = append(agents, map[string]string{
+			"id":    ag.Name(),
+			"name":  ag.Name(),
+			"model": model,
+		})
+	}
+	return agents
 }

@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="web/public/brand/logo.svg" alt="FastClaw" width="120">
+
 # FastClaw
 
 A lightweight AI Agent runtime written in Go.
@@ -15,15 +17,26 @@ A lightweight AI Agent runtime written in Go.
 ---
 
 <p align="center">
-  <img src="previews/admin.png" alt="FastClaw admin dashboard" width="900">
+  <img src="previews/chat-support.png" alt="FastClaw web chat: a Support Assistant agent drafting a customer reply" width="900">
   <br>
-  <em>Platform admin: agents, models, skills, users, API keys</em>
+  <em>Chat with your agents on the web — or connect them to the API and IM channels</em>
 </p>
 
+<table>
+  <tr>
+    <td width="50%"><img src="previews/agents.png" alt="Agents list in the FastClaw console"><br><sub><b>Agents</b> — many agents side by side, each with its own model, memory and skills</sub></td>
+    <td width="50%"><img src="previews/soul-editor.png" alt="Editing an agent's SOUL.md in the console"><br><sub><b>Customize</b> — edit SOUL.md, IDENTITY, memory and heartbeat in the browser</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="previews/channels.png" alt="Connecting an agent to IM channels"><br><sub><b>Channels</b> — Telegram, Discord, Slack, WhatsApp, LINE, iMessage, WeChat, Feishu, WeCom</sub></td>
+    <td width="50%"><img src="previews/scheduler.png" alt="Scheduled jobs for an agent"><br><sub><b>Scheduler</b> — cron and interval jobs the agent runs on its own</sub></td>
+  </tr>
+</table>
+
 <p align="center">
-  <img src="previews/agent.png" alt="FastClaw agent management" width="900">
+  <img src="previews/chat-code-review.png" alt="A Code Reviewer agent flagging SQL injection and a race condition" width="900">
   <br>
-  <em>Per-agent management: chat, customize, scoped models / skills / channels / scheduler</em>
+  <em>Rich markdown and code in replies — a Code Reviewer agent catching a SQL injection and a race condition</em>
 </p>
 
 ## What is FastClaw?
@@ -149,7 +162,10 @@ table and is edited through the dashboard or `fastclaw agents config`.
 
 ### API
 - OpenAI-compatible `/v1/chat/completions` (streaming)
-- Upstream app integration contract: [`docs/upstream-api.md`](docs/upstream-api.md)
+- Agent Communication Protocol (ACP) 0.2 at `/acp` — agent discovery,
+  manifests, sync/async/stream runs, events, cancellation, and sessions
+- App integration guide (also served at `/skills/agent-integration/SKILL.md`): [`skills/agent-integration/SKILL.md`](skills/agent-integration/SKILL.md)
+- ACP integration guide: [`docs/acp.md`](docs/acp.md)
 - Web chat `/api/chat/stream` (SSE)
 - Live agent push via `/api/chat/subscribe` (SSE) — surfaces cron-fired and other async replies into the open chat panel without a refresh
 - Session management `/api/chat/sessions`

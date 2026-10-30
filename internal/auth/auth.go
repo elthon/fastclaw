@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -25,7 +26,18 @@ import (
 )
 
 // SessionCookieName is the cookie that backs the web UI's login state.
-const SessionCookieName = "fastclaw_session"
+// Browsers scope cookies by host, not port, so an instance on a
+// non-default FASTCLAW_PORT (e.g. `make dev`) suffixes the name with its
+// port; otherwise logging into one instance would clobber the other's
+// session on the same localhost.
+var SessionCookieName = sessionCookieName(os.Getenv("FASTCLAW_PORT"))
+
+func sessionCookieName(port string) string {
+	if port == "" || port == "18953" {
+		return "fastclaw_session"
+	}
+	return "fastclaw_session_" + port
+}
 
 // SessionTTL is how long a freshly-issued login cookie is valid.
 const SessionTTL = 30 * 24 * time.Hour
@@ -53,6 +65,26 @@ type Identity struct {
 	// user's resources read-only via ?actAs=. Mutating handlers MUST
 	// 403 when this is set.
 	ActAsUserID string
+
+	// AppUserID and EndUser are set when an api_key request named an
+	// end-user (X-Fastclaw-End-User header or the `user` body field) and
+	// SwitchToAppUser rebound UserID to that end-user's app_user record.
+	// AppUserID is the api_key owner — the account that owns the agents.
+	// EndUser is the caller's external id for the end-user. UserID then
+	// only names the data namespace (sessions, USER.md, personal memory);
+	// agents are always resolved against AppUserID.
+	AppUserID string
+	EndUser   string
+}
+
+// AccountID returns the account this request acts for — the tenant: the
+// api_key owner, even when UserID was switched to an end-user namespace.
+// Agents are resolved against it.
+func (i Identity) AccountID() string {
+	if i.AppUserID != "" {
+		return i.AppUserID
+	}
+	return i.EffectiveUserID()
 }
 
 // EffectiveUserID is who we read data for. For super_admin in actAs mode
@@ -76,7 +108,8 @@ func (i Identity) ReadOnly() bool {
 }
 
 // CanAccessAgent answers "is this caller authorized for agentID?"
-//   - super_admin (session): yes, on any agent (read-only when actAs)
+//   - super_admin (session): identity-level yes; record-level handlers
+//     still require owner/public access or the read-only actAs audit flow
 //   - apikey type=admin: yes, on any agent
 //   - apikey type=user/agent: only if agentID ∈ APIKeyAgents (the list
 //     is pre-resolved at auth time per type — see Resolved.Agents)
@@ -266,17 +299,25 @@ func (r *Resolver) SwitchToAppUser(ctx context.Context, ident Identity, external
 	if ident.AuthMethod != "apikey" || ident.APIKeyID == "" {
 		return ident, errors.New("auth.SwitchToAppUser: api_key auth required")
 	}
-	// Already an app_user (request switched once) — re-keying off the
-	// app_user's own id would mint a nested user. No-op instead.
+	// Key the app_user on the api_key's OWNER account so rotating or
+	// replacing the api_key keeps the same user.
+	owner := ident.UserID
 	if ident.Role == users.RoleAppUser {
-		return ident, nil
+		// Already switched once (header) — re-keying off the app_user's
+		// own id would mint a nested user. A different end-user named in
+		// the body re-keys off the app owner instead; anything else is a
+		// no-op.
+		if ident.AppUserID == "" || ident.EndUser == externalID {
+			return ident, nil
+		}
+		owner = ident.AppUserID
 	}
-	// ident.UserID is the api_key's owner account here (pre-switch); key the
-	// app_user on it so rotating/replacing the api_key keeps the same user.
-	acc, err := r.accounts.EnsureAppUser(ctx, ident.UserID, externalID, "", ident.APIKeyID)
+	acc, err := r.accounts.EnsureAppUser(ctx, owner, externalID, "", ident.APIKeyID)
 	if err != nil {
 		return ident, err
 	}
+	ident.AppUserID = owner
+	ident.EndUser = externalID
 	ident.UserID = acc.ID
 	ident.Role = acc.Role
 	return ident, nil

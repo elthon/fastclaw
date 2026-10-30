@@ -1,15 +1,22 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, useLayoutEffect } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
+import { ConnectorRequestCard } from "@/components/connector-request-card";
+import { beginChatRun, finishChatRun, stopChatRun, useChatRunStatus, type ChatRunStatus } from "@/lib/chat-runs";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { fileUrl, getAgent, getAgentKnowledgeFile, getChangedFiles, getChatHistoryWithCursor, getChatSessions, getChatTodo, getMe, getScopePreview, getScopePreviewLogs, getSessionHistory, listAgentFiles, listProjects, renameChatSession, restoreSessionHistory, revealAgentWorkspace, sendChatStream, steerChat, uploadAgentFiles, getSkills, type ChatHistoryMessage, type ChatStreamEvent, type KnowledgeSource, type ScopePreview, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile, type WorkspaceHistoryEntry } from "@/lib/api";
-import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Folder, FolderSearch, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square, FolderOpen, RefreshCw, Eye, Code2, RotateCcw, ListChecks, Terminal, ExternalLink, MoreHorizontal, PanelLeftClose, PanelLeftOpen, BookOpen } from "lucide-react";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { createProject, deleteChatSession, deleteProject, fileUrl, getAgent, getAgentKnowledgeFile, getChangedFiles, getChatHistoryWithCursor, getChatSessions, getChatTodo, getMe, getScopePreview, getScopePreviewLogs, getFolderHistory, getSessionHistory, listAgentFiles, listProjects, renameChatSession, restoreFolderHistory, restoreSessionHistory, revealAgentWorkspace, saveSceneEdits, sendChatStream, steerChat, updateAgent, updateProject, uploadAgentFiles, getSkills, type AgentDetail, type ChatHistoryMessage, type ChatStreamEvent, type KnowledgeSource, type MeResponse, type PrivateSource, type ProjectEntry, type ScopePreview, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile, type WorkspaceHistoryEntry } from "@/lib/api";
+import { ArrowLeft, ArrowUp, BookOpen, Box, Brain, Check, ChevronDown, ChevronRight, ChevronUp, CircleAlert, CornerDownRight, CirclePause, Clock, Code2, Copy, Download, Eye, ExternalLink, File, FileCode, FileText, Film, Folder, FolderOpen, FolderPlus, FolderSearch, Globe, Globe2, IdCard, Image as ImageIcon, Link2, ListChecks, LoaderCircle, LockKeyhole, MoreHorizontal, Music, PanelLeftClose, PanelLeftOpen, Paperclip, Pencil, Plus, Puzzle, Radio, RefreshCw, RotateCcw, Settings, Share2, SlidersHorizontal, Sparkles, Square, SquarePen, Terminal, Trash2, Wand2, Wrench, X } from "lucide-react";
 import Link from "next/link";
 import { ChatMarkdown } from "@/components/chat-markdown";
+import type { AgentSettingsTab } from "@/components/agent-settings-dialog";
 
 // Split a string on `![alt](data:image/...;base64,...)` markdown.
 //
@@ -71,6 +78,7 @@ function renderContentWithDataImages(
   sessionId?: string,
   knowledgeSources?: KnowledgeSource[],
   onKnowledgeCitationClick?: (source: KnowledgeSource) => void,
+  onWorkspaceFileClick?: (path: string) => void,
 ): React.ReactNode | null {
   const parts = splitDataImages(content);
   if (!parts.some((p) => p.type === "image")) return null;
@@ -81,7 +89,7 @@ function renderContentWithDataImages(
           if (suppressAllInlineImages || surfacedSrcs?.has(p.src)) return null;
           return (
             // eslint-disable-next-line @next/next/no-img-element
-            <img key={i} src={p.src} alt={p.alt} className="rounded-lg max-w-full h-auto my-2" />
+            <img key={i} src={p.src} alt={p.alt} className="my-2 h-auto max-h-96 w-auto max-w-[min(100%,28rem)] cursor-zoom-in rounded-lg" />
           );
         }
         return (
@@ -92,6 +100,7 @@ function renderContentWithDataImages(
             sessionId={sessionId}
             knowledgeSources={knowledgeSources}
             onKnowledgeCitationClick={onKnowledgeCitationClick}
+            onWorkspaceFileClick={onWorkspaceFileClick}
           />
         );
       })}
@@ -101,9 +110,13 @@ function renderContentWithDataImages(
 
 import { usePageHeader } from "@/components/sidebar";
 import { useSidebarOptional } from "@/components/ui/sidebar";
-import { channelLabel } from "@/components/channel-icon";
+import { ChannelIcon, channelLabel, hasChannelIcon } from "@/components/channel-icon";
+import { chatHref, newAgentChat, rememberChatTarget } from "@/lib/chat-route";
+import { stripLeakedToolMarkup } from "@/lib/leaked-tool-markup";
+import { RightPanelToggle } from "@/components/right-panel";
+import { useLocale, type Locale, type MessageKey } from "@/components/locale-provider";
 
-interface ProducedFile {
+export interface ProducedFile {
   path: string; // path relative to workspace
   size?: number;
 }
@@ -152,6 +165,9 @@ interface ChatMessage {
   content: string;
   timestamp: number;
   toolCalls?: { id: string; name: string; arguments: string; result?: string; metadata?: ToolResultMetadata }[];
+  // Private message this reply answers (another agent's request) or
+  // arrived as (a group's private message to the human).
+  privateFrom?: PrivateSource;
   files?: ProducedFile[];
   attachments?: UserAttachment[];
   // Optimistically-rendered steer bubble awaiting the server's persisted
@@ -181,6 +197,83 @@ interface ChatMessage {
 // outbound text on this marker into separate platform messages; the
 // web UI renders one bubble per split chunk so the experience matches.
 const SPLIT_MARKER = "<|split|>";
+const CHAT_HISTORY_PAGE_SIZE = 20;
+const LLM_PROVIDER_NOT_CONFIGURED = "llm_provider_not_configured";
+const MAX_INLINE_IMAGE_EDGE = 2048;
+const MAX_INLINE_IMAGE_BYTES = 1.5 * 1024 * 1024;
+const MAX_INLINE_IMAGES_TOTAL_BYTES = 4 * 1024 * 1024;
+const MAX_INLINE_IMAGES_PER_MESSAGE = 4;
+
+function isLLMProviderConfigurationError(code: string | undefined, message: string): boolean {
+  return code === LLM_PROVIDER_NOT_CONFIGURED
+    || /not configured with a usable LLM provider/i.test(message);
+}
+
+function openAgentModelsSettings(agentId: string) {
+  if (typeof window === "undefined" || !agentId) return;
+  window.dispatchEvent(
+    new CustomEvent("fastclaw:open-agent-settings", {
+      detail: { agentId, tab: "models" satisfies AgentSettingsTab },
+    }),
+  );
+}
+
+function readBlobAsDataURL(blob: Blob): Promise<string | null> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : null);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(blob);
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob | null> {
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
+}
+
+// Keep inline vision payloads small enough for common LLM gateways while the
+// original file remains untouched in /workspace. Small images retain their
+// original encoding; large/high-resolution images are progressively resized
+// and encoded as WebP before being embedded in the chat request.
+async function prepareImageForModel(file: File, targetBytes: number): Promise<string | null> {
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return file.size <= targetBytes ? readBlobAsDataURL(file) : null;
+  }
+
+  try {
+    const longestEdge = Math.max(bitmap.width, bitmap.height);
+    if (longestEdge <= MAX_INLINE_IMAGE_EDGE && file.size <= targetBytes) {
+      return readBlobAsDataURL(file);
+    }
+
+    let scale = Math.min(1, MAX_INLINE_IMAGE_EDGE / longestEdge);
+    let quality = 0.86;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const width = Math.max(1, Math.round(bitmap.width * scale));
+      const height = Math.max(1, Math.round(bitmap.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) return null;
+      context.drawImage(bitmap, 0, 0, width, height);
+
+      const blob = await canvasToBlob(canvas, quality);
+      if (!blob) return null;
+      if (blob.size <= targetBytes) return readBlobAsDataURL(blob);
+
+      const sizeRatio = Math.sqrt(targetBytes / blob.size);
+      scale *= Math.max(0.55, Math.min(0.88, sizeRatio * 0.92));
+      quality = Math.max(0.64, quality - 0.06);
+    }
+    return null;
+  } finally {
+    bitmap.close();
+  }
+}
 
 // splitOnMarker breaks `s` on SPLIT_MARKER, trims each chunk, and
 // drops the empty ones. Used at render time so a streamed assistant
@@ -199,7 +292,7 @@ const SYSTEM_FILES = new Set([
   "MEMORY.md", "KNOWLEDGE.md", "HEARTBEAT.md", "AGENTS.md", "TOOLS.md", "agent.json",
 ]);
 
-function isSystemFile(path: string): boolean {
+export function isSystemFile(path: string): boolean {
   return !path.includes("/") && SYSTEM_FILES.has(path);
 }
 
@@ -208,10 +301,81 @@ function parseWrittenSize(result: string): number | undefined {
   return m ? parseInt(m[1], 10) : undefined;
 }
 
+function isTodoPath(path: unknown): boolean {
+  return typeof path === "string" && /(^|[\\/])todo\.md$/i.test(path.trim());
+}
+
+// File tools carry their target in different places. write_file/edit_file
+// expose a top-level path, while apply_patch embeds every path in its Codex
+// patch envelope. Keep this decoding in one place so a successful patch of
+// todo.md triggers the same live-panel refresh as an edit_file call.
+function toolMutationTouchesTodo(toolName: string, rawArguments: string): boolean {
+  if (toolName !== "write_file" && toolName !== "edit_file" && toolName !== "apply_patch") {
+    return false;
+  }
+  try {
+    const args = JSON.parse(rawArguments);
+    if (toolName !== "apply_patch") {
+      return isTodoPath(args?.path) || isTodoPath(args?.file_path);
+    }
+
+    const patch = typeof args?.input === "string" ? args.input : "";
+    return patch.split("\n").some((line: string) => {
+      const match = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$/.exec(line)
+        || /^\*\*\* Move to:\s*(.+?)\s*$/.exec(line);
+      return match ? isTodoPath(match[1]) : false;
+    });
+  } catch {
+    return false;
+  }
+}
+
+// Anchor the current todo.md to the conversation turn that last changed it.
+// A turn can contain several tool rounds and assistant bubbles, so the card
+// belongs after the final non-user message before the next user turn begins.
+// This keeps completed checklists in their original place instead of letting
+// them drift down to the composer when a later conversation starts.
+function findTodoAnchorMessageId(messages: ChatMessage[]): string | null {
+  let mutationIndex = -1;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      message.role === "tool-group"
+      && message.toolCalls?.some((call) =>
+        toolMutationTouchesTodo(call.name, call.arguments),
+      )
+    ) {
+      mutationIndex = i;
+    }
+  }
+
+  if (mutationIndex >= 0) {
+    let anchorId = messages[mutationIndex].id;
+    for (let i = mutationIndex + 1; i < messages.length; i++) {
+      if (messages[i].role === "user") break;
+      anchorId = messages[i].id;
+    }
+    return anchorId;
+  }
+
+  // Older histories may not retain tool-call details. In that case, keep
+  // the checklist with the latest assistant-side message rather than hiding
+  // it or placing it outside the timeline.
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== "user") return messages[i].id;
+  }
+  return null;
+}
+
 interface ChatSession {
+  status?: ChatRunStatus;
   id: string;
+  projectId?: string;
   title?: string;
   preview: string;
+  createdAt?: number;
+  updatedAt?: number;
+  thumbnailUrl?: string;
   // channel/accountId/chatId travel with the listing so the chat
   // page can decide whether composing into this session is allowed
   // (only `web` is — IM channels have no reverse-send path).
@@ -247,11 +411,31 @@ function namePastedImage(file: File, pasteId: number, index: number): File {
 }
 
 /** Convert raw history messages into UI ChatMessages, grouping tool calls with results. */
-function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
-  const msgs: ChatMessage[] = [];
+function buildChatMessages(history: ChatHistoryMessage[], historyOffset = 0): ChatMessage[] {
+  const built: ChatMessage[] = [];
+  // A request from another agent isn't the viewer's own turn: it is not
+  // shown as a user bubble but as a "received privately from …" card on
+  // the agent's next reply (see PrivateSourceCard).
+  let pendingSource: PrivateSource | undefined;
+  const msgs = {
+    push(message: ChatMessage) {
+      if (message.role === "agent") {
+        const source = pendingSource ?? message.metadata?.privateFrom;
+        if (source) message = { ...message, privateFrom: source };
+        pendingSource = undefined;
+      }
+      built.push(message);
+    },
+  };
+  const historyId = (index: number) => historyOffset + index;
   let i = 0;
   while (i < history.length) {
     const h = history[i];
+    if (h.role === "user" && h.privateFrom) {
+      pendingSource = h.privateFrom;
+      i++;
+      continue;
+    }
     if (h.role === "user") {
       // Surface image attachments on history-loaded user bubbles. The
       // server emits `imageUrls` on user turns whose ContentParts had
@@ -274,7 +458,12 @@ function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
             channel: h.senderChannel,
           }
         : undefined;
-      msgs.push({ id: `h-${i}`, role: "user", content: h.content || "", timestamp: 0, attachments, sender });
+      // IM channels (WeChat) store "[image]" as the text of a caption-less
+      // photo so the model gets a cue; on screen the thumbnail says it.
+      const userContent = attachments?.some((att) => att.isImage) && (h.content || "").trim() === "[image]"
+        ? ""
+        : h.content || "";
+      msgs.push({ id: `h-${historyId(i)}`, role: "user", content: userContent, timestamp: 0, attachments, sender });
       i++;
     } else if (h.role === "assistant" && h.toolCalls && h.toolCalls.length > 0) {
       // Group: assistant tool_calls + following tool results + final assistant content
@@ -312,11 +501,14 @@ function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
       // content. Folded, the body reads as preamble to a collapsed tool
       // block; split, the model's actual answer stands as a first-class
       // reply.
-      if (h.content) {
-        msgs.push({ id: `h-pre-${i}`, role: "agent", content: h.content, timestamp: 0, metadata: h.metadata });
+      // Replies saved before leaked tool-call markup was stripped
+      // server-side may still carry it.
+      const preContent = stripLeakedToolMarkup(h.content || "");
+      if (preContent) {
+        msgs.push({ id: `h-pre-${historyId(i)}`, role: "agent", content: preContent, timestamp: 0, metadata: h.metadata });
       }
       msgs.push({
-        id: `h-tool-${i}`,
+        id: `h-tool-${historyId(i)}`,
         role: "tool-group",
         content: "",
         timestamp: 0,
@@ -334,17 +526,17 @@ function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
         history[i].content &&
         !(history[i].toolCalls && history[i].toolCalls!.length > 0)
       ) {
-        msgs.push({ id: `h-${i}`, role: "agent", content: history[i].content || "", timestamp: 0, metadata: history[i].metadata });
+        msgs.push({ id: `h-${historyId(i)}`, role: "agent", content: stripLeakedToolMarkup(history[i].content || ""), timestamp: 0, metadata: history[i].metadata });
         i++;
       }
     } else if (h.role === "assistant") {
-      msgs.push({ id: `h-${i}`, role: "agent", content: h.content || "", timestamp: 0, metadata: h.metadata });
+      msgs.push({ id: `h-${historyId(i)}`, role: "agent", content: stripLeakedToolMarkup(h.content || ""), timestamp: 0, metadata: h.metadata });
       i++;
     } else {
       i++; // skip unexpected
     }
   }
-  return msgs;
+  return built;
 }
 
 // isPendingPlanContent recognises the closing line we instructed the
@@ -370,22 +562,14 @@ function isPendingPlanContent(content: string): boolean {
   return false;
 }
 
-// Parse the per-route ids out of the pathname. ChatScreen is mounted
-// once at the agent layout level and stays alive across these routes:
-//
-//   /agents/<aid>/                         — fresh loose chat
-//   /agents/<aid>/chat/                    — fresh loose chat
-//   /agents/<aid>/chat/<session>           — open existing chat by id
-//   /agents/<aid>/project/<pid>            — fresh chat in a project
-//
-// Reading from `usePathname()` (instead of accepting props from the
 // TodoPanel renders the per-session todo.md the agent maintains as a
-// live progress checklist above the conversation. "Current step" is
+// live progress checklist inside the conversation. "Current step" is
 // the first unchecked item — we surface it as a single line with a
 // "<n>/<total>" counter, and the full list expands on click. Hidden
 // entirely when no items exist (caller's responsibility — keeps this
 // dumb-component pure).
 function TodoPanel({ items, active }: { items: TodoItem[]; active: boolean }) {
+  const { tr } = useLocale();
   const [open, setOpen] = useState(true);
   const total = items.length;
   const doneCount = items.filter((i) => i.done).length;
@@ -396,12 +580,10 @@ function TodoPanel({ items, active }: { items: TodoItem[]; active: boolean }) {
   const currentIdx = allDone ? total - 1 : items.findIndex((i) => !i.done);
   const current = currentIdx >= 0 ? items[currentIdx] : null;
   return (
-    // Wrapper keeps the panel aligned with the composer's max-w-2xl
-    // column. Only the inner div carries border/background, so the
-    // surrounding chat area stays clean — no full-width strip across
-    // the page.
-    <div className="shrink-0 px-4 pt-2">
-      <div className="mx-auto max-w-2xl">
+    // Keep the checklist visually attached to an assistant turn while
+    // retaining the compact reading width used by the previous panel.
+    <div className="flex justify-start">
+      <div className="w-full max-w-2xl">
         <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 shadow-sm">
           <button
             type="button"
@@ -423,7 +605,7 @@ function TodoPanel({ items, active }: { items: TodoItem[]; active: boolean }) {
               {doneCount}/{total}
             </span>
             <span className="truncate flex-1">
-              {current ? current.text : "Plan checklist"}
+              {current ? current.text : tr("Plan checklist", "计划清单")}
             </span>
             {open ? (
               <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
@@ -473,6 +655,19 @@ function TodoPanel({ items, active }: { items: TodoItem[]; active: boolean }) {
   );
 }
 
+// Parse the per-route ids out of the pathname. ChatScreen is mounted
+// once at the agent layout level and stays alive across these routes:
+//
+//   /agents/<aid>/                         — fresh loose chat
+//   /agents/<aid>/chat/                    — fresh loose chat
+//   /agents/<aid>/chat/<session>           — open existing chat by id (old
+//                                            links; the server redirects)
+//   /chat/<session>                        — open existing chat by id; the
+//                                            agent comes from AppShell's
+//                                            session lookup
+//   /agents/<aid>/project/<pid>            — fresh chat in a project
+//
+// Reading from `usePathname()` (instead of accepting props from the
 // page tree) is what lets the component instance survive sidebar
 // navigations — sessionId / projectId become reactive values that
 // update in place rather than gating a remount.
@@ -480,7 +675,7 @@ function parseAgentRoute(pathname: string): {
   sessionId: string;
   projectId: string;
 } {
-  const sessMatch = pathname.match(/^\/agents\/[^/]+\/chat\/([^/]+)/);
+  const sessMatch = pathname.match(/^\/(?:agents\/[^/]+\/)?chat\/([^/]+)/);
   if (sessMatch) {
     const sid = sessMatch[1];
     // "_" is the build-time placeholder Next emits under output:'export'
@@ -495,10 +690,24 @@ function parseAgentRoute(pathname: string): {
   return { sessionId: "", projectId: "" };
 }
 
+export function conversationDayLabel(timestamp: number, locale: Locale) {
+  if (!timestamp) return locale === "zh-CN" ? "今天" : "Today";
+  const date = new Date(timestamp);
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const dayDelta = Math.round((startOfToday - startOfDate) / 86_400_000);
+  if (dayDelta === 0) return locale === "zh-CN" ? "今天" : "Today";
+  if (dayDelta === 1) return locale === "zh-CN" ? "昨天" : "Yesterday";
+  return date.toLocaleDateString(locale, { month: "short", day: "numeric", year: "numeric" });
+}
+
 export function ChatScreen() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const { locale, t, tr } = useLocale();
+  const isChatsPage = /^\/agents\/[^/]+\/chats\/?$/.test(pathname || "");
   // When `?actAs=<uid>` is in the URL, this chat is being opened by a
   // super_admin viewing another user's session (read-only by middleware).
   // Forces the composer into a disabled state and surfaces a banner so
@@ -509,6 +718,12 @@ export function ChatScreen() {
     () => parseAgentRoute(pathname || ""),
     [pathname],
   );
+  // A Chats route can be reconstructed by the static-export router even
+  // though it visually behaves like a right-panel view. Carry the active
+  // session in the query so the central conversation can be restored after
+  // that reconstruction instead of falling back to a fresh welcome screen.
+  const chatsSessionId = isChatsPage ? searchParams?.get("session") || "" : "";
+  const routeSessionId = urlSessionId || chatsSessionId;
   // Reactive: re-derives from pathname so switching agents (sidebar
   // dropdown, browser back/forward) immediately updates downstream
   // fetches. The previous useState(() => ...) flavor froze the id at
@@ -516,24 +731,35 @@ export function ChatScreen() {
   // panel showed stale history under the new URL.
   const selectedAgent = useAgentIdFromURL();
   const [agentName, setAgentName] = useState<string>("");
-  // Resolved metadata for `urlProjectId`, surfaced as the
-  // empty-state info card on /agents/<aid>/project/<pid>. Null until
-  // the fetch lands; the card hides while loading rather than
-  // flashing a placeholder.
-  const [projectInfo, setProjectInfo] = useState<{
-    id: string;
-    name: string;
-    description?: string;
-    updatedAt?: string;
-    createdAt?: string;
-  } | null>(null);
+  const [agentDetail, setAgentDetail] = useState<AgentDetail | null>(null);
+  // Signed-in user, for the avatar beside their own bubbles.
+  const [me, setMe] = useState<MeResponse | null>(null);
+  useEffect(() => {
+    getMe().then(setMe).catch(() => {});
+  }, []);
+  const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [sessionId, setSessionId] = useState<string>(
-    () => urlSessionId || generateSessionId(),
+    () => routeSessionId || generateSessionId(),
   );
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
+  const [localSending, setSending] = useState(false);
+  const runStatus = useChatRunStatus(selectedAgent, sessionId);
+  const sending = localSending || runStatus === "running" || sessions.some((topic) => (topic.id === sessionId || topic.chatId === sessionId) && topic.status === "running");
+  const viewGenerationRef = useRef(0);
+  const viewScopeRef = useRef(`${selectedAgent}/${routeSessionId || sessionId}`);
+  useLayoutEffect(() => {
+    const scope = `${selectedAgent}/${routeSessionId || sessionId}`;
+    if (viewScopeRef.current === scope) return;
+    viewScopeRef.current = scope;
+    viewGenerationRef.current++;
+    setSending(false);
+    inFlightSendSessionRef.current = null;
+    streamingMsgIdRef.current = null;
+    abortRef.current = null;
+  }, [selectedAgent, routeSessionId, sessionId]);
+  useLayoutEffect(() => () => { viewGenerationRef.current++; }, []);
   // todo.md state for the current session — agent maintains the file,
   // we re-fetch on every write_file/edit_file event that touches
   // todo.md plus once at mount. Empty `items` hides the panel.
@@ -543,33 +769,103 @@ export function ChatScreen() {
   // turns off, so it never lingers across turns. Only one subagent
   // runs at a time (delegate_task is registered serial) so we don't
   // need to key this by tool_call_id.
+  // Set while the backend is retrying a failed model call (status event,
+  // phase "retrying"); cleared by the next real event of the turn.
+  const [llmRetryStatus, setLlmRetryStatus] = useState<null | { attempt: number; max: number }>(null);
   const [subagentProgress, setSubagentProgress] = useState<null | {
     iteration?: number;
     max?: number;
-    phase?: "thinking" | "running" | "final-delivery" | "done";
+    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up";
     tools?: string[];
   }>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [filesSheetOpen, setFilesSheetOpen] = useState(false);
+  const [botPanelOpen, setBotPanelOpen] = useState(false);
+  const [workspaceReturnsToBotPanel, setWorkspaceReturnsToBotPanel] = useState(false);
+  // File picked in the Agent panel's Files tab; the workspace opens on it.
+  const [workspaceInitialFile, setWorkspaceInitialFile] = useState<ProducedFile | null>(null);
+  // Bumped when a file link in a reply opens the panel, remounting it so the
+  // new initialPreview is picked up even if the panel was already open.
+  const [workspaceFileNonce, setWorkspaceFileNonce] = useState(0);
+  // The Files tab's "All" view: the workspace opens on the whole agent
+  // workspace instead of the current conversation (owners only).
+  const [workspaceAllFiles, setWorkspaceAllFiles] = useState(false);
+  // Where the Agent panel reopens when the workspace's back button returns
+  // to it: the Files tab (and its This session / All view) it came from.
+  const [botPanelReturnFiles, setBotPanelReturnFiles] = useState<"chat" | "all" | null>(null);
+  const [botPanelFilesRequest, setBotPanelFilesRequest] = useState(0);
   const [knowledgePreview, setKnowledgePreview] = useState<KnowledgeSource | null>(null);
-  // Opening the workspace/preview panel collapses the platform sidebar to
-  // free horizontal room (null when there's no provider, e.g. act-as view).
+  // The compact workspace is only a file navigator, so it can coexist with
+  // the platform sidebar. Collapse that sidebar only while a file/app preview
+  // needs the extra canvas, then restore the state the user had before.
   const sidebar = useSidebarOptional();
+  const sidebarOpenRef = useRef(sidebar?.open ?? false);
+  const sidebarSetOpenRef = useRef(sidebar?.setOpen);
+  const workspacePreviewActiveRef = useRef(false);
+  const sidebarWasOpenBeforePreviewRef = useRef(false);
   useEffect(() => {
-    if (filesSheetOpen) sidebar?.setOpen(false);
-    // Intentionally keyed only on filesSheetOpen: collapse once when the
-    // panel opens; don't fight the user if they re-expand while it's open.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filesSheetOpen]);
-  const openKnowledgeCitation = useCallback((source: KnowledgeSource) => {
-    setKnowledgePreview(source);
+    sidebarOpenRef.current = sidebar?.open ?? false;
+    sidebarSetOpenRef.current = sidebar?.setOpen;
+  }, [sidebar?.open, sidebar?.setOpen]);
+  const handleWorkspacePreviewChange = useCallback((active: boolean) => {
+    if (workspacePreviewActiveRef.current === active) return;
+    workspacePreviewActiveRef.current = active;
+    if (active) {
+      sidebarWasOpenBeforePreviewRef.current = sidebarOpenRef.current;
+      if (sidebarOpenRef.current) sidebarSetOpenRef.current?.(false);
+      return;
+    }
+    if (sidebarWasOpenBeforePreviewRef.current) {
+      sidebarSetOpenRef.current?.(true);
+    }
+    sidebarWasOpenBeforePreviewRef.current = false;
+  }, []);
+  const openWorkspace = useCallback(() => {
+    setWorkspaceAllFiles(false);
+    setWorkspaceReturnsToBotPanel(false);
+    setBotPanelOpen(false);
     setFilesSheetOpen(true);
   }, []);
-  const [sessionTitle, setSessionTitle] = useState<string>("");
+  // "Open files" on a reply lands in the Workspace panel's Files tab,
+  // scoped to this chat, rather than the standalone file browser.
+  const openChatFiles = useCallback(() => {
+    setFilesSheetOpen(false);
+    setWorkspaceReturnsToBotPanel(false);
+    setBotPanelReturnFiles("chat");
+    setBotPanelFilesRequest((n) => n + 1);
+    setBotPanelOpen(true);
+  }, []);
+  const openWorkspaceFromBotPanel = useCallback((file?: ProducedFile, allFiles = false) => {
+    setWorkspaceInitialFile(file ?? null);
+    setWorkspaceAllFiles(allFiles);
+    setWorkspaceReturnsToBotPanel(true);
+    setBotPanelOpen(false);
+    setFilesSheetOpen(true);
+  }, []);
+  // A workspace file link in a reply (e.g. report.html) opens in the
+  // Workspace panel's viewer instead of navigating away from the chat.
+  const openWorkspaceFile = useCallback((path: string) => {
+    setWorkspaceInitialFile({ path });
+    setWorkspaceAllFiles(false);
+    setWorkspaceReturnsToBotPanel(false);
+    setBotPanelOpen(false);
+    setWorkspaceFileNonce((n) => n + 1);
+    setFilesSheetOpen(true);
+  }, []);
+  const openKnowledgeCitation = useCallback((source: KnowledgeSource) => {
+    setKnowledgePreview(source);
+    openWorkspace();
+  }, [openWorkspace]);
   const [attachments, setAttachments] = useState<File[]>([]);
   // Lightbox for clicking either an attachment thumbnail (compose box)
   // or an inline image in a sent message bubble. `null` = closed.
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  useEffect(() => {
+    if (!lightboxSrc) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setLightboxSrc(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightboxSrc]);
   // Object URLs for image attachments in the compose box. Keyed by file
   // index so we can revoke on remove without re-computing for every
   // chip on every keystroke. Re-derived whenever `attachments` changes.
@@ -585,16 +881,65 @@ export function ChatScreen() {
       for (const url of attachmentPreviews) if (url) URL.revokeObjectURL(url);
     };
   }, [attachmentPreviews]);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const messagesContentRef = useRef<HTMLDivElement>(null);
   // Auto-scroll only when the user is already pinned to the bottom.
   // Toggled false the moment they scroll up so streaming agent output
   // can't yank them back down mid-read, then flipped back to true once
   // they return to the bottom (or hit the "scroll to latest" button).
   const stickToBottomRef = useRef(true);
+  const historyStartRef = useRef(0);
+  const historyLoadingOlderRef = useRef(false);
+  const activeHistoryScopeRef = useRef({ agentId: selectedAgent, sessionId });
+  const pendingInitialScrollRef = useRef("");
+  const pendingPrependScrollRef = useRef<{ height: number; top: number } | null>(null);
+  const [hasOlderHistory, setHasOlderHistory] = useState(false);
+  const [messageScrollState, setMessageScrollState] = useState({
+    overflow: false,
+    canScrollUp: false,
+    canScrollDown: false,
+  });
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pasteIdRef = useRef(0);
+  // Todo reads are asynchronous and can finish after the user has moved to
+  // another conversation. Keep both the active scope and a monotonically
+  // increasing request token so neither an old session response nor an
+  // earlier request within the same session can overwrite current state.
+  const activeTodoScopeRef = useRef({ agentId: selectedAgent, sessionId });
+  const todoRequestTokenRef = useRef(0);
+  const resetTodoScope = useCallback((agentId: string, nextSessionId: string) => {
+    activeTodoScopeRef.current = { agentId, sessionId: nextSessionId };
+    todoRequestTokenRef.current += 1;
+    setTodoItems([]);
+  }, []);
+  const refreshTodoForScope = useCallback((agentId: string, targetSessionId: string) => {
+    const active = activeTodoScopeRef.current;
+    if (active.agentId !== agentId || active.sessionId !== targetSessionId) return;
+
+    const requestToken = ++todoRequestTokenRef.current;
+    getChatTodo(agentId, targetSessionId)
+      .then((todo) => {
+        const current = activeTodoScopeRef.current;
+        if (
+          todoRequestTokenRef.current === requestToken
+          && current.agentId === agentId
+          && current.sessionId === targetSessionId
+        ) {
+          setTodoItems(todo.items);
+        }
+      })
+      .catch(() => {
+        const current = activeTodoScopeRef.current;
+        if (
+          todoRequestTokenRef.current === requestToken
+          && current.agentId === agentId
+          && current.sessionId === targetSessionId
+        ) {
+          setTodoItems([]);
+        }
+      });
+  }, []);
 
   // Dedupe events arriving on both the active POST stream and the
   // parallel /api/chat/subscribe SSE — both subscribe to the same
@@ -643,6 +988,11 @@ export function ChatScreen() {
   // keeps the gate honest if sessionId changes again before history
   // catches up.
   const [loadedSessionId, setLoadedSessionId] = useState<string | null>(null);
+  const isConversationLoading = Boolean(
+    selectedAgent
+      && routeSessionId
+      && (routeSessionId !== sessionId || loadedSessionId !== routeSessionId),
+  );
 
   // Slash-command menu state. The menu opens when the textarea holds a
   // token beginning with `/` at the caret; selecting a skill swaps that
@@ -668,12 +1018,14 @@ export function ChatScreen() {
   useEffect(() => {
     if (lastAgentRef.current === selectedAgent) return;
     lastAgentRef.current = selectedAgent;
+    resetTodoScope(selectedAgent, sessionId);
     setMessages([]);
     setSessions([]);
-    setSessionTitle("");
+    setProjects([]);
     setAgentName("");
+    setAgentDetail(null);
     setAttachments([]);
-  }, [selectedAgent]);
+  }, [selectedAgent, sessionId, resetTodoScope]);
 
   // Resolve the agent's display name once. The chat title and any
   // future header bits should show "Chat with My Helper", not the
@@ -686,39 +1038,35 @@ export function ChatScreen() {
     getAgent(selectedAgent)
       .then((a) => {
         if (aborted) return;
+        setAgentDetail(a);
         setAgentName(a?.name || a?.id || selectedAgent);
       })
       .catch(() => {
-        if (!aborted) setAgentName(selectedAgent);
+        if (!aborted) {
+          setAgentDetail(null);
+          setAgentName(selectedAgent);
+        }
       });
     return () => {
       aborted = true;
     };
   }, [selectedAgent]);
 
-  // Resolve project name for the hero title when the URL points at a
-  // project's empty new-chat state. Cheap enough to do via listProjects
-  // — projects per (user, agent) is small and the sidebar has already
-  // warmed the network cache.
+  const loadProjects = useCallback((agentId: string) => {
+    listProjects(agentId)
+      .then((list) => setProjects(list || []))
+      .catch(() => setProjects([]));
+  }, []);
+
   useEffect(() => {
-    if (!selectedAgent || !urlProjectId) {
-      setProjectInfo(null);
-      return;
-    }
-    let aborted = false;
-    listProjects(selectedAgent)
-      .then((list) => {
-        if (aborted) return;
-        const p = list.find((x) => x.id === urlProjectId);
-        setProjectInfo(p ?? null);
-      })
-      .catch(() => {
-        if (!aborted) setProjectInfo(null);
-      });
-    return () => {
-      aborted = true;
-    };
-  }, [selectedAgent, urlProjectId]);
+    if (!selectedAgent) return;
+    loadProjects(selectedAgent);
+  }, [selectedAgent, loadProjects]);
+
+  const projectInfo = useMemo(
+    () => (urlProjectId ? projects.find((project) => project.id === urlProjectId) ?? null : null),
+    [projects, urlProjectId],
+  );
 
   // Detect whether the caret is inside a /token and, if so, what's been
   // typed after the slash. Cheap enough to run every keystroke.
@@ -796,14 +1144,28 @@ export function ChatScreen() {
 
   // Load sessions when agent changes
   const loadSessions = useCallback((agentId: string) => {
+    const generation = viewGenerationRef.current;
     getChatSessions(agentId)
-      .then((list) => setSessions(list || []))
-      .catch(() => setSessions([]));
+      .then((list) => { if (generation === viewGenerationRef.current) setSessions(list || []); })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
     if (!selectedAgent) return;
     loadSessions(selectedAgent);
+    // Only while the tab is visible: a backgrounded tab left open all day
+    // would otherwise keep polling. Coming back refreshes at once.
+    const timer = setInterval(() => {
+      if (!document.hidden) loadSessions(selectedAgent);
+    }, 2500);
+    const onVisible = () => {
+      if (!document.hidden) loadSessions(selectedAgent);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [selectedAgent, loadSessions]);
 
   // Live + replay subscription. Two job:
@@ -829,20 +1191,29 @@ export function ChatScreen() {
     const since = subscribeSinceRef.current;
     const url = `/api/chat/subscribe?agentId=${encodeURIComponent(selectedAgent)}&sessionId=${encodeURIComponent(sessionId)}&since=${since}`;
     const es = new EventSource(url, { withCredentials: true });
+    const generation = viewGenerationRef.current;
+    const scopedMessages: typeof setMessages = (value) => setMessages((current) => generation === viewGenerationRef.current ? (typeof value === "function" ? value(current) : value) : current);
+    let deltaBubbleId: string | null = null;
     es.onmessage = (ev) => {
+      if (generation !== viewGenerationRef.current) return;
       let data: {
         seq?: number;
         type?: string;
         text?: string;
         data?: {
           content?: string;
+          delta?: string;
+          code?: string;
           message?: string;
           metadata?: ToolResultMetadata;
           // subagent_progress fields
           iteration?: number;
           max?: number;
-          phase?: "thinking" | "running" | "final-delivery" | "done";
+          phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up";
           tools?: string[];
+          // status fields (phase "retrying")
+          attempt?: number;
+          maxAttempts?: number;
         };
       };
       try {
@@ -871,11 +1242,39 @@ export function ChatScreen() {
         const claim = () => {
           if (seq >= 0) maxSeqRef.current = seq;
         };
+        if (data.type === "status") {
+          if (data.data?.phase === "retrying") {
+            setLlmRetryStatus({ attempt: data.data.attempt ?? 0, max: data.data.maxAttempts ?? 0 });
+          }
+          return;
+        }
+        setLlmRetryStatus(null);
         switch (data.type) {
+          case "content_delta": {
+            const delta = data.data?.delta;
+            if (!delta) break;
+            if (!deltaBubbleId) deltaBubbleId = `resume-delta-${crypto.randomUUID()}`;
+            const id = deltaBubbleId;
+            transientBubbleIdRef.current = id;
+            scopedMessages((prev) => {
+              if (generation !== viewGenerationRef.current) return prev;
+              const index = prev.findIndex((message) => message.id === id);
+              if (index < 0) return [...prev, { id, role: "agent", content: delta, timestamp: Date.now() }];
+              return prev.map((message) => message.id === id ? { ...message, content: message.content + delta } : message);
+            });
+            break;
+          }
           case "content": {
             const content = data.data?.content || "";
             const meta = data.data?.metadata;
             if (!content && !meta) break;
+            if (deltaBubbleId && content) {
+              const id = deltaBubbleId;
+              deltaBubbleId = null;
+              claim();
+              scopedMessages((prev) => generation !== viewGenerationRef.current ? prev : prev.map((message) => message.id === id ? { ...message, content, metadata: meta } : message));
+              break;
+            }
             // The active POST sendChatStream is rendering this turn
             // via content_delta into streamingMsgIdRef. Both
             // subscriptions sit on the same hub, so the `content`
@@ -892,7 +1291,7 @@ export function ChatScreen() {
               break;
             }
             claim();
-            setMessages((prev) => {
+            scopedMessages((prev) => {
               if (transientBubbleIdRef.current) {
                 const idx = prev.findIndex((m) => m.id === transientBubbleIdRef.current);
                 if (idx >= 0) {
@@ -926,14 +1325,23 @@ export function ChatScreen() {
           }
           case "error": {
             claim();
-            const msg = data.data?.message || "Unknown error";
+            const msg = data.data?.message || tr("Unknown error", "未知错误");
             // Older gateways persisted cancellation as an error event.
             // Ignore those on replay so Stop produces one clear status
             // instead of "(Stopped)" followed by a stale error bubble.
             if (/\bcontext canceled\b/i.test(msg)) break;
-            setMessages((prev) => [
+            const needsModelConfiguration = isLLMProviderConfigurationError(data.data?.code, msg);
+            if (needsModelConfiguration) openAgentModelsSettings(selectedAgent);
+            scopedMessages((prev) => [
               ...prev,
-              { id: `e-${Date.now()}`, role: "agent", content: `Error: ${msg}`, timestamp: Date.now() },
+              {
+                id: `e-${Date.now()}`,
+                role: "agent",
+                content: needsModelConfiguration
+                  ? tr("Configure an LLM provider before chatting.", "请先配置可用的模型服务商，再继续聊天。")
+                  : tr("Error: {{error}}", "错误：{{error}}", { error: msg }),
+                timestamp: Date.now(),
+              },
             ]);
             break;
           }
@@ -958,6 +1366,8 @@ export function ChatScreen() {
           }
           case "done": {
             claim();
+            deltaBubbleId = null;
+            setSending(false);
             // Defensive clear — content events should already have
             // sealed the streaming bubble, but a turn that errors out
             // before the trailing `content` event lands would leave
@@ -975,11 +1385,14 @@ export function ChatScreen() {
             // message to session_messages.
             if (transientBubbleIdRef.current) {
               transientBubbleIdRef.current = null;
-              getChatHistoryWithCursor(selectedAgent, sessionId)
-                .then(({ history, latestEventSeq }) => {
+              getChatHistoryWithCursor(selectedAgent, sessionId, { limit: CHAT_HISTORY_PAGE_SIZE })
+                .then(({ history, latestEventSeq, historyStart, hasMoreHistory }) => {
+                  if (generation !== viewGenerationRef.current) return;
                   if (latestEventSeq > maxSeqRef.current) maxSeqRef.current = latestEventSeq;
                   subscribeSinceRef.current = latestEventSeq;
-                  setMessages(buildChatMessages(history));
+                  historyStartRef.current = historyStart;
+                  setHasOlderHistory(hasMoreHistory);
+                  scopedMessages(buildChatMessages(history, historyStart));
                 })
                 .catch(() => {});
             }
@@ -1003,7 +1416,7 @@ export function ChatScreen() {
       // Shape B: legacy WebChannel { text } — cron-fired async messages.
       const text = data.text || "";
       if (!text) return;
-      setMessages((prev) => [
+      scopedMessages((prev) => [
         ...prev,
         {
           id: `async-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1021,7 +1434,7 @@ export function ChatScreen() {
     return () => {
       es.close();
     };
-  }, [selectedAgent, sessionId, loadedSessionId]);
+  }, [selectedAgent, sessionId, loadedSessionId, tr]);
 
   // Reactively swap sessionId when the URL changes underneath us.
   // Three URL transitions matter, all handled by the same branch logic:
@@ -1036,20 +1449,26 @@ export function ChatScreen() {
   // fetch is in flight.
   const prevHadSessionRef = useRef(false);
   useEffect(() => {
-    if (urlSessionId) {
+    if (routeSessionId) {
       prevHadSessionRef.current = true;
-      if (urlSessionId !== sessionId) {
-        setSessionId(urlSessionId);
+      if (routeSessionId !== sessionId) {
+        resetTodoScope(selectedAgent, routeSessionId);
+        setSessionId(routeSessionId);
         setMessages([]);
       }
       return;
     }
+    // `/chats` with no selected session only replaces the right-side panel.
+    // Do not mint a new central conversation while that route is active.
+    if (isChatsPage) return;
     if (prevHadSessionRef.current) {
       prevHadSessionRef.current = false;
-      setSessionId(generateSessionId());
+      const nextSessionId = generateSessionId();
+      resetTodoScope(selectedAgent, nextSessionId);
+      setSessionId(nextSessionId);
       setMessages([]);
     }
-  }, [urlSessionId, sessionId]);
+  }, [isChatsPage, routeSessionId, sessionId, selectedAgent, resetTodoScope]);
 
   // Switching conversations (sidebar chat click, New chat, opening a project)
   // changes the URL ids — close the workspace panel so the previous chat's
@@ -1057,15 +1476,7 @@ export function ChatScreen() {
   // not every render, so the user can still re-open it within the SAME chat.
   useEffect(() => {
     setFilesSheetOpen(false);
-  }, [urlSessionId, urlProjectId]);
-
-  // Keep the local sessionTitle in sync with the session list. Unknown
-  // sessions (brand-new, not saved yet) fall back to empty so the header
-  // can render "New chat".
-  useEffect(() => {
-    const s = sessions.find((x) => x.id === sessionId);
-    setSessionTitle(s?.title || s?.preview || "");
-  }, [sessionId, sessions]);
+  }, [routeSessionId, urlProjectId]);
 
   // Channel of the currently-open session, derived from the sessions
   // list. Brand-new web chats don't have a row yet — the fallback to
@@ -1082,66 +1493,134 @@ export function ChatScreen() {
   const isReadOnlyChannel = currentChannel !== "web";
   const isReadOnlyView = isReadOnlyChannel || isActAsView;
   const inputIsReadOnlySafeSlashCommand = isReadOnlySafeSlashCommand(input);
-  const canUseComposer = !!selectedAgent;
+  const canUseComposer = !!selectedAgent && !isConversationLoading;
   const canSendComposer =
     canUseComposer && (!isReadOnlyView || inputIsReadOnlySafeSlashCommand);
   const canAttach = !!selectedAgent && !sending && !isReadOnlyView;
 
-  const handleRenameTitle = useCallback(
-    async (next: string) => {
-      const trimmed = next.trim();
-      if (!trimmed || !selectedAgent || trimmed === sessionTitle) return;
-      setSessionTitle(trimmed);
-      try {
-        await renameChatSession(selectedAgent, sessionId, trimmed);
-      } finally {
-        loadSessions(selectedAgent);
-        // Tell the global sidebar to refetch its Chats list so the new
-        // title shows up without a full page reload. AppSidebar's own
-        // fetch only re-runs when activeAgentId changes, which doesn't
-        // happen on rename.
-        if (typeof window !== "undefined") {
-          window.dispatchEvent(
-            new CustomEvent("fastclaw:sessions-changed", {
-              detail: { agentId: selectedAgent },
-            }),
-          );
-        }
-      }
-    },
-    [selectedAgent, sessionId, sessionTitle, loadSessions],
-  );
+  const openBotSettings = useCallback(() => {
+    if (typeof window === "undefined" || !selectedAgent) return;
+    window.dispatchEvent(
+      new CustomEvent("fastclaw:open-agent-settings", {
+        detail: { agentId: selectedAgent },
+      }),
+    );
+  }, [selectedAgent]);
 
-  // Render the editable title + the workspace-panel toggle into the
-  // global sticky header (the chat container injects whatever JSX it
-  // wants here, next to the sidebar toggle). The toggle stays wired
-  // even when the panel is open so users can collapse it from the
-  // same control they used to expand it.
+  const openBotSettingsTab = useCallback((tab: AgentSettingsTab, userOnly = false) => {
+    if (typeof window === "undefined" || !selectedAgent) return;
+    window.dispatchEvent(
+      new CustomEvent("fastclaw:open-agent-settings", {
+        detail: { agentId: selectedAgent, tab, userOnly },
+      }),
+    );
+  }, [selectedAgent]);
+
+  const handleAgentPublicChange = useCallback((isPublic: boolean) => {
+    setAgentDetail((current) => current ? { ...current, isPublic } : current);
+  }, []);
+
+  // Keep legacy/direct /chats URLs closable even though the in-panel recent
+  // list now expands in place and no longer navigates there.
+  const fallbackChatHref = useMemo(() => {
+    if (!selectedAgent) return "/agents";
+    const activeSessionExists = sessions.some((topic) => topic.id === sessionId);
+    return chatHref(activeSessionExists ? sessionId : newAgentChat(selectedAgent));
+  }, [selectedAgent, sessionId, sessions]);
+  const leaveChatsPage = useCallback((keepAgentPanelOpen: boolean) => {
+    if (typeof window === "undefined") return;
+    setBotPanelOpen(keepAgentPanelOpen);
+    window.history.replaceState(null, "", fallbackChatHref);
+  }, [fallbackChatHref]);
+  const navigationPanelOpen = botPanelOpen || isChatsPage;
+
+  // The header is memoized; reach the per-render new-chat handler
+  // through a ref instead of rebuilding the header on every render.
+  const newChatRef = useRef<() => void>(() => {});
+
+  // Conversation header follows the compact Bot pattern: identity opens
+  // settings, while the monitor action opens the live workspace.
   const headerSlot = useMemo(
     () => (
-      <div className="flex flex-1 items-center justify-between gap-2 min-w-0">
-        <ChatHeaderTitle
-          title={sessionTitle}
-          fallback={`Chat with ${agentName || selectedAgent}`}
-          onSave={handleRenameTitle}
-        />
+      <div className="flex h-full min-w-0 flex-1 items-center gap-3 pl-1 pr-4 md:pr-5">
         <button
           type="button"
-          onClick={() => setFilesSheetOpen((v) => !v)}
-          className={`shrink-0 inline-flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
-            filesSheetOpen
-              ? "bg-muted text-foreground"
-              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-          }`}
-          title={filesSheetOpen ? "Hide workspace" : "Show workspace"}
-          aria-pressed={filesSheetOpen}
+          onClick={openBotSettings}
+          className="group flex min-w-0 max-w-[min(60vw,32rem)] cursor-pointer items-center gap-1.5 rounded-xl px-1.5 py-1 transition-colors hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring"
+          title={tr("Open settings for {{agent}}", "打开 {{agent}} 的设置", { agent: agentName || selectedAgent })}
+          aria-label={tr("Open settings for {{agent}}", "打开 {{agent}} 的设置", { agent: agentName || selectedAgent })}
         >
-          <FolderOpen className="h-4 w-4" />
-          <span className="sr-only">Toggle workspace</span>
+          <span className="truncate text-sm font-semibold text-foreground">
+            {agentName || selectedAgent}
+          </span>
+          {/* Edit affordance: always takes its space (no layout shift),
+              only visible on hover / keyboard focus. */}
+          <Pencil
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+          />
         </button>
+        {/* Pushes share + the panel toggle to the right edge, with or
+            without the share button. */}
+        <span aria-hidden="true" className="flex-1" />
+        {/* New chat and share act on a session that exists, so both stay
+            hidden on a new, unsent chat. */}
+        <div className="flex shrink-0 items-center gap-1">
+        {routeSessionId && sessions.some((session) => session.id === routeSessionId) && (
+        <>
+        <button
+          type="button"
+          onClick={() => newChatRef.current()}
+          className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          title={tr("New chat (⌘N)", "新建对话 (⌘N)")}
+          aria-label={tr("New chat", "新建对话")}
+        >
+          <SquarePen className="size-[17px]" />
+        </button>
+        <ShareAgentMenu
+          agentId={selectedAgent}
+          sessionId={routeSessionId}
+          agentName={agentName || selectedAgent}
+          isPublic={agentDetail?.isPublic === true}
+          canChangeVisibility={agentDetail?.role === "owner" && !isActAsView}
+          onPublicChange={handleAgentPublicChange}
+        />
+        </>
+        )}
+        <RightPanelToggle
+          open={navigationPanelOpen}
+          label={navigationPanelOpen ? tr("Close navigation panel", "关闭导航侧栏") : tr("Open projects and recent sessions", "打开项目和最近会话")}
+          onToggle={() => {
+            setFilesSheetOpen(false);
+            setKnowledgePreview(null);
+            setWorkspaceReturnsToBotPanel(false);
+            if (isChatsPage) {
+              leaveChatsPage(false);
+              return;
+            }
+            setBotPanelReturnFiles(null);
+            setBotPanelOpen((value) => !value);
+          }}
+        />
+        </div>
       </div>
     ),
-    [sessionTitle, agentName, selectedAgent, handleRenameTitle, filesSheetOpen],
+    [
+      agentName,
+      selectedAgent,
+      agentDetail?.isPublic,
+      agentDetail?.role,
+      isActAsView,
+      openBotSettings,
+      handleAgentPublicChange,
+      isChatsPage,
+      leaveChatsPage,
+      navigationPanelOpen,
+      botPanelOpen,
+      routeSessionId,
+      sessions,
+      tr,
+    ],
   );
   usePageHeader(headerSlot, [headerSlot]);
 
@@ -1154,6 +1633,13 @@ export function ChatScreen() {
   useEffect(() => {
     if (!selectedAgent || !sessionId) return;
     const sessionHasActivePost = inFlightSendSessionRef.current === sessionId;
+    activeHistoryScopeRef.current = { agentId: selectedAgent, sessionId };
+    historyStartRef.current = 0;
+    historyLoadingOlderRef.current = false;
+    pendingPrependScrollRef.current = null;
+    pendingInitialScrollRef.current = sessionId;
+    stickToBottomRef.current = true;
+    setHasOlderHistory(false);
     // Reset dedup state when session changes — events from a previous
     // session must not bias the new session's seq filter, and any
     // transient placeholder is no longer relevant.
@@ -1163,26 +1649,27 @@ export function ChatScreen() {
     // Close the SSE gate for this sessionId; reopens once the history
     // fetch lands and subscribeSinceRef has been set to the real cursor.
     setLoadedSessionId(null);
-    // Reset the todo panel on session change so the previous chat's
-    // checklist doesn't briefly flash before the new one's fetch lands.
-    setTodoItems([]);
+    // Reset the todo panel on session change and invalidate every request
+    // started for the previous conversation before loading this scope.
+    resetTodoScope(selectedAgent, sessionId);
     // Same for the subagent progress indicator — never carry it across
     // sessions; a fresh load means no in-flight delegate_task to track.
     setSubagentProgress(null);
+    setLlmRetryStatus(null);
     // Refresh todo.md alongside the history fetch. We don't gate the
     // rest of the load on it — a 404 (no todo.md yet) is the normal
     // empty-session case.
-    getChatTodo(selectedAgent, sessionId)
-      .then((todo) => setTodoItems(todo.items))
-      .catch(() => setTodoItems([]));
+    refreshTodoForScope(selectedAgent, sessionId);
     let aborted = false;
-    getChatHistoryWithCursor(selectedAgent, sessionId)
-      .then(async ({ history, latestEventSeq }) => {
+    getChatHistoryWithCursor(selectedAgent, sessionId, { limit: CHAT_HISTORY_PAGE_SIZE })
+      .then(async ({ history, latestEventSeq, historyStart, hasMoreHistory }) => {
         if (aborted) return;
         if (!sessionHasActivePost && latestEventSeq > maxSeqRef.current) {
           maxSeqRef.current = latestEventSeq;
         }
         subscribeSinceRef.current = latestEventSeq;
+        historyStartRef.current = historyStart;
+        setHasOlderHistory(hasMoreHistory);
         if (!history || history.length === 0) {
           if (!sessionHasActivePost) {
             setMessages([]);
@@ -1190,7 +1677,19 @@ export function ChatScreen() {
           setLoadedSessionId(sessionId);
           return;
         }
-        const built = buildChatMessages(history);
+        const built = buildChatMessages(history, historyStart);
+        setMessages(built);
+        setLoadedSessionId(sessionId);
+        // Attach the files after the conversation is on screen: listing a
+        // large workspace can take a while and must not hold up the chat.
+        let anchorId = "";
+        for (let i = built.length - 1; i >= 0; i--) {
+          if (built[i].role === "agent" || built[i].role === "tool-group") {
+            anchorId = built[i].id;
+            break;
+          }
+        }
+        if (!anchorId) return;
         try {
           // listAgentFiles(agentId, sessionId) lets the backend pick
           // the right prefix — projects/<pid>/ for project chats,
@@ -1202,21 +1701,20 @@ export function ChatScreen() {
           )
             .filter((f) => !isSystemFile(f.path))
             .map((f) => ({ path: f.path, size: f.size }));
-          if (sessionFiles.length > 0) {
-            for (let i = built.length - 1; i >= 0; i--) {
-              if (built[i].role === "agent" || built[i].role === "tool-group") {
-                built[i] = { ...built[i], files: sessionFiles };
-                break;
-              }
-            }
-          }
+          if (aborted || sessionFiles.length === 0) return;
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === anchorId && !message.files
+                ? { ...message, files: sessionFiles }
+                : message,
+            ),
+          );
         } catch { /* listing failed — fall back to no panel */ }
-        if (aborted) return;
-        setMessages(built);
-        setLoadedSessionId(sessionId);
       })
       .catch(() => {
         if (aborted) return;
+        historyStartRef.current = 0;
+        setHasOlderHistory(false);
         if (!sessionHasActivePost) {
           setMessages([]);
         }
@@ -1229,33 +1727,176 @@ export function ChatScreen() {
     return () => {
       aborted = true;
     };
-  }, [selectedAgent, sessionId]);
+  }, [selectedAgent, sessionId, refreshTodoForScope, resetTodoScope]);
 
-  useEffect(() => {
-    if (!stickToBottomRef.current) return;
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  const updateMessageScrollState = useCallback(() => {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const next = {
+      overflow: el.scrollHeight > el.clientHeight + 1 || hasOlderHistory,
+      canScrollUp: el.scrollTop > 8 || hasOlderHistory,
+      canScrollDown: distanceFromBottom > 8,
+    };
+    setMessageScrollState((current) =>
+      current.overflow === next.overflow
+      && current.canScrollUp === next.canScrollUp
+      && current.canScrollDown === next.canScrollDown
+        ? current
+        : next,
+    );
+  }, [hasOlderHistory]);
 
-  // Watch the scroll container so we know whether to keep auto-scrolling
-  // as new content arrives. 64px slack absorbs streaming jitter — without
-  // it, a single token append can push the bottom past the viewport and
-  // flip us off "sticky" for one tick before the next auto-scroll fires.
+  const loadOlderHistory = useCallback(async () => {
+    if (
+      !selectedAgent
+      || !sessionId
+      || !hasOlderHistory
+      || historyStartRef.current <= 0
+      || historyLoadingOlderRef.current
+    ) {
+      return;
+    }
+    historyLoadingOlderRef.current = true;
+    const requestScope = { agentId: selectedAgent, sessionId };
+    try {
+      const result = await getChatHistoryWithCursor(selectedAgent, sessionId, {
+        limit: CHAT_HISTORY_PAGE_SIZE,
+        before: historyStartRef.current,
+      });
+      const activeScope = activeHistoryScopeRef.current;
+      if (
+        activeScope.agentId !== requestScope.agentId
+        || activeScope.sessionId !== requestScope.sessionId
+      ) {
+        return;
+      }
+      const olderMessages = buildChatMessages(result.history, result.historyStart);
+      historyStartRef.current = result.historyStart;
+      setHasOlderHistory(result.hasMoreHistory);
+      if (olderMessages.length === 0) return;
+
+      const el = messagesScrollRef.current;
+      if (el) {
+        pendingPrependScrollRef.current = {
+          height: el.scrollHeight,
+          top: el.scrollTop,
+        };
+      }
+      stickToBottomRef.current = false;
+      setMessages((current) => {
+        const existingIds = new Set(current.map((message) => message.id));
+        return [
+          ...olderMessages.filter((message) => !existingIds.has(message.id)),
+          ...current,
+        ];
+      });
+    } finally {
+      historyLoadingOlderRef.current = false;
+    }
+  }, [hasOlderHistory, selectedAgent, sessionId]);
+
+  // Perform all automatic positioning before paint. Entering a long
+  // conversation therefore opens on the newest message immediately instead
+  // of visibly animating the scrollbar from the top. Prepending an older page
+  // preserves the message that was under the reader's eyes.
+  useLayoutEffect(() => {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+
+    const restore = pendingPrependScrollRef.current;
+    if (restore) {
+      pendingPrependScrollRef.current = null;
+      el.scrollTop = restore.top + (el.scrollHeight - restore.height);
+    } else if (
+      pendingInitialScrollRef.current === sessionId
+      && loadedSessionId === sessionId
+    ) {
+      pendingInitialScrollRef.current = "";
+      stickToBottomRef.current = true;
+      el.scrollTop = el.scrollHeight;
+    } else if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+    updateMessageScrollState();
+  }, [loadedSessionId, messages, sessionId, updateMessageScrollState]);
+
+  // Keep the controls accurate while the user scrolls and as Markdown,
+  // images, or tool panels change the content height after rendering.
   useEffect(() => {
     const el = messagesScrollRef.current;
+    const content = messagesContentRef.current;
     if (!el) return;
     const onScroll = () => {
       const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
       stickToBottomRef.current = distance <= 64;
+      updateMessageScrollState();
+      if (el.scrollTop <= 24 && hasOlderHistory) {
+        void loadOlderHistory();
+      }
     };
+    // A disclosure the user opens should grow downward from where they
+    // clicked; staying pinned to the bottom would push it up instead.
+    // Scrolling back to the bottom re-arms the pin via onScroll.
+    const releaseBottomStick = () => {
+      stickToBottomRef.current = false;
+    };
+    window.addEventListener(CHAT_RELEASE_BOTTOM_STICK_EVENT, releaseBottomStick);
+    // The list reserves a scrollbar gutter; the composer below has no
+    // scrollbar, so publish the gutter width for it to pad by the same
+    // amount and keep both columns' edges aligned (0 with overlay bars).
+    const syncScrollbarGutter = () => {
+      el.parentElement?.style.setProperty("--chat-scrollbar", `${el.offsetWidth - el.clientWidth}px`);
+    };
+    // Older pages load on scroll-to-top, but a page that doesn't fill the
+    // viewport can't scroll, so no scroll event ever fires — a short last
+    // turn (e.g. "continue" after a long tool run) would hide everything
+    // before it. Keep loading until the list overflows or history runs out;
+    // each prepend resizes the content and re-runs this check.
+    const fillViewport = () => {
+      if (hasOlderHistory && el.scrollHeight <= el.clientHeight + 24) {
+        void loadOlderHistory();
+      }
+    };
+    const resizeObserver = new ResizeObserver(() => {
+      if (stickToBottomRef.current && !pendingPrependScrollRef.current) {
+        el.scrollTop = el.scrollHeight;
+      }
+      syncScrollbarGutter();
+      updateMessageScrollState();
+      fillViewport();
+    });
     el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+    if (content) resizeObserver.observe(content);
+    resizeObserver.observe(el);
+    syncScrollbarGutter();
+    updateMessageScrollState();
+    fillViewport();
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      window.removeEventListener(CHAT_RELEASE_BOTTOM_STICK_EVENT, releaseBottomStick);
+      resizeObserver.disconnect();
+    };
+  }, [hasOlderHistory, loadOlderHistory, updateMessageScrollState]);
+
+  const scrollMessagesByPage = useCallback((direction: -1 | 1) => {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    if (direction < 0 && el.scrollTop <= 8 && hasOlderHistory) {
+      void loadOlderHistory();
+      return;
+    }
+    el.scrollBy({
+      top: direction * Math.max(240, el.clientHeight * 0.72),
+      behavior: "smooth",
+    });
+  }, [hasOlderHistory, loadOlderHistory]);
 
   useEffect(() => {
     const el = textareaRef.current;
     if (el) {
       el.style.height = "auto";
-      el.style.height = Math.min(el.scrollHeight, 200) + "px";
+      el.style.height = Math.min(el.scrollHeight, 180) + "px";
     }
   }, [input]);
 
@@ -1281,6 +1922,11 @@ export function ChatScreen() {
     });
   }, []);
 
+  const sendMessages = setMessages;
+  const sendInput = setInput;
+  const sendAttachments = setAttachments;
+  const sendSending = setSending;
+  const sendSubagentProgress = setSubagentProgress;
   const handleSend = useCallback(async (overrideText?: string, force?: boolean) => {
     // overrideText lets caller post a message that didn't come from
     // the composer (e.g. the plan-approval button clicking "go"). When
@@ -1307,6 +1953,20 @@ export function ChatScreen() {
     // drops back to the bare chat form.
     const projectIdHint = urlProjectId;
 
+    const generation = viewGenerationRef.current;
+    const isCurrent = () => generation === viewGenerationRef.current;
+    const setMessages: typeof sendMessages = (value) => { sendMessages((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
+    const setInput: typeof sendInput = (value) => { sendInput((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
+    const setAttachments: typeof sendAttachments = (value) => { sendAttachments((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
+    const setSending: typeof sendSending = (value) => { sendSending((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
+    const setSubagentProgress: typeof sendSubagentProgress = (value) => { sendSubagentProgress((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
+
+    const controller = beginChatRun(selectedAgent, sessionId);
+    if (!controller) return;
+    setSending(true);
+    abortRef.current = controller;
+    let outcome: ChatRunStatus = "failed";
+    try {
     // Pin the sessionId into the URL on the first send so a refresh
     // keeps the user in the same conversation. We use the native
     // History API instead of `router.replace` because output:'export'
@@ -1318,8 +1978,11 @@ export function ChatScreen() {
     // history.replaceState to dispatch ACTION_RESTORE, so usePathname /
     // useSearchParams (and the sidebar's navigateOnce dedupe that
     // derives from them) still see the new URL.
-    const target = `/agents/${selectedAgent}/chat/${sessionId}/`;
-    inFlightSendSessionRef.current = sessionId;
+    // Conversations live at /chat/<sid>; record the agent first so AppShell
+    // keeps this screen mounted across the URL change (no lookup frame).
+    rememberChatTarget(sessionId, { kind: "agent", agentId: selectedAgent });
+    const target = chatHref(sessionId);
+    if (isCurrent()) inFlightSendSessionRef.current = sessionId;
     if (pathname !== target) {
       window.history.replaceState(null, "", target);
     }
@@ -1338,14 +2001,30 @@ export function ChatScreen() {
     let imageDataUrls: string[] = [];
 
     if (filesToUpload.length > 0) {
-      userBubbleAttachments = filesToUpload.map((f) => ({
-        name: f.name,
-        isImage: f.type.startsWith("image/"),
-        previewUrl: f.type.startsWith("image/") ? URL.createObjectURL(f) : undefined,
-      }));
-
+      const imageFiles = filesToUpload.filter((file) => file.type.startsWith("image/"));
+      if (imageFiles.length > MAX_INLINE_IMAGES_PER_MESSAGE) {
+        setAttachments(filesToUpload);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `e-${Date.now()}`,
+            role: "agent",
+            content: tr(
+              "You can send up to 4 images in one message.",
+              "每条消息最多可以发送 4 张图片。",
+            ),
+            timestamp: Date.now(),
+          },
+        ]);
+        return;
+      }
       try {
-        await uploadAgentFiles(selectedAgent, sessionId, filesToUpload);
+        await uploadAgentFiles(
+          selectedAgent,
+          sessionId,
+          filesToUpload,
+          !routeSessionId && urlProjectId ? urlProjectId : undefined,
+        );
       } catch (err) {
         setMessages((prev) => [
           ...prev,
@@ -1354,22 +2033,39 @@ export function ChatScreen() {
         return;
       }
 
-      // Read each image as a base64 data URL. We do this AFTER upload —
-      // upload only needs the File object; data URL conversion is for the
-      // provider call. Done in parallel for snappy UX on multi-attach.
-      imageDataUrls = (
-        await Promise.all(
-          filesToUpload.map(async (f) => {
-            if (!f.type.startsWith("image/")) return null;
-            return await new Promise<string | null>((resolve) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : null);
-              reader.onerror = () => resolve(null);
-              reader.readAsDataURL(f);
-            });
-          }),
-        )
-      ).filter((s): s is string => !!s);
+      // Prepare only this turn's images for inline vision. Divide a bounded
+      // aggregate budget across the selected images so multi-attach cannot
+      // accidentally create a huge JSON request. The original uploads stay
+      // lossless in /workspace for file/image tools.
+      const perImageBudget = Math.min(
+        MAX_INLINE_IMAGE_BYTES,
+        Math.max(64 * 1024, Math.floor(MAX_INLINE_IMAGES_TOTAL_BYTES / Math.max(1, imageFiles.length))),
+      );
+      const preparedImages = await Promise.all(
+        imageFiles.map((file) => prepareImageForModel(file, perImageBudget)),
+      );
+      if (preparedImages.some((image) => !image)) {
+        setAttachments(filesToUpload);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `e-${Date.now()}`,
+            role: "agent",
+            content: tr(
+              "One or more images could not be prepared. Try a smaller PNG, JPEG, or WebP file.",
+              "图片处理失败，请尝试使用尺寸更小的 PNG、JPEG 或 WebP 图片。",
+            ),
+            timestamp: Date.now(),
+          },
+        ]);
+        return;
+      }
+      imageDataUrls = preparedImages.filter((image): image is string => !!image);
+      userBubbleAttachments = filesToUpload.map((file) => ({
+        name: file.name,
+        isImage: file.type.startsWith("image/"),
+        previewUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined,
+      }));
     }
     // Build the prompt actually sent to the model. Images travel as
     // `imageUrls` for vision, but the model also needs the on-disk path
@@ -1394,7 +2090,7 @@ export function ChatScreen() {
     // Sending always means "I want to see what happens next" — re-pin
     // to bottom even if the user had scrolled up to read earlier in the
     // conversation.
-    stickToBottomRef.current = true;
+    if (isCurrent()) stickToBottomRef.current = true;
     setMessages((prev) => [
       ...prev,
       {
@@ -1406,13 +2102,12 @@ export function ChatScreen() {
       },
     ]);
     setSending(true);
-    abortRef.current = new AbortController();
 
     // Snapshot the workspace before the turn so we can diff at `done` and
     // attach newly-created / modified files (PDFs, images, …) to the
     // final reply. Fire-and-forget; if the snapshot fails we just won't
     // surface files this turn. `path → size|modTime` key.
-    const preTurnFilesPromise = listAgentFiles(selectedAgent)
+    const preTurnFilesPromise = listAgentFiles(selectedAgent, sessionId)
       .then((items) => {
         const m = new Map<string, string>();
         for (const f of items) m.set(f.path, `${f.size}|${f.modTime}`);
@@ -1423,6 +2118,10 @@ export function ChatScreen() {
     let curGroupId = "";
     let curCalls: { id: string; name: string; arguments: string; result?: string; metadata?: ToolResultMetadata }[] = [];
     let curContent = "";
+    // Raw text of the in-flight bubble. It shows with leaked tool-call
+    // markup cut off (stripLeakedToolMarkup); the raw form is kept so a
+    // tag split across deltas is still recognized.
+    let streamRaw = "";
     // streamingMsgIdRef tracks the in-flight assistant bubble for
     // content_delta accretion. Stored on a ref (declared above) so
     // the parallel /api/chat/subscribe SSE handler can observe it
@@ -1437,12 +2136,15 @@ export function ChatScreen() {
       curGroupId = `tg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       curCalls = [];
       curContent = "";
-      streamingMsgIdRef.current = null;
+      if (isCurrent()) streamingMsgIdRef.current = null;
     };
     startNewGroup();
 
     try {
+      outcome = "completed";
       await sendChatStream(selectedAgent, sessionId, fullText, (evt: ChatStreamEvent) => {
+        if (evt.type === "error") outcome = "failed";
+        if (!isCurrent()) return;
         // Dedup against /api/chat/subscribe SSE, which subscribes to
         // the same chat-events hub server-side. Whichever path arrives
         // first renders; the other skips. seq < 0 means persistence
@@ -1453,6 +2155,13 @@ export function ChatScreen() {
           if (evt.seq <= maxSeqRef.current) return;
           maxSeqRef.current = evt.seq;
         }
+        if (evt.type === "status") {
+          if (evt.data?.phase === "retrying") {
+            setLlmRetryStatus({ attempt: evt.data.attempt ?? 0, max: evt.data.maxAttempts ?? 0 });
+          }
+          return;
+        }
+        setLlmRetryStatus(null);
         switch (evt.type) {
           case "content_delta": {
             // Incremental token chunk from the provider. Append to the
@@ -1473,17 +2182,21 @@ export function ChatScreen() {
             if (!streamingMsgIdRef.current) {
               const id = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
               streamingMsgIdRef.current = id;
+              streamRaw = delta;
+              const shown = stripLeakedToolMarkup(streamRaw, true);
               setMessages((prev) => [
                 ...prev,
-                { id, role: "agent", content: delta, timestamp: Date.now() },
+                { id, role: "agent", content: shown, timestamp: Date.now() },
               ]);
             } else {
               const id = streamingMsgIdRef.current;
+              streamRaw += delta;
+              const shown = stripLeakedToolMarkup(streamRaw, true);
               setMessages((prev) => {
                 const idx = prev.findIndex((m) => m.id === id);
                 if (idx < 0) return prev;
                 const updated = [...prev];
-                updated[idx] = { ...updated[idx], content: (updated[idx].content || "") + delta };
+                updated[idx] = { ...updated[idx], content: shown };
                 return updated;
               });
             }
@@ -1494,7 +2207,7 @@ export function ChatScreen() {
             const meta = evt.data?.metadata;
             if (content === "__NEW_SESSION__") {
               handleNewChat();
-              loadSessions(selectedAgent);
+              if (isCurrent()) loadSessions(selectedAgent);
               return;
             }
             if (!content && !meta) {
@@ -1507,15 +2220,19 @@ export function ChatScreen() {
             if (streamingMsgIdRef.current) {
               const id = streamingMsgIdRef.current;
               streamingMsgIdRef.current = null;
-              if (meta) {
-                setMessages((prev) => {
-                  const idx = prev.findIndex((m) => m.id === id);
-                  if (idx < 0) return prev;
-                  const updated = [...prev];
-                  updated[idx] = { ...updated[idx], metadata: { ...updated[idx].metadata, ...meta } };
-                  return updated;
-                });
-              }
+              // The final text is the server's cleaned copy, so it also
+              // replaces whatever leaked markup the deltas carried.
+              setMessages((prev) => {
+                const idx = prev.findIndex((m) => m.id === id);
+                if (idx < 0) return prev;
+                const updated = [...prev];
+                updated[idx] = {
+                  ...updated[idx],
+                  ...(content ? { content: stripLeakedToolMarkup(content) } : {}),
+                  ...(meta ? { metadata: { ...updated[idx].metadata, ...meta } } : {}),
+                };
+                return updated;
+              });
               curContent = content;
               break;
             }
@@ -1557,6 +2274,18 @@ export function ChatScreen() {
             // ID so a subsequent content_delta on the next round
             // spawns a fresh bubble instead of writing into the
             // now-defunct ID.
+            {
+              // The tool call may have been streamed as text first; keep
+              // only the prose before it, and drop a bubble that was
+              // nothing but the leaked markup.
+              const streamedId = streamingMsgIdRef.current;
+              if (streamedId) {
+                const shown = stripLeakedToolMarkup(streamRaw);
+                setMessages((prev) => shown.trim()
+                  ? prev.map((m) => (m.id === streamedId ? { ...m, content: shown } : m))
+                  : prev.filter((m) => m.id !== streamedId));
+              }
+            }
             streamingMsgIdRef.current = null;
             // New round starts if every tool in the current group has
             // already resolved. Without this, two assistant turns that
@@ -1618,18 +2347,8 @@ export function ChatScreen() {
             // every tool_result so the network cost stays proportional
             // to actual updates (a long run with 50 web_search calls
             // doesn't trigger 50 refetches).
-            if (tc && (tc.name === "write_file" || tc.name === "edit_file" || tc.name === "apply_patch")) {
-              try {
-                const args = JSON.parse(tc.arguments);
-                const path: string =
-                  (typeof args?.path === "string" ? args.path : "") ||
-                  (typeof args?.file_path === "string" ? args.file_path : "");
-                if (path && /(^|\/)todo\.md$/i.test(path)) {
-                  getChatTodo(selectedAgent, sessionId)
-                    .then((todo) => setTodoItems(todo.items))
-                    .catch(() => {});
-                }
-              } catch { /* ignore bad args */ }
+            if (tc && toolMutationTouchesTodo(tc.name, tc.arguments)) {
+              refreshTodoForScope(selectedAgent, sessionId);
             }
             const groupId = curGroupId;
             const calls = [...curCalls];
@@ -1671,22 +2390,31 @@ export function ChatScreen() {
             // turn just hangs — the model failed (provider 4xx/5xx,
             // serialization mismatch, etc.) and the only signal was a
             // gateway log line the user can't see.
-            const msg = evt.data?.message || "Unknown error";
+            const msg = evt.data?.message || tr("Unknown error", "未知错误");
             if (/\bcontext canceled\b/i.test(msg)) break;
+            const needsModelConfiguration = isLLMProviderConfigurationError(evt.data?.code, msg);
+            if (needsModelConfiguration) openAgentModelsSettings(selectedAgent);
             setMessages((prev) => [
               ...prev,
-              { id: `e-${Date.now()}`, role: "agent", content: `Error: ${msg}`, timestamp: Date.now() },
+              {
+                id: `e-${Date.now()}`,
+                role: "agent",
+                content: needsModelConfiguration
+                  ? tr("Configure an LLM provider before chatting.", "请先配置可用的模型服务商，再继续聊天。")
+                  : tr("Error: {{error}}", "错误：{{error}}", { error: msg }),
+                timestamp: Date.now(),
+              },
             ]);
             break;
           }
         }
-      }, abortRef.current.signal, imageDataUrls, projectIdHint);
+      }, controller.signal, imageDataUrls, projectIdHint);
       // Diff the workspace against the pre-turn snapshot so files
       // produced by *exec* (e.g. a Python script that saves PDFs) get
       // surfaced too — `turnFiles` only catches write_file tool calls
       // with relative, non-identity paths, which misses most real-
       // world flows. Union both sources by path.
-      const postTurnFiles = await listAgentFiles(selectedAgent).catch(() => []);
+      const postTurnFiles = await listAgentFiles(selectedAgent, sessionId).catch(() => []);
       const preSnap = await preTurnFilesPromise;
       const diffFiles: ProducedFile[] = [];
       for (const f of postTurnFiles) {
@@ -1728,7 +2456,7 @@ export function ChatScreen() {
           return updated;
         });
       }
-      loadSessions(selectedAgent);
+      if (isCurrent()) loadSessions(selectedAgent);
       // First-turn of a brand-new session just got persisted — tell the
       // global sidebar to refetch its Chats list so the new title shows
       // up without a full page reload.
@@ -1740,6 +2468,8 @@ export function ChatScreen() {
         );
       }
     } catch (err) {
+      outcome = controller.signal.aborted ? "stopped" : "failed";
+      if (!isCurrent()) return;
       // AbortError from the user clicking Stop is expected — surface a
       // brief "Stopped" line so they see the cancellation took effect,
       // not a generic failure message.
@@ -1769,7 +2499,7 @@ export function ChatScreen() {
               ? {
                   ...m,
                   toolCalls: m.toolCalls.map((tc) =>
-                    tc.result === undefined ? { ...tc, result: "(stopped)" } : tc,
+                    tc.result === undefined ? { ...tc, result: tr("(stopped)", "（已停止）") } : tc,
                   ),
                 }
               : m,
@@ -1777,9 +2507,14 @@ export function ChatScreen() {
         );
         setMessages((prev) => [
           ...prev,
-          { id: `e-${Date.now()}`, role: "agent", content: "(Stopped)", timestamp: Date.now() },
+          { id: `e-${Date.now()}`, role: "agent", content: tr("(Stopped)", "（已停止）"), timestamp: Date.now() },
         ]);
       } else {
+        const rawErrorMessage = err instanceof Error && err.message
+          ? err.message
+          : tr("Failed to get a response. Is the gateway running?", "获取回复失败，请确认网关是否正在运行。");
+        const needsModelConfiguration = isLLMProviderConfigurationError(undefined, rawErrorMessage);
+        if (needsModelConfiguration) openAgentModelsSettings(selectedAgent);
         setMessages((prev) => {
           const lastUser = [...prev].reverse().findIndex((m) => m.role === "user");
           if (lastUser >= 0) {
@@ -1788,9 +2523,9 @@ export function ChatScreen() {
               .some((m) => m.role === "agent" || m.role === "tool-group");
             if (replyAfter) return prev; // turn already produced output
           }
-          const errMsg = err instanceof Error && err.message
-            ? err.message
-            : "Failed to get a response. Is the gateway running?";
+          const errMsg = needsModelConfiguration
+            ? tr("Configure an LLM provider before chatting.", "请先配置可用的模型服务商，再继续聊天。")
+            : rawErrorMessage;
           return [
             ...prev,
             {
@@ -1802,23 +2537,44 @@ export function ChatScreen() {
           ];
         });
       }
-    } finally {
-      if (inFlightSendSessionRef.current === sessionId) {
-        inFlightSendSessionRef.current = null;
-      }
-      abortRef.current = null;
-      setSending(false);
-      // Belt-and-suspenders: the subagent's done event clears this on
-      // the happy path, but if a network blip drops that event we don't
-      // want a stale "iteration 5/20" sitting under a finished turn.
-      setSubagentProgress(null);
-      textareaRef.current?.focus();
     }
-  }, [input, attachments, selectedAgent, sessionId, sending, isReadOnlyView, isReadOnlySafeSlashCommand, loadSessions, pathname, router, urlProjectId]);
+    } catch (err) {
+      outcome = controller.signal.aborted ? "stopped" : "failed";
+      setMessages((prev) => [...prev, { id: `e-${Date.now()}`, role: "agent", content: err instanceof Error ? err.message : String(err), timestamp: Date.now() }]);
+    } finally {
+      finishChatRun(selectedAgent, sessionId, controller, controller.signal.aborted ? "stopped" : outcome);
+      if (isCurrent()) {
+        if (inFlightSendSessionRef.current === sessionId) inFlightSendSessionRef.current = null;
+        abortRef.current = null;
+        setSending(false);
+        setSubagentProgress(null);
+        textareaRef.current?.focus();
+      }
+    }
+  }, [input, attachments, selectedAgent, sessionId, routeSessionId, sending, isReadOnlyView, isReadOnlySafeSlashCommand, loadSessions, pathname, refreshTodoForScope, router, tr, urlProjectId]);
 
+  // Workspace previews reload after each agent turn (the agent may have
+  // rewritten the file being viewed, e.g. an editable design).
+  const [turnNonce, setTurnNonce] = useState(0);
+  const wasSending = useRef(sending);
+  useEffect(() => {
+    if (wasSending.current && !sending) setTurnNonce((n) => n + 1);
+    wasSending.current = sending;
+  }, [sending]);
+  // An editable design asked for a change: send it now, or leave it in the
+  // composer while a turn is still running.
+  const handleDesignAsk = useCallback((text: string) => {
+    if (sending || isReadOnlyView) {
+      setInput(text);
+      return;
+    }
+    void handleSend(text);
+  }, [sending, isReadOnlyView, handleSend]);
+
+  const stopPressRef = useRef(false);
   const handleStop = useCallback(() => {
-    abortRef.current?.abort();
-  }, []);
+    stopChatRun(selectedAgent, sessionId);
+  }, [selectedAgent, sessionId]);
 
   // handleSteer fires while a turn is streaming: it buffers the message
   // into the running turn (the agent folds it in between tool rounds and
@@ -1979,30 +2735,61 @@ export function ChatScreen() {
     }, 0);
   };
 
+  // A new chat opens at its own /chat/<id>/ right away, like a new group
+  // session; the server learns the id with the first message.
   const handleNewChat = () => {
-    const newId = generateSessionId();
+    const newId = newAgentChat(selectedAgent);
+    resetTodoScope(selectedAgent, newId);
     setSessionId(newId);
     setMessages([]);
-    router.replace(`/agents/${selectedAgent}/chat/`);
+    window.history.replaceState(null, "", chatHref(newId));
   };
+  newChatRef.current = handleNewChat;
 
   const handleSelectSession = (sid: string) => {
+    resetTodoScope(selectedAgent, sid);
     setSessionId(sid);
     // history.replaceState (not router.replace) for the same reason as
     // handleSend: /chat/[session] is only pre-rendered for the `_`
     // placeholder under output:'export', so router-driven navigation to
     // a real sid hard-reloads. See the longer note in handleSend.
-    window.history.replaceState(null, "", `/agents/${selectedAgent}/chat/${sid}/`);
+    rememberChatTarget(sid, { kind: "agent", agentId: selectedAgent });
+    window.history.replaceState(null, "", chatHref(sid));
   };
 
   const formatTime = (ts: number) =>
-    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    new Date(ts).toLocaleTimeString(locale === "zh-CN" ? "zh-CN" : "en-US", { hour: "2-digit", minute: "2-digit" });
 
-  // Empty new-chat state: collapse the messages scroll out of the
-  // flex-1 lane and center title + composer vertically, Manus-style.
-  // Once any message exists the layout swings back to the standard
-  // "scroll above, sticky composer at bottom" shape.
+  // A new chat — plain or inside a project — opens in conversation mode
+  // with a local welcome message; the project shows as the composer chip.
+  // Existing session URLs keep their normal history-loading behavior.
   const isEmpty = messages.length === 0;
+  // Every empty conversation opens with the Agent's greeting — a new chat
+  // has its own /chat/<id> URL before its first message, so "no session
+  // in the URL" no longer marks the new-chat case.
+  const showBotWelcome = !isConversationLoading && isEmpty;
+  const showEmptyHero = !isConversationLoading && isEmpty && !showBotWelcome;
+  const todoAnchorMessageId = todoItems.length > 0
+    ? findTodoAnchorMessageId(messages)
+    : null;
+  const todoIsActive = sending && todoAnchorMessageId !== null && (() => {
+    const anchorIndex = messages.findIndex((message) => message.id === todoAnchorMessageId);
+    return anchorIndex >= 0
+      && !messages.slice(anchorIndex + 1).some((message) => message.role === "user");
+  })();
+  // A description means the agent is already set up, so it goes straight
+  // to the task. The description itself is not repeated.
+  const botWelcome = agentDetail?.description?.trim()
+    ? tr(
+        "Hey, I am {{name}}. What should we start with?",
+        "Hey，我是{{name}}。想先从哪件事开始？",
+        { name: agentName || tr("your new Agent", "新来的 Agent") },
+      )
+    : tr(
+        "Hi, I'm {{name}}. Ask me anything, or hand me a task — what can I help you with today?",
+        "Hi，我是{{name}}。有问题随时问，有事情尽管交给我，今天想让我帮你做点什么？",
+        { name: agentName || tr("your new Agent", "新来的 Agent") },
+      );
   // Compute the id of the latest agent bubble that's a pending plan
   // (numbered plan + "Reply `go` to execute" footer), only when no
   // user message has followed it. This is the single bubble that gets
@@ -2022,38 +2809,56 @@ export function ChatScreen() {
   // render a small info card UNDER the hero (folder + name + meta)
   // instead of taking over the headline, so users always know which
   // agent they're chatting with first.
-  const heroTitle = "What can I do for you?";
+  const heroTitle = tr("What can I do for you?", "我能为你做什么？");
 
   return (
-    <div className="flex h-[calc(100vh-3rem)] flex-row">
+    <div className="flex h-[calc(100vh-3.5rem)] flex-row bg-background">
       <div
         className={
-          "flex flex-1 min-w-0 flex-col" +
-          // pb-12 (3rem) matches the header height we already subtracted
-          // from the parent's h-[calc(100vh-3rem)]. Without it `justify-
+          "relative flex flex-1 min-w-0 flex-col xl:min-w-[520px]" +
+          // pb-14 (3.5rem) matches the header height we already subtracted
+          // from the parent's h-[calc(100vh-3.5rem)]. Without it `justify-
           // center` centers content inside the post-header area, which
           // sits visually ~24px below the true viewport mid-line — the
           // user notices the hero + composer pair drifting low. Adding
           // an equal bottom padding biases the centered group upward by
           // half the header height so the optical centre lines up with
           // the geometric centre of the screen.
-          (isEmpty ? " justify-center pb-12" : "")
+          (showEmptyHero ? " justify-center pb-14" : "")
         }
       >
       {/* Messages */}
         <div
           ref={messagesScrollRef}
           className={
-            // scrollbar-gutter:stable always reserves the 6px scrollbar track
+            // scrollbar-gutter:stable always reserves the 4px scrollbar track
             // so message rows keep a fixed content width that lines up with the
             // composer below (which gets a matching right inset) — otherwise the
             // scrollbar shifts message edges out of alignment on a narrow panel.
             "min-h-0 px-4 [scrollbar-gutter:stable] " +
-            (isEmpty ? "shrink-0" : "flex-1 overflow-y-auto py-4")
+            (showEmptyHero ? "shrink-0" : "flex-1 overflow-y-auto py-4")
           }
         >
-          <div className="mx-auto max-w-2xl space-y-3">
-            {isEmpty && (
+          <div
+            ref={messagesContentRef}
+            className={`mx-auto w-full ${CHAT_COLUMN_MAX} ${
+              isConversationLoading ? "flex min-h-full items-center justify-center" : "space-y-3"
+            }`}
+          >
+            {isConversationLoading && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="inline-flex items-center gap-2.5 rounded-full border border-black/[0.07] bg-card px-4 py-2.5 text-sm text-muted-foreground shadow-[0_5px_20px_rgba(0,0,0,0.04)] dark:border-white/[0.09]"
+              >
+                <RefreshCw
+                  className="size-4 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
+                <span>{tr("Loading conversation…", "正在加载对话…")}</span>
+              </div>
+            )}
+            {showEmptyHero && (
               <div className="py-8 text-center">
                 <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">
                   {heroTitle}
@@ -2061,7 +2866,19 @@ export function ChatScreen() {
               </div>
             )}
 
-            {(() => {
+            {!isConversationLoading && !showEmptyHero && (
+              <div className="pb-5 pt-1 text-center text-xs font-medium text-muted-foreground/75">
+                {conversationDayLabel(messages[0]?.timestamp || Date.now(), locale)}
+              </div>
+            )}
+
+            {showBotWelcome && (
+              <div className="flex justify-start">
+                <p className="max-w-full whitespace-pre-wrap py-0.5 text-[15px] leading-6 text-[#202020] dark:text-foreground">{botWelcome}</p>
+              </div>
+            )}
+
+            {!isConversationLoading && (() => {
               // Tool-group artefacts (e.g. an image rendered to base64 by
               // a Python script inside the sandbox) are attached to the
               // *next* agent reply bubble — so they appear as part of the
@@ -2098,6 +2915,15 @@ export function ChatScreen() {
               // dominate the chat — the bundle hides them behind one
               // header until the user actually wants to dive in.
               const elements: React.ReactNode[] = [];
+              // The copy / files bar belongs to the end of an agent turn:
+              // the last agent message before the next user message.
+              const turnEndIds = new Set<string>();
+              for (let i = 0; i < messages.length; i++) {
+                const m = messages[i];
+                if (m.role !== "agent") continue;
+                const next = messages.slice(i + 1).find((later) => later.role !== "tool-group" || later.toolCalls?.length);
+                if (!next || next.role === "user") turnEndIds.add(m.id);
+              }
               for (let i = 0; i < messages.length; i++) {
                 const msg = messages[i];
                 if (msg.role === "tool-group") {
@@ -2109,18 +2935,6 @@ export function ChatScreen() {
                     i++;
                   }
                   const rounds = messages.slice(start, i + 1);
-                  // Keep the surfacing of any per-round produced files
-                  // out here so each round's panel still renders below
-                  // the bundle in chronological order.
-                  const filePanels = rounds
-                    .filter((r) => r.files && r.files.length > 0)
-                    .map((r) => (
-                      <FilesPanel
-                        key={`files-${r.id}`}
-                        files={r.files!}
-                        onOpen={() => setFilesSheetOpen(true)}
-                      />
-                    ));
                   if (rounds.length === 1) {
                     elements.push(
                       <div key={rounds[0].id}>
@@ -2132,7 +2946,6 @@ export function ChatScreen() {
                           subagentProgress={subagentProgress}
                           onKnowledgeCitationClick={openKnowledgeCitation}
                         />
-                        {filePanels}
                       </div>,
                     );
                   } else {
@@ -2146,8 +2959,22 @@ export function ChatScreen() {
                           subagentProgress={subagentProgress}
                           onKnowledgeCitationClick={openKnowledgeCitation}
                         />
-                        {filePanels}
                       </div>,
+                    );
+                  }
+                  // Cards an agent put in front of the person (connect an
+                  // account), outside the collapsible tool details.
+                  for (const round of rounds) {
+                    for (const call of round.toolCalls ?? []) {
+                      const req = call.metadata?.connectorRequest;
+                      if (req?.id) {
+                        elements.push(<ConnectorRequestCard key={`connector-${req.id}`} request={req} />);
+                      }
+                    }
+                  }
+                  if (rounds.some((round) => round.id === todoAnchorMessageId)) {
+                    elements.push(
+                      <TodoPanel key="todo-panel" items={todoItems} active={todoIsActive} />,
                     );
                   }
                   continue;
@@ -2157,11 +2984,15 @@ export function ChatScreen() {
                 // behavior). Expand into one bubble per chunk so the
                 // marker never surfaces as literal text. Attach files /
                 // metadata only to the last chunk to match the IM
-                // dispatcher's "attach to last chunk" rule.
-                if (msg.role === "agent" && msg.content.includes(SPLIT_MARKER)) {
+                // dispatcher's "attach to last chunk" rule. Not limited to
+                // role "agent": group-chat mirrors show other agents' turns
+                // on the user side, and those carry the marker too.
+                if (msg.content.includes(SPLIT_MARKER)) {
                   const parts = splitOnMarker(msg.content);
                   parts.forEach((part, idx) => {
                     const isLast = idx === parts.length - 1;
+                    // Only the last part carries the hover actions, and its
+                    // copy takes the whole reply rather than one fragment.
                     elements.push(
                       renderRegularBubble({
                         ...msg,
@@ -2169,53 +3000,103 @@ export function ChatScreen() {
                         content: part,
                         files: isLast ? msg.files : undefined,
                         metadata: isLast ? msg.metadata : undefined,
-                      }),
+                        privateFrom: idx === 0 ? msg.privateFrom : undefined,
+                      }, { actions: isLast && (msg.role !== "agent" || turnEndIds.has(msg.id)), copyText: parts.join("\n\n") }),
                     );
                   });
+                  if (msg.id === todoAnchorMessageId) {
+                    elements.push(
+                      <TodoPanel key="todo-panel" items={todoItems} active={todoIsActive} />,
+                    );
+                  }
                   continue;
                 }
-                elements.push(renderRegularBubble(msg));
+                elements.push(renderRegularBubble(msg, { actions: msg.role !== "agent" || turnEndIds.has(msg.id) }));
+                if (msg.id === todoAnchorMessageId) {
+                  elements.push(
+                    <TodoPanel key="todo-panel" items={todoItems} active={todoIsActive} />,
+                  );
+                }
               }
               return elements;
 
-              function renderRegularBubble(msg: ChatMessage) {
+              function renderRegularBubble(msg: ChatMessage, opts: { actions?: boolean; copyText?: string } = {}) {
+                const copyMsg = opts.copyText ? { ...msg, content: opts.copyText } : msg;
+                // The viewer's own web turns are stored with a sender block
+                // (their id + name); treat those as "me" so the row skips
+                // the name line meant for other people's turns.
+                const sender = msg.sender && msg.sender.id && msg.sender.id === me?.user?.id
+                  ? undefined
+                  : msg.sender;
                 return (
                 <div
                   key={msg.id}
                   className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
                 >
                   <div
-                    className={`group relative ${
-                      // Assistant content (tables, long markdown) uses the full
-                      // lane — capped only by the lane's max-w-2xl — so it stops
-                      // wrapping early and leaving a big empty gutter on narrow
-                      // panels. User bubbles stay hugged to the right.
-                      msg.role === "user" ? "max-w-[80%] order-1" : "max-w-full"
+                    className={`group relative min-w-0 ${
+                      // Assistant replies read as plain text (no bubble)
+                      // across the conversation column, like tool activity.
+                      // The user's turns stay a compact bubble on the right.
+                      msg.role === "user" ? "max-w-[80%]" : `w-full ${ASSISTANT_LANE_MAX}`
                     }`}
                   >
-                    {msg.role === "user" && msg.sender && (
-                      <div className="mb-1 flex items-center justify-end gap-2 text-xs text-muted-foreground">
-                        <span className="font-medium text-foreground/80">{msg.sender.name}</span>
-                        {msg.sender.avatarUrl ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img
-                            src={msg.sender.avatarUrl}
-                            alt={msg.sender.name}
-                            className="h-5 w-5 rounded-full object-cover ring-1 ring-border"
-                          />
-                        ) : (
-                          <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/20 text-[10px] font-semibold uppercase text-foreground">
-                            {msg.sender.name.slice(0, 1)}
-                          </span>
+                    {msg.role === "user" && sender && (
+                      <div className="mb-1 flex h-5 items-center justify-end gap-2 text-xs text-muted-foreground">
+                        <span className="font-medium text-foreground/80">{sender.name}</span>
+                        <ChatBubbleAvatar name={sender.name} src={sender.avatarUrl} size="small" />
+                      </div>
+                    )}
+                    {/* The user's attachments sit above their bubble as a
+                        row of square thumbnails / file chips, so the bubble
+                        itself carries only text. */}
+                    {msg.role === "user" && msg.attachments && msg.attachments.length > 0 && (
+                      <div className="mb-2 flex flex-wrap justify-end gap-2">
+                        {msg.attachments.map((att, i) =>
+                          att.isImage && att.previewUrl ? (
+                            <button
+                              key={i}
+                              type="button"
+                              onClick={() => setLightboxSrc(att.previewUrl!)}
+                              className="block size-32 shrink-0 cursor-zoom-in overflow-hidden rounded-xl border border-black/10 bg-muted/40 transition hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring md:size-36 dark:border-white/10"
+                              aria-label={tr("Preview {{name}}", "预览 {{name}}", { name: att.name })}
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={att.previewUrl}
+                                alt={att.name}
+                                className="size-full object-cover"
+                              />
+                            </button>
+                          ) : (
+                            <div
+                              key={i}
+                              className="flex max-w-[16rem] items-center gap-2 rounded-xl border border-black/10 bg-background px-3 py-2 text-sm text-foreground dark:border-white/10"
+                            >
+                              <Paperclip className="size-4 shrink-0 text-muted-foreground" />
+                              <span className="truncate">{att.name}</span>
+                            </div>
+                          ),
                         )}
                       </div>
                     )}
+                    {msg.role !== "user" && msg.privateFrom && (
+                      <PrivateSourceCard source={msg.privateFrom} />
+                    )}
                     <div
-                      className={`rounded-2xl px-4 py-2.5 break-words ${
+                      className={`break-words ${
                         msg.role === "user"
-                          ? "bg-primary/10 dark:bg-primary/15 text-foreground rounded-br-md"
-                          : "bg-muted rounded-bl-md"
+                          ? `user-chat-bubble rounded-2xl rounded-br-md border border-[#ded5e2] bg-[#eee9f0] px-4 py-2.5 text-[#29252a] dark:border-[#4b404e] dark:bg-[#342d36] dark:text-[#f8f5f9] ${msg.content.trim() ? "" : "hidden"}`
+                          : "py-0.5 text-[#202020] dark:text-foreground"
                       }`}
+                      // Every picture in a message opens full size; images
+                      // inside a link keep the link.
+                      onClick={(e) => {
+                        const img = (e.target as HTMLElement).closest("img");
+                        if (!img || img.closest("a, button") || !img.currentSrc) return;
+                        e.preventDefault();
+                        setLightboxSrc(img.currentSrc);
+                      }}
                     >
                       {(() => {
                         const attached = attachedImages.get(msg.id);
@@ -2227,42 +3108,12 @@ export function ChatScreen() {
                                 key={i}
                                 src={img.src}
                                 alt={img.alt}
-                                className="rounded-lg max-w-full h-auto"
+                                className="h-auto max-h-96 w-auto max-w-[min(100%,28rem)] cursor-zoom-in rounded-lg"
                               />
                             ))}
                           </div>
                         ) : null;
                       })()}
-                      {msg.role === "user" && msg.attachments && msg.attachments.length > 0 && (
-                        <div className="flex flex-wrap gap-2 mb-2 justify-end">
-                          {msg.attachments.map((att, i) =>
-                            att.isImage && att.previewUrl ? (
-                              <button
-                                key={i}
-                                type="button"
-                                onClick={() => setLightboxSrc(att.previewUrl!)}
-                                className="block cursor-zoom-in"
-                                aria-label={`Preview ${att.name}`}
-                              >
-                                {/* eslint-disable-next-line @next/next/no-img-element */}
-                                <img
-                                  src={att.previewUrl}
-                                  alt={att.name}
-                                  className="rounded-lg max-h-48 max-w-[12rem] w-auto h-auto object-cover"
-                                />
-                              </button>
-                            ) : (
-                              <div
-                                key={i}
-                                className="flex items-center gap-2 rounded-md bg-sidebar-foreground/10 px-2 py-1.5 text-xs"
-                              >
-                                <Paperclip className="h-3 w-3 opacity-70" />
-                                <span className="truncate">{att.name}</span>
-                              </div>
-                            ),
-                          )}
-                        </div>
-                      )}
                       {msg.content && (
                         renderContentWithDataImages(
                           msg.content,
@@ -2272,6 +3123,7 @@ export function ChatScreen() {
                           sessionId,
                           msg.metadata?.knowledgeSources,
                           openKnowledgeCitation,
+                          openWorkspaceFile,
                         ) ?? (
                           <ChatMarkdown
                             text={msg.content}
@@ -2279,23 +3131,35 @@ export function ChatScreen() {
                             sessionId={sessionId}
                             knowledgeSources={msg.metadata?.knowledgeSources}
                             onKnowledgeCitationClick={openKnowledgeCitation}
+                            onWorkspaceFileClick={openWorkspaceFile}
                           />
                         )
                       )}
                       {msg.role === "agent" && msg.metadata?.iterationCapReached && (
                         <div className="mt-2 flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-900 dark:text-amber-200">
-                          <span className="font-medium">Iteration limit reached</span>
-                          <span className="opacity-80">
-                            Agent hit the {msg.metadata.iterationCapValue ?? ""} tool-call budget before finishing. The answer above was synthesized from partial results — fields may be marked unknown / partial. Continue the conversation to push further.
-                          </span>
+                          {msg.metadata.iterationStopReason === "loop" ? (
+                            <>
+                              <span className="font-medium">{tr("Stopped: no progress", "已停止：没有进展")}</span>
+                              <span className="opacity-80">
+                                {tr("The agent kept repeating the same step with the same result, so the turn was stopped. The answer above may be incomplete. Continue the conversation to check again.", "Agent 反复执行同一步骤且结果没有变化，本轮已停止。上方回答可能不完整；可继续对话让它再检查一次。")}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <span className="font-medium">{tr("Iteration limit reached", "已达到迭代上限")}</span>
+                              <span className="opacity-80">
+                                {tr("The agent reached its {{count}} tool-call budget before finishing. The answer above was synthesized from partial results, so some fields may be marked unknown or partial. Continue the conversation to go further.", "Agent 在完成任务前已用完 {{count}} 次工具调用预算。上方回答基于部分结果整理，某些字段可能标记为未知或不完整；可继续对话以进一步处理。", { count: msg.metadata.iterationCapValue ?? "" })}
+                              </span>
+                            </>
+                          )}
                         </div>
                       )}
                       {msg.role === "agent" && msg.metadata?.planMode && (
                         <div className="mt-2 flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-900 dark:text-amber-200">
                           <ListChecks className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                          <span className="font-medium">Plan only — review before executing.</span>
+                          <span className="font-medium">{tr("Plan only — review before executing.", "仅生成计划——请确认后再执行。")}</span>
                           <span className="opacity-80">
-                            Tools were disabled for this turn. Reply with &quot;go&quot; (or edits) to run it.
+                            {tr('Tools were disabled for this turn. Reply with "go" or your edits to run it.', "本轮未启用工具。回复“go”或提出修改后即可执行。")}
                           </span>
                         </div>
                       )}
@@ -2308,7 +3172,7 @@ export function ChatScreen() {
                             className="h-8 gap-1.5"
                           >
                             <Check className="h-3.5 w-3.5" />
-                            Run plan
+                            {tr("Run plan", "执行计划")}
                           </Button>
                           <Button
                             size="sm"
@@ -2326,20 +3190,22 @@ export function ChatScreen() {
                             className="h-8 gap-1.5"
                           >
                             <X className="h-3.5 w-3.5" />
-                            Edit
+                            {tr("Edit", "修改")}
                           </Button>
                           <span className="text-xs text-muted-foreground">
-                            Run plan to authorize the agent end-to-end, or Edit to revise below.
+                            {tr("Run the plan to authorize the agent to complete it end to end, or choose Edit to revise it below.", "选择“执行计划”可授权 Agent 完整执行；选择“修改”可在下方调整计划。")}
                           </span>
                         </div>
                       )}
                     </div>
-                    {msg.files && msg.files.length > 0 && (
-                      <FilesPanel files={msg.files} onOpen={() => setFilesSheetOpen(true)} />
-                    )}
+                    {opts.actions !== false && (
                     <div
-                      className={`flex items-center gap-1.5 mt-1 ${
-                        msg.role === "user" ? "justify-end" : "justify-start"
+                      className={`flex items-center gap-1.5 ${
+                        msg.role === "user"
+                          ? "mt-1 justify-end"
+                          // Only a turn's last reply gets this bar (see
+                          // turnEndIds); it reveals on hover in its own line.
+                          : "mt-1 h-5 justify-start opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
                       }`}
                     >
                       {msg.role === "user" ? (
@@ -2350,9 +3216,9 @@ export function ChatScreen() {
                             </span>
                           )}
                           <button
-                            onClick={() => handleCopy(msg)}
+                            onClick={() => handleCopy(copyMsg)}
                             className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-muted text-muted-foreground/60 hover:text-muted-foreground transition-all"
-                            title="Copy"
+                            title={tr("Copy", "复制")}
                           >
                             {copiedId === msg.id ? (
                               <Check className="h-3 w-3 text-emerald-500" />
@@ -2363,7 +3229,7 @@ export function ChatScreen() {
                           <button
                             onClick={() => handleRetry(msg)}
                             className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-muted text-muted-foreground/60 hover:text-muted-foreground transition-all"
-                            title="Resend (refills the composer)"
+                            title={tr("Resend (refills the composer)", "重新发送（填回输入框）")}
                           >
                             <RotateCcw className="h-3 w-3" />
                           </button>
@@ -2376,9 +3242,9 @@ export function ChatScreen() {
                             </span>
                           )}
                           <button
-                            onClick={() => handleCopy(msg)}
+                            onClick={() => handleCopy(copyMsg)}
                             className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-muted text-muted-foreground/60 hover:text-muted-foreground transition-all"
-                            title="Copy"
+                            title={tr("Copy", "复制")}
                           >
                             {copiedId === msg.id ? (
                               <Check className="h-3 w-3 text-emerald-500" />
@@ -2387,51 +3253,76 @@ export function ChatScreen() {
                             )}
                           </button>
                           <button
-                            onClick={() => setFilesSheetOpen(true)}
+                            onClick={openChatFiles}
                             className="opacity-0 group-hover:opacity-100 inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-muted text-[10px] text-muted-foreground/60 hover:text-muted-foreground transition-all"
-                            title="View task files"
+                            title={tr("View task files", "查看任务文件")}
                           >
                             <FolderOpen className="h-3 w-3" />
-                            <span>Files</span>
+                            <span>{tr("Files", "文件")}</span>
                           </button>
                         </>
                       )}
                     </div>
+                    )}
                   </div>
                 </div>
               );
               }
             })()}
 
-            {sending && (
+            {!isConversationLoading && sending && (
               <div className="flex justify-start">
                 <div className="bg-muted rounded-2xl rounded-bl-md px-4 py-3">
                   <div className="flex items-center gap-1">
                     <span className="typing-dot inline-block h-2 w-2 rounded-full bg-muted-foreground/60" style={{ animationDelay: "0ms" }} />
                     <span className="typing-dot inline-block h-2 w-2 rounded-full bg-muted-foreground/60" style={{ animationDelay: "200ms" }} />
                     <span className="typing-dot inline-block h-2 w-2 rounded-full bg-muted-foreground/60" style={{ animationDelay: "400ms" }} />
+                    {llmRetryStatus && (
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        {tr("Model request failed, retrying ({{attempt}}/{{max}})…", "模型请求失败，正在自动重试（{{attempt}}/{{max}}）…", { attempt: llmRetryStatus.attempt, max: llmRetryStatus.max })}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
             )}
 
-            <div ref={messagesEndRef} />
           </div>
         </div>
 
-        {/* Live progress panel: agent maintains a per-session `todo.md`
-            checklist and we render it here right above the composer so
-            the user's eye is on the next step they're about to authorize,
-            not buried at the top behind a long scroll history. Auto-
-            hides when the file doesn't exist or has no checkbox items. */}
-        {!isEmpty && todoItems.length > 0 && (
-          <TodoPanel items={todoItems} active={sending} />
+        {!isConversationLoading && !showEmptyHero && messageScrollState.overflow && (
+          <div className="pointer-events-none absolute right-3 top-1/2 z-20 flex -translate-y-1/2 flex-col gap-1.5">
+            <button
+              type="button"
+              onClick={() => scrollMessagesByPage(-1)}
+              disabled={!messageScrollState.canScrollUp}
+              className="pointer-events-auto flex size-9 items-center justify-center rounded-xl border border-black/[0.08] bg-background/95 text-muted-foreground shadow-[0_6px_20px_rgba(0,0,0,0.12)] backdrop-blur transition hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-35 dark:border-white/[0.1]"
+              aria-label={tr("Scroll up", "向上滚动")}
+              title={tr("Scroll up", "向上滚动")}
+            >
+              <ChevronUp className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => scrollMessagesByPage(1)}
+              disabled={!messageScrollState.canScrollDown}
+              className="pointer-events-auto flex size-9 items-center justify-center rounded-xl border border-black/[0.08] bg-background/95 text-muted-foreground shadow-[0_6px_20px_rgba(0,0,0,0.12)] backdrop-blur transition hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-35 dark:border-white/[0.1]"
+              aria-label={tr("Scroll down", "向下滚动")}
+              title={tr("Scroll down", "向下滚动")}
+            >
+              <ChevronDown className="size-4" />
+            </button>
+          </div>
         )}
 
-        {/* Input — right inset matches the messages' reserved scrollbar gutter
-            (6px) so the composer's edges line up with the message rows above. */}
-        <div className="shrink-0 pl-4 pr-[calc(1rem+6px)] pb-6 pt-2">
-          <div className="mx-auto max-w-2xl relative">
+        {/* Full-width conversation composer, matching the compact Bot layout. */}
+        <div
+          aria-hidden={isConversationLoading}
+          className={isConversationLoading ? "hidden" : "shrink-0 pb-5 pl-4 pr-[calc(1rem+var(--chat-scrollbar,0px))] pt-2"}
+        >
+          {/* Same column as the message list (px-4 + CHAT_COLUMN_MAX) so
+              the composer's edges line up with the messages above it. */}
+          <div className={`relative mx-auto w-full ${CHAT_COLUMN_MAX}`}>
             {isReadOnlyChannel && (
               // The web compose path can't deliver into upstream IM
               // platforms (no reverse channel adapter, no outbound
@@ -2443,14 +3334,13 @@ export function ChatScreen() {
               // Block the input outright and tell the user where to
               // reply.
               <div className="mb-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                This conversation lives on{" "}
+                {tr("This conversation is hosted on", "此对话来自")} {" "}
                 <span className="font-medium text-foreground">
                   {channelLabel(currentChannel)}
                 </span>
-                . Reply from there — slash commands like{" "}
-                <span className="font-mono text-foreground">/usage</span> can
-                run here, but normal messages typed here won&apos;t reach the user
-                on the other side.
+                {tr(". Reply there. Slash commands such as", "。请在该渠道中回复。这里仍可运行类似")} {" "}
+                <span className="font-mono text-foreground">/usage</span>{" "}
+                {tr("can run here, but normal messages typed here will not reach the user on the other side.", "的斜杠命令，但在此输入的普通消息不会发送给渠道另一端的用户。")}
               </div>
             )}
             {isActAsView && !isReadOnlyChannel && (
@@ -2459,8 +3349,7 @@ export function ChatScreen() {
               // read-only for the whole request, so any send would 403
               // — disable the composer and surface why.
               <div className="mb-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                Read-only — you&apos;re viewing another user&apos;s chat.
-                Sending messages here is disabled.
+                {tr("Read-only — you are viewing another user's chat. Sending messages here is disabled.", "只读模式——你正在查看其他用户的对话，无法在此发送消息。")}
               </div>
             )}
             {slashOpen && filteredItems.length > 0 && (
@@ -2471,14 +3360,9 @@ export function ChatScreen() {
                 onSelect={selectItem}
               />
             )}
-            <div
-              className={
-                "border border-border bg-card focus-within:ring-2 focus-within:ring-ring/20 transition-shadow " +
-                (isEmpty ? "rounded-2xl px-5 pt-4 pb-3" : "rounded-xl px-4 py-3")
-              }
-            >
+            <div className="rounded-[22px] border border-black/10 bg-card p-1.5 shadow-[0_8px_28px_rgba(0,0,0,0.055)] transition-shadow focus-within:border-black/15 focus-within:ring-2 focus-within:ring-black/5 dark:border-white/10 dark:focus-within:border-white/16 dark:focus-within:ring-white/5">
               {attachments.length > 0 && (
-                <div className="flex flex-wrap gap-2 mb-2 pb-2 border-b border-border/60">
+                <div className="mx-1 mb-2 flex flex-wrap gap-2 border-b border-border/60 px-1 pb-2 pt-1">
                   {attachments.map((f, i) => {
                     const preview = attachmentPreviews[i];
                     if (preview) {
@@ -2491,7 +3375,7 @@ export function ChatScreen() {
                             type="button"
                             onClick={() => setLightboxSrc(preview)}
                             className="block h-full w-full cursor-zoom-in"
-                            aria-label={`Preview ${f.name}`}
+                            aria-label={tr("Preview {{name}}", "预览 {{name}}", { name: f.name })}
                           >
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img
@@ -2504,7 +3388,7 @@ export function ChatScreen() {
                             type="button"
                             onClick={() => removeAttachment(i)}
                             className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-background/80 text-muted-foreground opacity-0 transition group-hover:opacity-100 hover:text-foreground"
-                            aria-label="Remove attachment"
+                            aria-label={tr("Remove attachment", "移除附件")}
                           >
                             <X className="h-3 w-3" />
                           </button>
@@ -2522,7 +3406,7 @@ export function ChatScreen() {
                           type="button"
                           onClick={() => removeAttachment(i)}
                           className="p-0.5 rounded hover:bg-muted-foreground/15 text-muted-foreground hover:text-foreground"
-                          aria-label="Remove attachment"
+                          aria-label={tr("Remove attachment", "移除附件")}
                         >
                           <X className="h-3 w-3" />
                         </button>
@@ -2531,156 +3415,119 @@ export function ChatScreen() {
                   })}
                 </div>
               )}
-              {/* Empty-state composer: Manus-style — textarea fills the
-                  top, action row sits below it. Once messages exist we
-                  swing back to the compact single-row layout so the
-                  composer doesn't dominate the chat. */}
-              {isEmpty ? (
-                <>
-                  <textarea
-                    ref={textareaRef}
-                    value={input}
-                    onChange={handleInputChange}
-                    onPaste={handlePaste}
-                    onKeyDown={handleKeyDown}
-                    onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
-                    placeholder={
-                      isActAsView
-                        ? "Read-only — viewing another user's chat"
-                        : isReadOnlyChannel
-                          ? `Slash commands only — reply from ${channelLabel(currentChannel)}`
-                          : selectedAgent
-                            ? `Message ${agentName || selectedAgent}... ("/" to pick a skill)`
-                            : "Select an agent first"
-                    }
+              <div className="flex items-end gap-2">
+                <DropdownMenu>
+                  <DropdownMenuTrigger
                     disabled={!canUseComposer}
-                    rows={3}
-                    className="block w-full resize-none bg-transparent text-[15px] placeholder:text-muted-foreground/50 outline-none disabled:opacity-50"
-                    style={{ maxHeight: 240, minHeight: 72 }}
+                    render={
+                      <button
+                        type="button"
+                        className="flex size-8 shrink-0 items-center justify-center rounded-full border border-border/80 bg-muted/35 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45"
+                        aria-label={t("composer.moreOptions")}
+                        title={t("composer.moreOptions")}
+                      >
+                        <Plus className="size-[17px]" />
+                      </button>
+                    }
                   />
-                  <div className="mt-2 flex items-center justify-between">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <label
-                        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors ${
-                          !canAttach
-                            ? "opacity-50 cursor-not-allowed"
-                            : "hover:bg-muted hover:text-foreground cursor-pointer"
-                        }`}
-                        aria-label="Attach files"
-                      >
-                        <Paperclip className="h-4 w-4" />
-                        <input
-                          ref={fileInputRef}
-                          type="file"
-                          multiple
-                          className="sr-only"
-                          onChange={handleFilePick}
-                          disabled={!canAttach}
-                        />
-                      </label>
-                      {urlProjectId && projectInfo && (
-                        <div
-                          className="flex h-9 min-w-0 items-center gap-1.5 rounded-full border border-border px-3 text-xs text-muted-foreground"
-                          title={projectInfo.name}
-                        >
-                          <FolderOpen className="size-3.5 shrink-0" />
-                          <span className="truncate max-w-[20ch]">
-                            {projectInfo.name}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                    {sending ? (
-                      <Button
-                        onClick={handleStop}
-                        size="icon"
-                        className="h-9 w-9 shrink-0 rounded-full"
-                        aria-label="Stop generating"
-                      >
-                        <Square className="h-3.5 w-3.5 fill-current" />
-                      </Button>
-                    ) : (
-                      <Button
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          handleSend();
-                        }}
-                        disabled={(!input.trim() && attachments.length === 0) || !canSendComposer}
-                        size="icon"
-                        className="h-9 w-9 shrink-0 rounded-full"
-                        aria-label="Send message"
-                      >
-                        <Send className="h-4 w-4" />
-                      </Button>
-                    )}
-                  </div>
-                </>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <label
-                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors ${
-                      !canAttach
-                        ? "opacity-50 cursor-not-allowed"
-                        : "hover:bg-muted hover:text-foreground cursor-pointer"
-                    }`}
-                    aria-label="Attach files"
+                  <DropdownMenuContent
+                    align="start"
+                    side="top"
+                    sideOffset={10}
+                    className="w-56 rounded-2xl p-1.5 shadow-xl"
                   >
-                    <Paperclip className="h-4 w-4" />
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      className="sr-only"
-                      onChange={handleFilePick}
+                    <DropdownMenuItem
                       disabled={!canAttach}
-                    />
-                  </label>
-                  <textarea
-                    ref={textareaRef}
-                    value={input}
-                    onChange={handleInputChange}
-                    onPaste={handlePaste}
-                    onKeyDown={handleKeyDown}
-                    onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
-                    placeholder={
-                      isActAsView
-                        ? "Read-only — viewing another user's chat"
-                        : isReadOnlyChannel
-                          ? `Slash commands only — reply from ${channelLabel(currentChannel)}`
-                          : selectedAgent
-                            ? `Message ${agentName || selectedAgent}... ("/" to pick a skill)`
-                            : "Select an agent first"
-                    }
-                    disabled={!canUseComposer}
-                    rows={1}
-                    className="flex-1 resize-none bg-transparent text-[15px] leading-8 placeholder:text-muted-foreground/50 outline-none disabled:opacity-50"
-                    style={{ maxHeight: 200, minHeight: 32 }}
-                  />
-                  {sending ? (
-                    <Button
-                      onClick={handleStop}
-                      size="icon"
-                      className="h-8 w-8 shrink-0 rounded-lg"
-                      aria-label="Stop generating"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="gap-2.5 rounded-xl px-3 py-2.5"
                     >
-                      <Square className="h-3.5 w-3.5 fill-current" />
-                    </Button>
-                  ) : (
-                    <Button
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        handleSend();
-                      }}
-                      disabled={(!input.trim() && attachments.length === 0) || !canSendComposer}
-                      size="icon"
-                      className="h-8 w-8 shrink-0 rounded-lg"
-                      aria-label="Send message"
-                    >
-                      <Send className="h-4 w-4" />
-                    </Button>
-                  )}
-                </div>
-              )}
+                      <Paperclip className="size-4 text-muted-foreground" />
+                      <span>{t("composer.addAttachment")}</span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="sr-only"
+                  onChange={handleFilePick}
+                  disabled={!canAttach}
+                />
+                {urlProjectId && projectInfo && (
+                  <div
+                    className="flex h-8 min-w-0 shrink-0 items-center gap-1.5 rounded-full border border-border px-2.5 text-xs text-muted-foreground"
+                    title={projectInfo.name}
+                  >
+                    <FolderOpen className="size-3.5 shrink-0" />
+                    <span className="max-w-[14ch] truncate">{projectInfo.name}</span>
+                  </div>
+                )}
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={handleInputChange}
+                  onPaste={handlePaste}
+                  onKeyDown={handleKeyDown}
+                  onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
+                  placeholder={
+                    isActAsView
+                      ? t("composer.readOnly")
+                      : isReadOnlyChannel
+                        ? t("composer.slashOnly", { channel: channelLabel(currentChannel) })
+                        : selectedAgent
+                          ? t("composer.message", { name: agentName || selectedAgent })
+                          : t("composer.selectAgent")
+                  }
+                  disabled={!canUseComposer}
+                  rows={1}
+                  className="block min-w-0 flex-1 resize-none bg-transparent px-1 py-1 text-[15px] leading-6 placeholder:text-muted-foreground/45 outline-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden disabled:opacity-50"
+                  style={{ maxHeight: 180, minHeight: 32 }}
+                />
+                {/* Send fires on mousedown, which flips `sending` before the
+                    mouseup. Separate keys keep React from reusing the Send
+                    <button> as Stop, and Stop only acts on a press that
+                    started on it (or a keyboard click, detail === 0) — so
+                    the click that finishes a Send press can't stop the run
+                    it just started. */}
+                {sending ? (
+                  <Button
+                    key="composer-stop"
+                    onPointerDown={() => {
+                      stopPressRef.current = true;
+                    }}
+                    onPointerLeave={() => {
+                      stopPressRef.current = false;
+                    }}
+                    onClick={(event) => {
+                      const pressed = stopPressRef.current || event.detail === 0;
+                      stopPressRef.current = false;
+                      if (pressed) handleStop();
+                    }}
+                    size="icon"
+                    className="size-8 shrink-0 rounded-full bg-[#111] text-white hover:bg-black disabled:bg-[#111] dark:bg-white dark:text-black dark:hover:bg-white/90"
+                    aria-label={t("composer.stop")}
+                  >
+                    <Square className="size-3 fill-current" />
+                  </Button>
+                ) : (
+                  // Always present so the composer reads as sendable; it
+                  // stays dimmed until there's something to send.
+                  <Button
+                    key="composer-send"
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      handleSend();
+                    }}
+                    disabled={!canSendComposer || !(input.trim() || attachments.length > 0)}
+                    size="icon"
+                    className="size-8 shrink-0 rounded-full bg-[#111] text-white hover:bg-black disabled:bg-black/15 disabled:text-white disabled:opacity-100 dark:bg-white dark:text-black dark:hover:bg-white/90 dark:disabled:bg-white/20 dark:disabled:text-black/60"
+                    aria-label={t("composer.send")}
+                  >
+                    <ArrowUp className="size-[17px] stroke-[2.25]" />
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -2690,12 +3537,12 @@ export function ChatScreen() {
             onClick={() => setLightboxSrc(null)}
             role="dialog"
             aria-modal="true"
-            aria-label="Image preview"
+            aria-label={tr("Image preview", "图片预览")}
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src={lightboxSrc}
-              alt="Preview"
+              alt={tr("Preview", "预览")}
               className="max-h-full max-w-full rounded-lg shadow-2xl"
               onClick={(e) => e.stopPropagation()}
             />
@@ -2703,28 +3550,102 @@ export function ChatScreen() {
               type="button"
               onClick={() => setLightboxSrc(null)}
               className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full bg-background/80 text-foreground hover:bg-background"
-              aria-label="Close preview"
+              aria-label={tr("Close preview", "关闭预览")}
             >
               <X className="h-5 w-5" />
             </button>
           </div>
         )}
       </div>
+      {navigationPanelOpen && selectedAgent && (
+        <BotControlPanel
+          agentId={selectedAgent}
+          filesOnly={isActAsView}
+          projects={projects}
+          activeProjectId={urlProjectId || null}
+          expandedProjectId={
+            urlProjectId
+              || sessions.find((topic) => topic.id === sessionId)?.projectId
+              || null
+          }
+          topics={sessions}
+          activeTopicId={sessionId}
+          agentRole={agentDetail?.role}
+          onOpenSettings={openBotSettings}
+          onOpenSettingsTab={openBotSettingsTab}
+          onOpenWorkspace={openWorkspaceFromBotPanel}
+          workspaceAvailable={Boolean(routeSessionId || urlProjectId)}
+          // Same scope as the WorkspacePanel below.
+          returnToFiles={botPanelReturnFiles}
+          filesRequest={botPanelFilesRequest}
+          filesSessionId={routeSessionId ? sessionId : ""}
+          filesProjectId={!routeSessionId && urlProjectId ? urlProjectId : undefined}
+          onSelectProject={(projectId) => {
+            router.push(`/agents/${selectedAgent}/project/${encodeURIComponent(projectId)}/`);
+          }}
+          onProjectsChanged={() => {
+            loadProjects(selectedAgent);
+            window.dispatchEvent(
+              new CustomEvent("fastclaw:sessions-changed", {
+                detail: { agentId: selectedAgent },
+              }),
+            );
+          }}
+          onSelectTopic={handleSelectSession}
+          onNewTopic={handleNewChat}
+          onTopicsChanged={() => {
+            loadSessions(selectedAgent);
+            window.dispatchEvent(
+              new CustomEvent("fastclaw:sessions-changed", {
+                detail: { agentId: selectedAgent },
+              }),
+            );
+          }}
+          onClose={() => {
+            setBotPanelReturnFiles(null);
+            if (isChatsPage) leaveChatsPage(false);
+            else setBotPanelOpen(false);
+          }}
+        />
+      )}
       {filesSheetOpen && selectedAgent && (sessionId || urlProjectId) && (
         <WorkspacePanel
+          key={`${workspaceAllFiles ? "all" : "scope"}-${workspaceFileNonce}`}
           agentId={selectedAgent}
-          // On a project landing (no urlSessionId), sessionId here is the
+          // On a project landing (no routeSessionId), sessionId here is the
           // synthetic id chat-screen mints for the upcoming "New chat" —
           // it doesn't correspond to anything on disk, so we suppress it
           // and let projectId drive the scope. Inside an actual chat,
-          // urlSessionId is set and we pass the real sessionId.
-          sessionId={urlSessionId ? sessionId : ""}
-          projectId={!urlSessionId && urlProjectId ? urlProjectId : undefined}
+          // routeSessionId is set and we pass the real sessionId. The
+          // agent-wide view passes neither.
+          sessionId={!workspaceAllFiles && routeSessionId ? sessionId : ""}
+          projectId={!workspaceAllFiles && !routeSessionId && urlProjectId ? urlProjectId : undefined}
+          allFiles={workspaceAllFiles}
+          initialPreview={workspaceInitialFile}
           knowledgePreview={knowledgePreview}
           onClearKnowledgePreview={() => setKnowledgePreview(null)}
+          onPreviewStateChange={handleWorkspacePreviewChange}
+          onAsk={handleDesignAsk}
+          reloadNonce={turnNonce}
+          onBack={
+            workspaceReturnsToBotPanel
+              ? () => {
+                  setBotPanelReturnFiles(workspaceAllFiles ? "all" : "chat");
+                  setFilesSheetOpen(false);
+                  setKnowledgePreview(null);
+                  setWorkspaceInitialFile(null);
+                  setWorkspaceAllFiles(false);
+                  setWorkspaceReturnsToBotPanel(false);
+                  setBotPanelOpen(true);
+                }
+              : undefined
+          }
           onClose={() => {
             setFilesSheetOpen(false);
             setKnowledgePreview(null);
+            setWorkspaceInitialFile(null);
+            setWorkspaceAllFiles(false);
+            setWorkspaceReturnsToBotPanel(false);
           }}
         />
       )}
@@ -2732,81 +3653,1467 @@ export function ChatScreen() {
   );
 }
 
-interface ChatHeaderTitleProps {
-  title: string;
-  fallback: string;
-  onSave: (next: string) => void | Promise<void>;
-}
+const BOT_PANEL_MIN_WIDTH = 300;
+const BOT_PANEL_DEFAULT_WIDTH = 400;
+const BOT_PANEL_MAX_WIDTH = 520;
+const CHAT_PANE_MIN_WIDTH = 520;
+const BOT_PANEL_WIDTH_KEY = "fastclaw:bot-panel-width";
 
-/** Editable chat title rendered into the global sticky header via
- *  usePageHeader. Click / focus to edit; Enter or blur commits. */
-function ChatHeaderTitle({ title, fallback, onSave }: ChatHeaderTitleProps) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(title);
-  const inputRef = useRef<HTMLInputElement>(null);
+function ShareAgentMenu({
+  agentId,
+  sessionId,
+  agentName,
+  isPublic,
+  canChangeVisibility,
+  onPublicChange,
+}: {
+  agentId: string;
+  // The session whose link "Copy link" copies.
+  sessionId: string;
+  agentName: string;
+  isPublic: boolean;
+  canChangeVisibility: boolean;
+  onPublicChange: (isPublic: boolean) => void;
+}) {
+  const { tr } = useLocale();
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!editing) setDraft(title);
-  }, [title, editing]);
+    if (!open) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
 
-  useEffect(() => {
-    if (editing) inputRef.current?.select();
-  }, [editing]);
-
-  const commit = () => {
-    setEditing(false);
-    const next = draft.trim();
-    if (!next || next === title) return;
-    onSave(next);
+  const copyLink = async () => {
+    const url = `${window.location.origin}${chatHref(sessionId)}`;
+    let copiedToClipboard = false;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(url);
+        copiedToClipboard = true;
+      } catch {
+        // Clipboard API is commonly blocked on HTTP/self-signed installs.
+        // Fall through to the selection-based copy path below.
+      }
+    }
+    if (!copiedToClipboard) {
+      const input = document.createElement("textarea");
+      input.value = url;
+      input.setAttribute("readonly", "");
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      document.body.appendChild(input);
+      input.select();
+      copiedToClipboard = document.execCommand("copy");
+      input.remove();
+    }
+    if (!copiedToClipboard) {
+      throw new Error(tr("Could not copy the link", "无法复制链接，请检查浏览器权限"));
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
   };
 
-  if (editing) {
-    // field-sizing: content grows the input to match its text; min width
-    // keeps it reasonable right after entering edit mode even if the
-    // current title is very short.
-    return (
-      <input
-        ref={inputRef}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          // Ignore Enter while the user is mid-composition (CJK IME). Both
-          // conditions matter: isComposing is the modern signal, keyCode 229
-          // is the legacy flag some browsers (and macOS Pinyin in particular)
-          // still emit without isComposing set.
-          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commit();
-          } else if (e.key === "Escape") {
-            setDraft(title);
-            setEditing(false);
-          }
+  const changeVisibility = async (nextPublic: boolean, copyAfter = false) => {
+    if (busy) return;
+    if (nextPublic !== isPublic && !canChangeVisibility) return;
+    setBusy(true);
+    setError("");
+    setCopied(false);
+    try {
+      if (nextPublic !== isPublic) {
+        const response = await updateAgent(agentId, { isPublic: nextPublic });
+        if (response?.ok === false || response?.error) {
+          throw new Error(response?.error || tr("Could not update sharing", "无法更新分享设置"));
+        }
+        onPublicChange(nextPublic);
+      }
+      if (copyAfter) await copyLink();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : tr("Could not update sharing", "无法更新分享设置"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const triggerLabel = tr("Share {{agent}}", "分享 {{agent}}", { agent: agentName });
+
+  return (
+    <div ref={rootRef} className="relative shrink-0">
+      <button
+        type="button"
+        onClick={() => {
+          setOpen((current) => !current);
+          setError("");
+          setCopied(false);
         }}
-        onBlur={commit}
-        style={{ fieldSizing: "content" } as React.CSSProperties}
-        className="h-7 min-w-[8ch] max-w-[40ch] rounded-md bg-transparent px-2 text-sm outline-none ring-1 ring-border focus:ring-primary/40"
+        className={`inline-flex size-9 items-center justify-center rounded-lg transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
+          open
+            ? "bg-muted text-foreground"
+            : "text-muted-foreground hover:bg-muted/70 hover:text-foreground"
+        }`}
+        title={triggerLabel}
+        aria-label={triggerLabel}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+      >
+        <Share2 className="size-[17px]" />
+      </button>
+
+      {open && (
+        <div
+          role="dialog"
+          aria-label={triggerLabel}
+          className="absolute right-0 top-full z-50 mt-1.5 w-[min(320px,calc(100vw-24px))] rounded-xl border border-border bg-popover p-1.5 text-popover-foreground shadow-lg ring-1 ring-foreground/5"
+        >
+          <button
+            type="button"
+            disabled={busy || (!canChangeVisibility && isPublic)}
+            onClick={() => void changeVisibility(false)}
+            className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none disabled:cursor-default disabled:opacity-60"
+          >
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground">
+              <LockKeyhole className="size-[18px] stroke-[1.8]" />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-medium">{tr("Only me", "仅自己")}</span>
+              <span className="block truncate text-xs text-muted-foreground">{tr("Only you can view", "只有你自己可以查看")}</span>
+            </span>
+            {!isPublic && <Check className="size-4 shrink-0" />}
+          </button>
+
+          <button
+            type="button"
+            disabled={busy || !canChangeVisibility}
+            onClick={() => void changeVisibility(true)}
+            className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none disabled:cursor-default disabled:opacity-60"
+          >
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground">
+              <Globe2 className="size-[18px] stroke-[1.8]" />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-medium">{tr("Public access", "公开访问")}</span>
+              <span className="block truncate text-xs text-muted-foreground">{tr("Anyone with the link can view", "任何拿到链接的人都可以查看")}</span>
+            </span>
+            {busy && !isPublic ? (
+              <RefreshCw className="size-4 shrink-0 animate-spin" />
+            ) : isPublic ? (
+              <Check className="size-4 shrink-0" />
+            ) : null}
+          </button>
+
+          {error && <p role="alert" className="px-2 pb-1 pt-1 text-xs text-destructive">{error}</p>}
+
+          {isPublic && (
+            <Button
+              type="button"
+              disabled={busy}
+              onClick={() => void changeVisibility(true, true)}
+              className="mt-1 w-full"
+              aria-live="polite"
+            >
+              {busy ? (
+                <RefreshCw className="size-4 animate-spin" />
+              ) : copied ? (
+                <Check className="size-4" />
+              ) : (
+                <Link2 className="size-4" />
+              )}
+              {busy
+                ? tr("Copying…", "正在复制…")
+                : copied
+                  ? tr("Link copied", "链接已复制")
+                  : tr("Copy link", "复制链接")}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const BOT_QUICK_ACTIONS: Array<{
+  id: string;
+  labelKey: MessageKey;
+  icon: typeof Brain;
+  tab?: AgentSettingsTab;
+  userOnly?: boolean;
+  ownerOnly?: boolean;
+  action?: "settings";
+}> = [
+  { id: "profile", tab: "profile", labelKey: "settings.tab.profile", icon: IdCard, ownerOnly: true },
+  { id: "models", tab: "models", labelKey: "settings.tab.models", icon: Brain },
+  { id: "customize", tab: "customize", labelKey: "settings.tab.customize", icon: Wand2, ownerOnly: true },
+  { id: "skills", tab: "skills", labelKey: "settings.tab.skills", icon: Sparkles, ownerOnly: true },
+  { id: "channels", tab: "channels", labelKey: "settings.tab.channels", icon: Radio },
+  { id: "scheduler", tab: "scheduler", labelKey: "settings.tab.scheduler", icon: Clock, ownerOnly: true },
+  { id: "settings", labelKey: "sidebar.moreSettings", icon: Settings, action: "settings" },
+];
+
+// Recent chats shown before "Load more", and how many each click adds.
+const TOPIC_PAGE_SIZE = 20;
+
+const BOT_PANEL_ICON_BUTTON =
+  "flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition hover:bg-black/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring dark:hover:bg-white/8";
+
+const BOT_PANEL_CARD_BG = (active: boolean) =>
+  active
+    ? "bg-black/[0.065] dark:bg-white/[0.11]"
+    : "hover:bg-black/[0.04] dark:hover:bg-white/[0.07]";
+
+// BotPanelListHeader sits above a panel list: the count on the left and
+// the list's create action on the right.
+function BotPanelListHeader({
+  label,
+  actionLabel,
+  shortcut,
+  icon: Icon,
+  onAction,
+}: {
+  label: string;
+  // The action button is optional; a plain section title omits it.
+  actionLabel?: string;
+  shortcut?: string;
+  icon?: typeof Wrench;
+  onAction?: () => void;
+}) {
+  return (
+    <div className="mb-1 flex h-8 items-center justify-between pl-3 pr-1.5">
+      <span className="text-[13px] text-muted-foreground">{label}</span>
+      {onAction && Icon && (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              onClick={onAction}
+              className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition hover:bg-black/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring dark:hover:bg-white/8"
+              aria-label={actionLabel}
+            >
+              <Icon className="size-4" />
+            </button>
+          }
+        />
+        <TooltipContent side="left">
+          <span>{actionLabel}</span>
+          {shortcut && <kbd data-slot="kbd" className="bg-background/15 px-1.5 py-0.5 text-[10px]">{shortcut}</kbd>}
+        </TooltipContent>
+      </Tooltip>
+      )}
+    </div>
+  );
+}
+
+function BotControlPanel({
+  agentId,
+  filesOnly = false,
+  projects,
+  activeProjectId,
+  expandedProjectId,
+  topics,
+  activeTopicId,
+  agentRole,
+  onOpenSettings,
+  onOpenSettingsTab,
+  onOpenWorkspace,
+  workspaceAvailable,
+  returnToFiles,
+  filesRequest = 0,
+  filesSessionId,
+  filesProjectId,
+  onSelectProject,
+  onProjectsChanged,
+  onSelectTopic,
+  onNewTopic,
+  onTopicsChanged,
+  onClose,
+}: {
+  agentId: string;
+  projects: ProjectEntry[];
+  activeProjectId: string | null;
+  expandedProjectId: string | null;
+  topics: ChatSession[];
+  activeTopicId: string;
+  agentRole?: "owner" | "viewer";
+  onOpenSettings: () => void;
+  onOpenSettingsTab: (tab: AgentSettingsTab, userOnly?: boolean) => void;
+  onOpenWorkspace: (file?: ProducedFile, allFiles?: boolean) => void;
+  workspaceAvailable: boolean;
+  // Set when the workspace's back button reopens the panel: start on the
+  // Files tab, in the view the user left from.
+  returnToFiles?: "chat" | "all" | null;
+  filesRequest?: number;
+  // Files tab scope — one of them is set once the conversation exists.
+  filesSessionId: string;
+  filesProjectId?: string;
+  onSelectProject: (projectId: string) => void;
+  onProjectsChanged: () => void;
+  onSelectTopic: (sessionId: string) => void;
+  onNewTopic: () => void;
+  onTopicsChanged: () => void;
+  onClose: () => void;
+  // Viewing another user's conversation (?actAs=): only this chat's files
+  // apply, so the panel shows the Files tab alone.
+  filesOnly?: boolean;
+}) {
+  const { t, tr } = useLocale();
+  const [panelTab, setPanelTab] = useState<"chats" | "projects" | "files" | "agent">(
+    () => (filesOnly || returnToFiles ? "files" : activeProjectId ? "projects" : "chats"),
+  );
+  const [scopeFiles, setScopeFiles] = useState<{ key: string; files: WorkspaceFile[] } | null>(null);
+  // Files tab: this conversation, or the whole agent workspace. "all" is
+  // owner-only — the backend lists nothing unscoped for anyone else.
+  const [filesView, setFilesView] = useState<"chat" | "all">(returnToFiles ?? "chat");
+  // A "show this chat's files" request can arrive while the panel is
+  // already open ("Open files" under a reply). Each request bumps a
+  // counter; adopt it during render instead of in an effect.
+  const [seenFilesRequest, setSeenFilesRequest] = useState(filesRequest);
+  if (filesRequest !== seenFilesRequest) {
+    setSeenFilesRequest(filesRequest);
+    setPanelTab("files");
+    setFilesView("chat");
+  }
+  const canViewAllFiles = agentRole === "owner";
+  const showAllFiles = filesView === "all" && canViewAllFiles;
+  const [visibleTopicCount, setVisibleTopicCount] = useState(TOPIC_PAGE_SIZE);
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
+    () => new Set(expandedProjectId ? [expandedProjectId] : []),
+  );
+  const [createProjectOpen, setCreateProjectOpen] = useState(false);
+  const [editProject, setEditProject] = useState<ProjectEntry | null>(null);
+  const [deleteProjectTarget, setDeleteProjectTarget] = useState<ProjectEntry | null>(null);
+  const [editTopic, setEditTopic] = useState<ChatSession | null>(null);
+  const [deleteTopic, setDeleteTopic] = useState<ChatSession | null>(null);
+  const [panelWidth, setPanelWidth] = useState(() => {
+    if (typeof window === "undefined") return BOT_PANEL_DEFAULT_WIDTH;
+    const stored = Number(window.localStorage.getItem(BOT_PANEL_WIDTH_KEY));
+    return Number.isFinite(stored) && stored >= BOT_PANEL_MIN_WIDTH && stored <= BOT_PANEL_MAX_WIDTH
+      ? stored
+      : BOT_PANEL_DEFAULT_WIDTH;
+  });
+  const [resizing, setResizing] = useState(false);
+  const panelRef = useRef<HTMLElement>(null);
+  const resizeStartRef = useRef({ x: 0, width: BOT_PANEL_DEFAULT_WIDTH });
+  const latestPanelWidthRef = useRef(panelWidth);
+
+  const clampPanelWidth = useCallback((candidate: number) => {
+    const containerWidth = panelRef.current?.parentElement?.getBoundingClientRect().width
+      || window.innerWidth;
+    const responsiveMax = Math.max(
+      BOT_PANEL_MIN_WIDTH,
+      containerWidth - CHAT_PANE_MIN_WIDTH,
+    );
+    return Math.round(
+      Math.max(
+        BOT_PANEL_MIN_WIDTH,
+        Math.min(BOT_PANEL_MAX_WIDTH, responsiveMax, candidate),
+      ),
+    );
+  }, []);
+
+  const commitPanelWidth = useCallback((width: number) => {
+    const next = clampPanelWidth(width);
+    latestPanelWidthRef.current = next;
+    setPanelWidth(next);
+    try {
+      window.localStorage.setItem(BOT_PANEL_WIDTH_KEY, String(next));
+    } catch {
+      // Ignore private-mode and quota failures.
+    }
+  }, [clampPanelWidth]);
+
+  useEffect(() => {
+    if (!resizing) return;
+    const handleMove = (event: PointerEvent) => {
+      const next = clampPanelWidth(
+        resizeStartRef.current.width + resizeStartRef.current.x - event.clientX,
+      );
+      latestPanelWidthRef.current = next;
+      setPanelWidth(next);
+    };
+    const handleUp = () => {
+      setResizing(false);
+      try {
+        window.localStorage.setItem(
+          BOT_PANEL_WIDTH_KEY,
+          String(latestPanelWidthRef.current),
+        );
+      } catch {
+        // Ignore private-mode and quota failures.
+      }
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [clampPanelWidth, resizing]);
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (
+        (event.metaKey || event.ctrlKey)
+        && event.key.toLowerCase() === "n"
+        && !filesOnly
+        && !createProjectOpen
+        && !editProject
+        && !editTopic
+        && !deleteTopic
+      ) {
+        event.preventDefault();
+        onNewTopic();
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [createProjectOpen, deleteTopic, editProject, editTopic, filesOnly, onNewTopic]);
+
+  useEffect(() => {
+    if (!expandedProjectId) return;
+    setExpandedProjects((current) => {
+      if (current.has(expandedProjectId)) return current;
+      const next = new Set(current);
+      next.add(expandedProjectId);
+      return next;
+    });
+  }, [expandedProjectId]);
+
+  // The Files tab lists the current conversation's (or project landing's)
+  // workspace, or the whole agent's, fetched each time the tab is shown or
+  // the scope changes. Results are keyed by scope; a stale key reads as
+  // loading.
+  const filesScopeKey = showAllFiles
+    ? "all"
+    : filesProjectId ? `p:${filesProjectId}` : filesSessionId ? `s:${filesSessionId}` : "";
+  // A finished turn reloads the topic list with a new updatedAt; refetch
+  // then so uploads and files the agent wrote show up without reopening.
+  const activeTopicStamp = topics.find((topic) => topic.id === activeTopicId)?.updatedAt ?? 0;
+  useEffect(() => {
+    if (panelTab !== "files" || !filesScopeKey) return;
+    let cancelled = false;
+    (showAllFiles
+      ? listAgentFiles(agentId)
+      : filesProjectId
+        ? listAgentFiles(agentId, undefined, filesProjectId)
+        : listAgentFiles(agentId, filesSessionId))
+      .catch(() => [] as WorkspaceFile[])
+      .then((list) => {
+        if (!cancelled) {
+          setScopeFiles({ key: filesScopeKey, files: list.filter((f) => !isSystemFile(f.path)) });
+        }
+      });
+    // No clearing on cleanup: results are keyed by scope, so a refetch of
+    // the same scope keeps the current tree instead of flashing a spinner.
+    return () => {
+      cancelled = true;
+    };
+  }, [panelTab, agentId, filesScopeKey, showAllFiles, filesSessionId, filesProjectId, activeTopicStamp]);
+  const visibleScopeFiles = scopeFiles?.key === filesScopeKey ? scopeFiles.files : null;
+
+  // The Files tab label carries the current session's (or project
+  // landing's) file count, fetched whichever tab is open.
+  const sessionFilesKey = filesProjectId ? `p:${filesProjectId}` : filesSessionId ? `s:${filesSessionId}` : "";
+  const [sessionFileCount, setSessionFileCount] = useState<{ key: string; count: number } | null>(null);
+  useEffect(() => {
+    if (!sessionFilesKey) return;
+    let cancelled = false;
+    (filesProjectId
+      ? listAgentFiles(agentId, undefined, filesProjectId)
+      : listAgentFiles(agentId, filesSessionId))
+      .catch(() => [] as WorkspaceFile[])
+      .then((list) => {
+        if (!cancelled) {
+          setSessionFileCount({
+            key: sessionFilesKey,
+            count: list.filter((f) => !isSystemFile(f.path)).length,
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, sessionFilesKey, filesSessionId, filesProjectId, activeTopicStamp]);
+  const filesTabCount = sessionFileCount?.key === sessionFilesKey ? sessionFileCount.count : 0;
+
+  const sortedTopics = useMemo(
+    () => [...topics].sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0)),
+    [topics],
+  );
+  const looseTopics = sortedTopics.filter((topic) => !topic.projectId);
+  const visibleRecentTopics = looseTopics.slice(0, visibleTopicCount);
+  const hiddenTopicCount = Math.max(0, looseTopics.length - visibleRecentTopics.length);
+  const topicsByProject = useMemo(() => {
+    const grouped = new Map<string, ChatSession[]>();
+    for (const topic of sortedTopics) {
+      if (!topic.projectId) continue;
+      const projectTopics = grouped.get(topic.projectId) || [];
+      projectTopics.push(topic);
+      grouped.set(topic.projectId, projectTopics);
+    }
+    return grouped;
+  }, [sortedTopics]);
+
+  // Clicking a project folder only expands / collapses it; starting a
+  // chat in it is the pen button on the row.
+  const toggleProject = (projectId: string) => {
+    setExpandedProjects((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        className="fixed inset-0 z-40 bg-black/20 xl:hidden"
+        onClick={onClose}
+        aria-label={tr("Close Agent panel", "关闭 Agent 侧栏")}
+      />
+      <aside
+        ref={panelRef}
+        data-resizable-right-panel="true"
+        style={{ "--bot-panel-width": `${panelWidth}px` } as React.CSSProperties}
+        className="fixed inset-y-0 right-0 z-50 flex h-dvh w-[min(94vw,420px)] shrink-0 flex-col border-l border-border bg-background shadow-2xl xl:relative xl:z-30 xl:-mt-14 xl:h-screen xl:w-[var(--bot-panel-width)] xl:min-w-[300px] xl:max-w-[calc(100%_-_520px)] xl:shadow-none"
+      >
+        <button
+          type="button"
+          className={`absolute inset-y-0 left-0 z-40 hidden w-3 -translate-x-1/2 cursor-col-resize touch-none outline-none after:absolute after:inset-y-0 after:left-1/2 after:w-px after:transition-colors hover:after:bg-foreground/25 focus-visible:after:bg-ring xl:block ${
+            resizing ? "after:bg-ring" : "after:bg-transparent"
+          }`}
+          onPointerDown={(event) => {
+            event.preventDefault();
+            resizeStartRef.current = {
+              x: event.clientX,
+              width: panelRef.current?.getBoundingClientRect().width || panelWidth,
+            };
+            latestPanelWidthRef.current = resizeStartRef.current.width;
+            setResizing(true);
+          }}
+          onDoubleClick={() => commitPanelWidth(BOT_PANEL_DEFAULT_WIDTH)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              commitPanelWidth(panelWidth + 16);
+            } else if (event.key === "ArrowRight") {
+              event.preventDefault();
+              commitPanelWidth(panelWidth - 16);
+            } else if (event.key === "Home") {
+              event.preventDefault();
+              commitPanelWidth(BOT_PANEL_DEFAULT_WIDTH);
+            }
+          }}
+          aria-label={tr("Resize right panel", "调整右侧栏宽度")}
+          aria-orientation="vertical"
+          aria-valuemin={BOT_PANEL_MIN_WIDTH}
+          aria-valuemax={BOT_PANEL_MAX_WIDTH}
+          aria-valuenow={panelWidth}
+          role="separator"
+          title={tr("Drag to resize · Double-click to reset", "拖动调整宽度 · 双击恢复默认宽度")}
+        />
+        <div className="flex h-14 shrink-0 items-center gap-0.5 pl-5 pr-3">
+          <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold text-foreground">
+            {t("workspace.title")}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className={BOT_PANEL_ICON_BUTTON}
+            aria-label={tr("Close Agent panel", "关闭 Agent 侧栏")}
+            title={tr("Close", "关闭")}
+          >
+            <X className="size-[18px]" />
+          </button>
+        </div>
+
+        <div className="shrink-0 px-4 pt-1">
+          <div
+            role="tablist"
+            aria-label={t("common.agent")}
+            className={`grid rounded-[10px] bg-black/[0.045] p-[3px] dark:bg-white/[0.06] ${filesOnly ? "grid-cols-1" : "grid-cols-4"}`}
+          >
+            {(filesOnly
+              ? [["files", tr("Files", "文件")]] as const
+              : [
+                  ["chats", tr("Sessions", "会话")],
+                  ["projects", tr("Projects", "项目")],
+                  ["files", tr("Files", "文件")],
+                  ["agent", tr("Settings", "设置")],
+                ] as const
+            ).map(([id, label]) => {
+              const selected = panelTab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  onClick={() => setPanelTab(id)}
+                  className={`h-7 min-w-0 truncate rounded-[7px] px-2 text-[13px] transition-[background-color,color,box-shadow] focus-visible:ring-2 focus-visible:ring-ring ${
+                    selected
+                      ? "bg-background font-medium text-foreground shadow-[0_1px_2px_rgba(0,0,0,0.06),0_1px_6px_-1px_rgba(0,0,0,0.08)] dark:bg-white/[0.12] dark:shadow-none"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {/* The count is a corner badge on the label. It stays inside
+                      the button: the tab truncates, so anything past its
+                      edge would be clipped. */}
+                  <span className="relative">
+                    {label}
+                    {id === "files" && filesTabCount > 0 && (
+                      <span className="absolute -right-3 -top-1.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-black/[0.12] px-1 text-[10px] font-medium leading-none tabular-nums text-foreground/80 dark:bg-white/[0.18]">
+                        {filesTabCount > 99 ? "99+" : filesTabCount}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-8 pt-3">
+          {panelTab === "chats" && (
+            <BotPanelListHeader
+              label={tr("{{count}} sessions", "{{count}} 个会话", { count: looseTopics.length })}
+              actionLabel={tr("New chat", "新建对话")}
+              shortcut="⌘N"
+              icon={SquarePen}
+              onAction={onNewTopic}
+            />
+          )}
+          {panelTab === "chats" && (
+            looseTopics.length === 0 ? (
+              <p className="px-1 py-6 text-center text-sm leading-5 text-muted-foreground/75">
+                {tr("Recent sessions appear here after you send a message.", "发送消息后，最近会话会显示在这里。")}
+              </p>
+            ) : (
+              <div className="space-y-0.5">
+                {visibleRecentTopics.map((topic) => (
+                  <BotTopicCard
+                    key={topic.id}
+                    topic={topic}
+                    agentId={agentId}
+                    active={topic.id === activeTopicId}
+                    onSelect={() => onSelectTopic(topic.id)}
+                    onRename={() => setEditTopic(topic)}
+                    onDelete={() => setDeleteTopic(topic)}
+                  />
+                ))}
+                {hiddenTopicCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVisibleTopicCount((current) =>
+                        Math.min(current + TOPIC_PAGE_SIZE, looseTopics.length),
+                      );
+                    }}
+                    className="flex h-9 w-full items-center justify-center gap-1.5 rounded-xl text-[13px] font-medium text-muted-foreground transition hover:bg-black/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring dark:hover:bg-white/[0.07]"
+                  >
+                    <ChevronDown className="size-4 shrink-0" />
+                    <span>{tr("Load more", "加载更多")}</span>
+                    <span className="text-xs tabular-nums text-muted-foreground/70">{hiddenTopicCount}</span>
+                  </button>
+                )}
+              </div>
+            )
+          )}
+
+          {panelTab === "projects" && (
+            <BotPanelListHeader
+              label={tr("{{count}} projects", "{{count}} 个项目", { count: projects.length })}
+              actionLabel={tr("New project", "新建项目")}
+              icon={FolderPlus}
+              onAction={() => setCreateProjectOpen(true)}
+            />
+          )}
+          {panelTab === "projects" && (
+            projects.length === 0 ? (
+              <p className="px-1 py-6 text-center text-sm leading-5 text-muted-foreground/75">{tr("No projects yet", "还没有项目")}</p>
+            ) : (
+              <div className="space-y-0.5">
+                {projects.map((project) => {
+                  const active = project.id === activeProjectId;
+                  const open = expandedProjects.has(project.id);
+                  const projectTopics = topicsByProject.get(project.id) || [];
+                  return (
+                    <div key={project.id}>
+                      <div className={`group relative rounded-xl transition-colors ${BOT_PANEL_CARD_BG(active)}`}>
+                        <button
+                          type="button"
+                          onClick={() => toggleProject(project.id)}
+                          className="flex h-8 w-full min-w-0 items-center gap-2 rounded-xl px-3 pr-[4.25rem] text-left focus-visible:ring-2 focus-visible:ring-ring"
+                          aria-current={active ? "page" : undefined}
+                          aria-expanded={open}
+                          title={project.name}
+                        >
+                          <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground">
+                            {open ? (
+                              <FolderOpen className="size-4 stroke-[1.8]" />
+                            ) : (
+                              <Folder className="size-4 stroke-[1.8]" />
+                            )}
+                          </span>
+                          <span className={`min-w-0 flex-1 truncate text-[13.5px] leading-5 text-foreground ${active ? "font-medium" : ""}`}>
+                            {project.name}
+                          </span>
+                        </button>
+                        {/* Hover actions, Codex-style: ⋯ menu, then a pen
+                            that starts a new chat in the project. */}
+                        <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 has-[[aria-expanded=true]]:opacity-100">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger
+                              render={
+                                <button
+                                  type="button"
+                                  onClick={(event) => event.stopPropagation()}
+                                  className="flex size-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-background/70 hover:text-foreground"
+                                  aria-label={tr("More actions for {{name}}", "{{name}} 的更多操作", { name: project.name })}
+                                >
+                                  <MoreHorizontal className="size-4" />
+                                </button>
+                              }
+                            />
+                            <DropdownMenuContent align="end" className="w-40 rounded-xl">
+                              <DropdownMenuItem onClick={() => setEditProject(project)}>
+                                <Pencil className="size-4 text-muted-foreground" />
+                                {tr("Edit project", "编辑项目")}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() => setDeleteProjectTarget(project)}
+                                className="text-destructive focus:text-destructive"
+                              >
+                                <Trash2 className="size-4 text-destructive" />
+                                {tr("Delete project", "删除项目")}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                          <button
+                            type="button"
+                            onClick={() => onSelectProject(project.id)}
+                            className="flex size-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-background/70 hover:text-foreground"
+                            aria-label={tr("New session in {{name}}", "在 {{name}} 中新建会话", { name: project.name })}
+                            title={tr("New session in project", "新建项目会话")}
+                          >
+                            <SquarePen className="size-4" />
+                          </button>
+                        </div>
+                      </div>
+                      {open && projectTopics.length > 0 && (
+                        <div className="mb-1 ml-4 mt-1 space-y-0.5 border-l border-border/70 pl-2">
+                          {projectTopics.map((topic) => (
+                            <BotTopicCard
+                              key={topic.id}
+                              topic={topic}
+                              agentId={agentId}
+                              active={topic.id === activeTopicId}
+                              compact
+                              onSelect={() => onSelectTopic(topic.id)}
+                              onRename={() => setEditTopic(topic)}
+                              onDelete={() => setDeleteTopic(topic)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )
+          )}
+
+          {panelTab === "files" && canViewAllFiles && (
+            <div className="mb-2 flex gap-1 px-1 text-xs">
+              {([
+                ["chat", tr("This session", "当前会话")],
+                ["all", tr("All", "全部")],
+              ] as const).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setFilesView(id)}
+                  aria-pressed={filesView === id}
+                  className={`rounded-md px-2 py-1 transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
+                    filesView === id
+                      ? "bg-black/[0.06] font-medium text-foreground dark:bg-white/[0.1]"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+          {panelTab === "files" && (
+            !workspaceAvailable && !showAllFiles ? (
+              <p className="px-1 py-6 text-center text-sm leading-5 text-muted-foreground/75">
+                {t("workspace.unavailable")}
+              </p>
+            ) : visibleScopeFiles === null ? (
+              <div className="flex justify-center py-6">
+                <LoaderCircle className="size-4 animate-spin text-muted-foreground" />
+              </div>
+            ) : visibleScopeFiles.length === 0 ? (
+              <p className="px-1 py-6 text-center text-sm leading-5 text-muted-foreground/75">
+                {showAllFiles
+                  ? tr("This agent's workspace is empty.", "这个 Agent 的工作区还是空的。")
+                  : tr("Files the agent creates in this session appear here.", "Agent 在本会话中生成的文件会显示在这里。")}
+              </p>
+            ) : (
+              <FileTreeView
+                // Remount per scope so folder expansion starts fresh.
+                key={filesScopeKey}
+                files={visibleScopeFiles}
+                rootPrefix={showAllFiles ? "" : scopeWorkdirPrefix(visibleScopeFiles)}
+                rootLabel={showAllFiles ? undefined : workdirLabel(scopeWorkdirPrefix(visibleScopeFiles))}
+                onSelect={(file) => onOpenWorkspace(file, showAllFiles)}
+              />
+            )
+          )}
+
+          {panelTab === "agent" && (
+            <BotPanelListHeader label={tr("Manage agent", "管理 Agent")} />
+          )}
+          {panelTab === "agent" && (
+            <div className="overflow-hidden rounded-xl bg-black/[0.03] dark:bg-white/[0.05]">
+              {BOT_QUICK_ACTIONS.map((action, index) => {
+                const Icon = action.icon;
+                const label = t(action.labelKey);
+                const disabled = action.ownerOnly && agentRole !== "owner";
+                return (
+                  <button
+                    key={action.id}
+                    type="button"
+                    onClick={() => {
+                      if (action.action === "settings") onOpenSettings();
+                      else if (action.tab) onOpenSettingsTab(action.tab, action.userOnly);
+                    }}
+                    disabled={disabled}
+                    className={`flex h-11 w-full min-w-0 items-center gap-3 px-3.5 text-left text-foreground transition-colors hover:bg-black/[0.04] focus-visible:bg-black/[0.04] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent dark:hover:bg-white/[0.06] ${
+                      index > 0 ? "border-t border-black/[0.05] dark:border-white/[0.06]" : ""
+                    }`}
+                    title={label}
+                  >
+                    <Icon className="size-4 shrink-0 stroke-[1.8] text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
+                    <ChevronRight className="size-4 shrink-0 text-muted-foreground/70" />
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </aside>
+      {createProjectOpen && (
+        <BotProjectCreateDialog
+          agentId={agentId}
+          onClose={() => setCreateProjectOpen(false)}
+          onCreated={(project) => {
+            onProjectsChanged();
+            setCreateProjectOpen(false);
+            onSelectProject(project.id);
+          }}
+        />
+      )}
+      {editProject && (
+        <BotProjectEditDialog
+          key={editProject.id}
+          agentId={agentId}
+          project={editProject}
+          onClose={() => setEditProject(null)}
+          onSaved={onProjectsChanged}
+        />
+      )}
+      {deleteProjectTarget && (
+        <BotProjectDeleteDialog
+          key={deleteProjectTarget.id}
+          agentId={agentId}
+          project={deleteProjectTarget}
+          topicCount={topicsByProject.get(deleteProjectTarget.id)?.length ?? 0}
+          onClose={() => setDeleteProjectTarget(null)}
+          onDeleted={() => {
+            const deletedActiveProject = deleteProjectTarget.id === activeProjectId;
+            setDeleteProjectTarget(null);
+            onProjectsChanged();
+            if (deletedActiveProject) onNewTopic();
+          }}
+        />
+      )}
+      {editTopic && (
+        <BotTopicEditDialog
+          key={editTopic.id}
+          agentId={agentId}
+          topic={editTopic}
+          onClose={() => setEditTopic(null)}
+          onSaved={onTopicsChanged}
+        />
+      )}
+      {deleteTopic && (
+        <BotTopicDeleteDialog
+          key={deleteTopic.id}
+          agentId={agentId}
+          topic={deleteTopic}
+          onClose={() => setDeleteTopic(null)}
+          onDeleted={() => {
+            const deletedActiveTopic = deleteTopic.id === activeTopicId;
+            setDeleteTopic(null);
+            onTopicsChanged();
+            if (deletedActiveTopic) onNewTopic();
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+function TopicRunStatus({ agentId, sessionId, fallback }: { agentId: string; sessionId: string; fallback?: ChatRunStatus }) {
+  const local = useChatRunStatus(agentId, sessionId);
+  const status = local || fallback;
+  const { tr } = useLocale();
+  // Completed is the normal end state, so it gets no mark; only running,
+  // stopped and failed topics need the user's attention.
+  if (!status || status === "completed") return null;
+  const label = status === "running" ? tr("Running", "进行中")
+    : status === "stopped" ? tr("Stopped", "已停止") : tr("Failed", "失败");
+  const Icon = status === "running" ? LoaderCircle
+    : status === "stopped" ? CirclePause : CircleAlert;
+  return (
+    <span role="img" title={label} aria-label={label} className={`flex size-4 shrink-0 items-center justify-center ${status === "running" ? "text-violet-600 dark:text-violet-300" : status === "failed" ? "text-destructive" : "text-muted-foreground"}`}>
+      <Icon aria-hidden="true" className={`size-3.5 ${status === "running" ? "animate-spin motion-reduce:animate-none" : ""}`} />
+    </span>
+  );
+}
+
+// ChatBubbleAvatar is the small inline mark beside another person's name
+// on mirrored group turns: their photo, or an initial on a tinted circle.
+function ChatBubbleAvatar({
+  name,
+  src,
+}: {
+  name: string;
+  src?: string;
+  size?: "small";
+}) {
+  if (src) {
+    // eslint-disable-next-line @next/next/no-img-element
+    return <img src={src} alt={name} className="inline-block size-5 rounded-full object-cover" />;
+  }
+  return (
+    <span
+      aria-hidden="true"
+      className="flex size-5 items-center justify-center rounded-full bg-[#e4dce8] text-[10px] font-semibold uppercase text-[#5b4c60] dark:bg-[#3d3340] dark:text-[#e6dbe9]"
+    >
+      {name.trim().slice(0, 1) || "?"}
+    </span>
+  );
+}
+
+function ChatSessionLeadingVisual({ topic }: { topic: ChatSession }) {
+  const isWeb = !topic.channel || topic.channel === "web";
+  if (isWeb && topic.thumbnailUrl) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={topic.thumbnailUrl}
+        alt=""
+        className="size-5 shrink-0 rounded-md object-cover"
       />
     );
   }
+  // Every chat leads with its source so the origin reads at a glance:
+  // a globe for web, the IM brand mark, a cube for conversations an
+  // integrating app started over the API, or a code glyph otherwise.
+  return (
+    <span
+      className="flex size-5 shrink-0 items-center justify-center text-muted-foreground"
+      title={channelLabel(topic.channel)}
+      aria-label={channelLabel(topic.channel)}
+    >
+      {isWeb ? (
+        <Globe className="size-4 shrink-0 stroke-[1.8]" />
+      ) : hasChannelIcon(topic.channel) ? (
+        <ChannelIcon channel={topic.channel} className="size-4 shrink-0" />
+      ) : topic.channel === "api" ? (
+        <Box className="size-4 shrink-0 stroke-[1.8]" />
+      ) : (
+        <Code2 className="size-4 shrink-0 stroke-[1.8]" />
+      )}
+    </span>
+  );
+}
+
+function BotTopicCard({
+  topic,
+  agentId,
+  active,
+  compact = false,
+  onSelect,
+  onRename,
+  onDelete,
+}: {
+  topic: ChatSession;
+  agentId: string;
+  active: boolean;
+  compact?: boolean;
+  onSelect: () => void;
+  onRename: () => void;
+  onDelete: () => void;
+}) {
+  const { tr } = useLocale();
+  const topicTitle = topic.title?.trim() || topic.preview?.trim() || tr("Untitled session", "未命名会话");
+  return (
+    <div className={`group relative rounded-xl transition-colors ${BOT_PANEL_CARD_BG(active)}`}>
+      <button
+        type="button"
+        onClick={onSelect}
+        className={`flex w-full min-w-0 items-center gap-2 rounded-xl px-3 pr-10 text-left focus-visible:ring-2 focus-visible:ring-ring ${
+          compact ? "h-7" : "h-8"
+        }`}
+        aria-current={active ? "page" : undefined}
+        title={topicTitle}
+      >
+        {/* Project rows sit under their folder; the source icon is noise there. */}
+        {!compact && <ChatSessionLeadingVisual topic={topic} />}
+        <span className={`min-w-0 flex-1 truncate text-[13.5px] leading-5 text-foreground ${active ? "font-medium" : ""}`}>
+          {topicTitle}
+        </span>
+      </button>
+      {/* Run status sits in the ⋯ button's slot at the far right and gives
+          way to it on hover. */}
+      <span className="pointer-events-none absolute right-1.5 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
+        <TopicRunStatus agentId={agentId} sessionId={topic.id} fallback={topic.status} />
+      </span>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <button
+              type="button"
+              onClick={(event) => event.stopPropagation()}
+              className="absolute right-1.5 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded-lg text-muted-foreground opacity-0 transition-opacity hover:bg-background/70 hover:text-foreground group-hover:opacity-100 group-focus-within:opacity-100 aria-expanded:opacity-100"
+              aria-label={tr("More actions for {{name}}", "{{name}} 的更多操作", { name: topicTitle })}
+            >
+              <MoreHorizontal className="size-4" />
+            </button>
+          }
+        />
+        <DropdownMenuContent align="end" className="w-36 rounded-xl">
+          <DropdownMenuItem onClick={onRename}>
+            <Pencil className="size-4 text-muted-foreground" />
+            {tr("Rename", "重命名")}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={onDelete}
+            className="text-destructive focus:text-destructive"
+          >
+            <Trash2 className="size-4 text-destructive" />
+            {tr("Delete", "删除")}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+function BotProjectCreateDialog({
+  agentId,
+  onClose,
+  onCreated,
+}: {
+  agentId: string;
+  onClose: () => void;
+  onCreated: (project: ProjectEntry) => void;
+}) {
+  const { tr } = useLocale();
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const save = async () => {
+    const nextName = name.trim();
+    if (!nextName || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const result = await createProject(agentId, {
+        name: nextName,
+        description: description.trim(),
+      });
+      if ("error" in result) {
+        setError(result.error || tr("Creation failed. Try again.", "创建失败，请重试。"));
+        return;
+      }
+      onCreated(result);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : tr("Creation failed. Try again.", "创建失败，请重试。"));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
-    <button
-      onClick={() => {
-        setDraft(title);
-        setEditing(true);
-      }}
-      // Cap the title width responsively so a long auto-summary doesn't
-      // push the whole header off-screen on small viewports. The
-      // arbitrary `min(...)` keeps narrow widths on phones (60vw) while
-      // capping at ~32rem on desktop; sm:/md: bumps give intermediate
-      // breakpoints a deterministic width too.
-      className="group flex min-w-0 max-w-[min(60vw,18rem)] sm:max-w-[24rem] md:max-w-[28rem] lg:max-w-[32rem] items-center gap-1.5 rounded-md px-2 py-1 text-sm text-foreground hover:bg-muted/50"
-      title={title || fallback}
-    >
-      <span className="truncate">{title || fallback}</span>
-      <Pencil className="h-3 w-3 shrink-0 text-muted-foreground/50 opacity-0 transition-opacity group-hover:opacity-100" />
-    </button>
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{tr("New project", "新建项目")}</DialogTitle>
+          <DialogDescription>{tr("Organize related chats and files in one project.", "将相关对话和文件整理到同一个项目中。")}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div>
+            <label className="mb-1.5 block text-xs font-medium" htmlFor="new-bot-project-name">{tr("Project name", "项目名称")}</label>
+            <Input
+              id="new-bot-project-name"
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void save();
+                }
+              }}
+            />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-xs font-medium" htmlFor="new-bot-project-description">{tr("Project description", "项目说明")}</label>
+            <Textarea
+              id="new-bot-project-description"
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              rows={3}
+            />
+          </div>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={saving}>{tr("Cancel", "取消")}</Button>
+          <Button onClick={() => void save()} disabled={saving || !name.trim()}>
+            {saving ? tr("Creating…", "创建中…") : tr("Create", "创建")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function BotTopicEditDialog({
+  agentId,
+  topic,
+  onClose,
+  onSaved,
+}: {
+  agentId: string;
+  topic: ChatSession;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { tr } = useLocale();
+  const currentTitle = topic.title?.trim() || topic.preview?.trim() || tr("Untitled session", "未命名会话");
+  const [title, setTitle] = useState(currentTitle);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const save = async () => {
+    const nextTitle = title.trim();
+    if (!nextTitle || saving) return;
+    if (nextTitle === currentTitle) {
+      onClose();
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const result = await renameChatSession(agentId, topic.id, nextTitle);
+      if (result?.error) {
+        setError(result.error);
+        return;
+      }
+      onSaved();
+      onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : tr("Save failed. Try again.", "保存失败，请重试。"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{tr("Rename chat", "重命名对话")}</DialogTitle>
+          <DialogDescription>{tr("Use a title that makes this session easier to find.", "使用更容易查找的会话名称。")}</DialogDescription>
+        </DialogHeader>
+        <Input
+          autoFocus
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+            if (event.key === "Enter") {
+              event.preventDefault();
+              void save();
+            }
+          }}
+        />
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={saving}>{tr("Cancel", "取消")}</Button>
+          <Button onClick={() => void save()} disabled={saving || !title.trim()}>
+            {saving ? tr("Saving…", "保存中…") : tr("Save", "保存")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function BotTopicDeleteDialog({
+  agentId,
+  topic,
+  onClose,
+  onDeleted,
+}: {
+  agentId: string;
+  topic: ChatSession;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const { tr } = useLocale();
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+  const topicTitle = topic.title?.trim() || topic.preview?.trim() || tr("Untitled session", "未命名会话");
+
+  const remove = async () => {
+    if (deleting) return;
+    setDeleting(true);
+    setError("");
+    try {
+      const result = await deleteChatSession(agentId, topic.id);
+      if (result?.error) {
+        setError(result.error);
+        return;
+      }
+      onDeleted();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : tr("Deletion failed. Try again.", "删除失败，请重试。"));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <AlertDialog open onOpenChange={(open) => !open && onClose()}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{tr("Delete chat", "删除对话")}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {tr("Delete “{{title}}”? The complete chat history will be permanently deleted.", "确定删除“{{title}}”吗？完整对话记录将被永久删除。", { title: topicTitle })}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleting}>{tr("Cancel", "取消")}</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={deleting}
+            onClick={(event) => {
+              event.preventDefault();
+              void remove();
+            }}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+          >
+            {deleting ? tr("Deleting…", "删除中…") : tr("Delete", "删除")}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+// The server refuses to delete a project that still has chats (409 with
+// sessionCount) and never cascades, so with chats in it the dialog says so
+// up front instead of offering a delete that will fail.
+function BotProjectDeleteDialog({
+  agentId,
+  project,
+  topicCount,
+  onClose,
+  onDeleted,
+}: {
+  agentId: string;
+  project: ProjectEntry;
+  topicCount: number;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const { tr } = useLocale();
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+  const blocked = topicCount > 0;
+
+  const remove = async () => {
+    if (deleting || blocked) return;
+    setDeleting(true);
+    setError("");
+    try {
+      const result = await deleteProject(agentId, project.id);
+      if (result?.error) {
+        setError(result.sessionCount
+          ? tr("This project still has {{count}} sessions. Delete them first.", "项目中还有 {{count}} 个会话，请先删除它们。", { count: result.sessionCount })
+          : result.error);
+        return;
+      }
+      onDeleted();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : tr("Deletion failed. Try again.", "删除失败，请重试。"));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <AlertDialog open onOpenChange={(open) => !open && onClose()}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{tr("Delete project", "删除项目")}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {blocked
+              ? tr(
+                  "“{{name}}” still has {{count}} sessions. Delete them first, then delete the project.",
+                  "“{{name}}”中还有 {{count}} 个会话，请先删除这些会话，再删除项目。",
+                  { name: project.name, count: topicCount },
+                )
+              : tr(
+                  "Delete “{{name}}”? Its files on disk are kept.",
+                  "确定删除“{{name}}”吗？磁盘上的项目文件会保留。",
+                  { name: project.name },
+                )}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleting}>
+            {blocked ? tr("OK", "知道了") : tr("Cancel", "取消")}
+          </AlertDialogCancel>
+          {!blocked && (
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(event) => {
+                event.preventDefault();
+                void remove();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleting ? tr("Deleting…", "删除中…") : tr("Delete", "删除")}
+            </AlertDialogAction>
+          )}
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function BotProjectEditDialog({
+  agentId,
+  project,
+  onClose,
+  onSaved,
+}: {
+  agentId: string;
+  project: ProjectEntry;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { tr } = useLocale();
+  const [name, setName] = useState(project.name);
+  const [description, setDescription] = useState(project.description || "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const save = async () => {
+    const nextName = name.trim();
+    if (!nextName || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const result = await updateProject(agentId, project.id, {
+        name: nextName,
+        description: description.trim(),
+      });
+      if ("error" in result && result.error) {
+        setError(result.error);
+        return;
+      }
+      onSaved();
+      onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : tr("Save failed. Try again.", "保存失败，请重试。"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{tr("Edit project", "编辑项目")}</DialogTitle>
+          <DialogDescription>{tr("Change the project name and description without moving its files.", "修改项目名称和说明，不会移动项目中的文件。")}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div>
+            <label className="mb-1.5 block text-xs font-medium" htmlFor="bot-project-name">{tr("Project name", "项目名称")}</label>
+            <Input
+              id="bot-project-name"
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void save();
+              }}
+            />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-xs font-medium" htmlFor="bot-project-description">{tr("Project description", "项目说明")}</label>
+            <Textarea
+              id="bot-project-description"
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              rows={3}
+            />
+          </div>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={saving}>{tr("Cancel", "取消")}</Button>
+          <Button onClick={() => void save()} disabled={saving || !name.trim()}>
+            {saving ? tr("Saving…", "保存中…") : tr("Save", "保存")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -2814,35 +5121,12 @@ function ChatHeaderTitle({ title, fallback, onSave }: ChatHeaderTitleProps) {
  *  `nested`, the outer flex/max-width wrappers are dropped so a parent
  *  container (ToolRoundsBundle) can stack rounds without each one
  *  re-imposing its own bubble alignment. */
-function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId, nested = false, roundIndex, subagentProgress, onKnowledgeCitationClick }: { msg: ChatMessage; surfacedSrcs?: ReadonlySet<string>; agentId: string; sessionId: string; nested?: boolean; roundIndex?: number; subagentProgress?: { iteration?: number; max?: number; phase?: "thinking" | "running" | "final-delivery" | "done"; tools?: string[] } | null; onKnowledgeCitationClick?: (source: KnowledgeSource) => void }) {
-  const [groupOpen, setGroupOpen] = useState(false);
-  const [expandedTool, setExpandedTool] = useState<Record<string, boolean>>({});
-
-  const tools = msg.toolCalls || [];
-  const doneCount = tools.filter((tc) => tc.result != null).length;
-  const allDone = doneCount === tools.length;
-
-  // delegate_task is registered serial, so only the FIRST not-yet-
-  // returned delegate_task in this round corresponds to the active
-  // subagentProgress event stream. Older ones already finished;
-  // later ones are queued on the mutex and have no progress yet.
-  const activeDelegateId = (() => {
-    for (const tc of tools) {
-      if (tc.name === "delegate_task" && tc.result == null) {
-        return tc.id;
-      }
-    }
-    return null;
-  })();
-
-  const toggleTool = (id: string) =>
-    setExpandedTool((prev) => ({ ...prev, [id]: !prev[id] }));
-
+function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId, nested = false, subagentProgress, onKnowledgeCitationClick }: { msg: ChatMessage; surfacedSrcs?: ReadonlySet<string>; agentId: string; sessionId: string; nested?: boolean; roundIndex?: number; subagentProgress?: ToolSubagentProgress | null; onKnowledgeCitationClick?: (source: KnowledgeSource) => void }) {
   const inner = (
     <>
       {/* Content before tools */}
       {msg.content && (
-        <div className="bg-muted rounded-2xl rounded-bl-md px-4 py-2.5">
+        <div className="py-0.5 text-[#202020] dark:text-foreground">
           {renderContentWithDataImages(msg.content, surfacedSrcs, false, agentId, sessionId, msg.metadata?.knowledgeSources, onKnowledgeCitationClick) ?? (
             <ChatMarkdown
               text={msg.content}
@@ -2854,145 +5138,372 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId, nested = false, 
           )}
         </div>
       )}
-      {/* Collapsed tool group summary */}
-      <div className="rounded-lg border border-border bg-card/50 overflow-hidden">
-          <button
-            onClick={() => setGroupOpen(!groupOpen)}
-            className="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-muted/50 transition-colors"
-          >
-            {!allDone ? (
-              <div className="h-5 w-5 shrink-0 rounded-full border-2 border-amber-500 border-t-transparent animate-spin" />
-            ) : roundIndex !== undefined ? (
-              // When this group is a round inside a bundle, the leading
-              // glyph carries the round number — gives the bundle's
-              // expanded view a built-in step indicator without an
-              // extra "ROUND N" label row above each card.
-              <span className="h-5 w-5 shrink-0 inline-flex items-center justify-center rounded-full bg-amber-500/10 text-[11px] font-semibold text-amber-600 dark:text-amber-400">
-                {roundIndex}
-              </span>
-            ) : (
-              <Wrench className="h-3.5 w-3.5 text-amber-500 shrink-0" />
-            )}
-            <span className="font-medium text-foreground">
-              {allDone
-                ? `Executed ${tools.length} tool${tools.length > 1 ? "s" : ""}`
-                : `Running tools (${doneCount}/${tools.length})...`}
-            </span>
-            <span className="text-muted-foreground/60 text-[11px] flex-1 text-left truncate">
-              {tools.map((tc) => tc.name).join(", ")}
-            </span>
-            {groupOpen ? (
-              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-            )}
-          </button>
-
-          {groupOpen && (
-            <div className="border-t border-border">
-              {tools.map((tc) => (
-                <div key={tc.id} className="border-b border-border last:border-b-0">
-                  <button
-                    onClick={() => toggleTool(tc.id)}
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/30 transition-colors"
-                  >
-                    {tc.result === undefined ? (
-                      <div className="h-3 w-3 shrink-0 rounded-full border-2 border-amber-500/60 border-t-transparent animate-spin" />
-                    ) : (
-                      <Check className="h-3 w-3 text-emerald-500 shrink-0" />
-                    )}
-                    <span className="font-medium text-foreground">{tc.name}</span>
-                    {tc.metadata?.sandbox && (
-                      <span
-                        className="flex items-center gap-0.5 rounded bg-emerald-500/10 px-1 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400"
-                        title="Executed inside a sandboxed container"
-                      >
-                        <ShieldCheck className="h-2.5 w-2.5" />
-                        sandbox
-                      </span>
-                    )}
-                    <span className="text-muted-foreground/50 font-mono truncate flex-1 text-left text-[11px]">
-                      {(() => {
-                        try {
-                          const args = JSON.parse(tc.arguments);
-                          // delegate_task's `task` arg always opens with
-                          // the same boilerplate ("You are a B2B lead
-                          // researcher…"); the differentiating part is a
-                          // markdown heading further down ("## Target:
-                          // <industry>"). Surface that line instead of
-                          // the head so a fan-out of N delegates doesn't
-                          // look like N copies of the same call.
-                          if (tc.name === "delegate_task" && typeof args.task === "string") {
-                            const m = args.task.match(/^#+\s*Target:\s*(.+)$/m) ||
-                                      args.task.match(/^#+\s+(.+)$/m);
-                            if (m) return m[1].trim();
-                            return args.task.replace(/\s+/g, " ").slice(0, 120);
-                          }
-                          return Object.values(args).join(", ");
-                        } catch {
-                          return tc.arguments;
-                        }
-                      })()}
-                    </span>
-                    {expandedTool[tc.id] ? (
-                      <ChevronDown className="h-3 w-3 text-muted-foreground/50 shrink-0" />
-                    ) : (
-                      <ChevronRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
-                    )}
-                  </button>
-                  {expandedTool[tc.id] && (
-                    <div className="px-3 py-2 space-y-2 bg-muted/20">
-                      <div>
-                        <p className="text-[10px] font-medium text-muted-foreground uppercase mb-1">Input</p>
-                        <pre className="text-xs font-mono bg-muted/50 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-40">
-                          {(() => {
-                            try { return JSON.stringify(JSON.parse(tc.arguments), null, 2); }
-                            catch { return tc.arguments; }
-                          })()}
-                        </pre>
-                      </div>
-                      {tc.result != null ? (
-                        <div>
-                          <p className="text-[10px] font-medium text-muted-foreground uppercase mb-1">Output</p>
-                          <pre className="text-xs font-mono bg-muted/50 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60">
-                            {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
-                          </pre>
-                        </div>
-                      ) : tc.name === "delegate_task" && tc.id === activeDelegateId && subagentProgress ? (
-                        <div className="text-xs text-muted-foreground/80 italic">
-                          {(() => {
-                            const it = subagentProgress.iteration;
-                            const mx = subagentProgress.max;
-                            const phase = subagentProgress.phase;
-                            const tools = subagentProgress.tools;
-                            const counter = it && mx ? `Iteration ${it}/${mx}` : "Sub-agent running";
-                            let detail = "";
-                            if (phase === "thinking") detail = "thinking";
-                            else if (phase === "running" && tools?.length) detail = `running ${tools.join(", ")}`;
-                            else if (phase === "final-delivery") detail = "synthesizing final answer";
-                            return detail ? `${counter} · ${detail}` : counter;
-                          })()}
-                        </div>
-                      ) : tc.name === "delegate_task" && tc.result == null && tc.id !== activeDelegateId ? (
-                        <p className="text-xs text-muted-foreground/60 italic">Queued (waiting on prior sub-agent)…</p>
-                      ) : (
-                        <p className="text-xs text-muted-foreground/60 italic">Executing...</p>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </>
-    );
+      <PrivateDeliveryCard calls={(msg.toolCalls || []).filter(isMessageAgentCall)} />
+      <ToolActivity
+        items={(msg.toolCalls || []).filter((tc) => !isMessageAgentCall(tc)).map((tc) => ({ kind: "tool" as const, tc }))}
+        subagentProgress={subagentProgress}
+      />
+    </>
+  );
   if (nested) {
     return <div className="space-y-2">{inner}</div>;
   }
+  return <AgentLaneRow>{inner}</AgentLaneRow>;
+}
+
+// AgentLaneRow holds non-text assistant content (tool activity) in the
+// same width-capped lane as the reply text, so a turn reads as one block.
+function AgentLaneRow({ children }: { children: React.ReactNode }) {
+  return <div className={`min-w-0 space-y-2 ${ASSISTANT_LANE_MAX}`}>{children}</div>;
+}
+
+// Assistant turns fill the conversation column; the column itself
+// (CHAT_COLUMN_MAX) is what keeps reading width comfortable.
+const ASSISTANT_LANE_MAX = "max-w-full";
+
+// One centered, responsive column for messages and composer alike
+// (Codex-style): full width on narrow panes, capped on wide ones.
+const CHAT_COLUMN_MAX = "max-w-4xl";
+
+// Fired by in-message disclosures before they change height, so the
+// chat's stick-to-bottom scroll doesn't drag them upward.
+export const CHAT_RELEASE_BOTTOM_STICK_EVENT = "fastclaw:chat-release-bottom-stick";
+function releaseChatBottomStick() {
+  window.dispatchEvent(new Event(CHAT_RELEASE_BOTTOM_STICK_EVENT));
+}
+
+export type ToolCallEntry = NonNullable<ChatMessage["toolCalls"]>[number];
+type ToolSubagentProgress = { iteration?: number; max?: number; phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up"; tools?: string[] };
+export type ToolActivityItem = { kind: "tool"; tc: ToolCallEntry } | { kind: "note"; id: string; text: string };
+
+// message_agent calls render as private-message cards, not tool lines.
+function isMessageAgentCall(tc: ToolCallEntry): boolean {
+  return tc.name === "message_agent";
+}
+
+// parseMessageAgentResult reads the tool result's stable shape:
+// "Delivered to <name> (<id>). …\nRecipient reply:\n<reply>"; anything
+// else is an error message from the tool.
+function parseMessageAgentResult(result?: string): { name?: string; reply?: string; error?: string } {
+  if (result == null) return {};
+  const marker = "\nRecipient reply:\n";
+  const at = result.indexOf(marker);
+  if (at < 0) return { error: result.replace(/^error:\s*/i, "").trim() };
+  const name = result.match(/^Delivered to (.+?) \(/)?.[1];
+  return { name, reply: result.slice(at + marker.length).trim() };
+}
+
+function PrivateDisclosure({ summary, children }: { summary: string; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
   return (
-    <div className="flex justify-start">
-      <div className="max-w-full space-y-2">{inner}</div>
+    <div className="max-w-full text-sm leading-6 text-muted-foreground">
+      <button
+        type="button"
+        onClick={() => {
+          releaseChatBottomStick();
+          setOpen((value) => !value);
+        }}
+        className="flex max-w-full items-center gap-2 rounded-md text-left transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        aria-expanded={open}
+      >
+        <LockKeyhole className="size-4 shrink-0 stroke-[1.8]" />
+        <span className="truncate">{summary}</span>
+        <ChevronDown className={`size-4 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && <div className="mt-1.5 space-y-2">{children}</div>}
+    </div>
+  );
+}
+
+// PrivateDeliveryCard is the sender-side receipt for message_agent:
+// "Sent private message to B", expanding to the request and B's reply.
+function PrivateDeliveryCard({ calls }: { calls: ToolCallEntry[] }) {
+  const { tr } = useLocale();
+  if (calls.length === 0) return null;
+  const entries = calls.map((tc) => {
+    const args = parseToolArgs(tc.arguments);
+    const parsed = parseMessageAgentResult(tc.result);
+    const name = parsed.name || (typeof args.agent === "string" ? args.agent : "") || tr("Agent", "Agent");
+    return { tc, name, message: typeof args.message === "string" ? args.message : "", ...parsed };
+  });
+  const names = [...new Set(entries.map((entry) => entry.name))].join(", ");
+  return (
+    <PrivateDisclosure summary={tr("Sent private message to {{names}}", "已发送私信给 {{names}}", { names })}>
+      {entries.map((entry) => (
+        <section key={entry.tc.id} className="rounded-xl bg-black/[0.035] p-3 dark:bg-white/[0.05]">
+          <p className="mb-1 text-xs text-muted-foreground">{tr("To {{name}}", "发送给 {{name}}", { name: entry.name })}</p>
+          <div className="whitespace-pre-wrap break-words text-sm text-foreground">{entry.message}</div>
+          {entry.tc.result == null ? (
+            <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <LoaderCircle className="size-3.5 animate-spin" />
+              {tr("Waiting for {{name}} to reply…", "等待 {{name}} 回复…", { name: entry.name })}
+            </p>
+          ) : entry.reply ? (
+            <div className="mt-2 rounded-lg bg-background/70 p-2.5 dark:bg-black/20">
+              <p className="mb-1 flex items-center gap-1 text-xs text-muted-foreground">
+                <CornerDownRight className="size-3" />
+                {tr("{{name}} replied", "{{name}} 回复", { name: entry.name })}
+              </p>
+              <ChatMarkdown text={entry.reply} />
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-destructive">{entry.error}</p>
+          )}
+        </section>
+      ))}
+    </PrivateDisclosure>
+  );
+}
+
+// PrivateSourceCard labels a reply that answers a private message: from
+// another agent (expandable to the original request) or delivered from a
+// group to the human.
+function PrivateSourceCard({ source }: { source: PrivateSource }) {
+  const { tr } = useLocale();
+  if (source.kind === "group") {
+    return (
+      <p className="mb-1 flex items-center gap-2 text-sm text-muted-foreground">
+        <LockKeyhole className="size-4 shrink-0 stroke-[1.8]" />
+        <span className="truncate">{tr("Private message from group {{name}}", "来自群聊「{{name}}」的私信", { name: source.name })}</span>
+      </p>
+    );
+  }
+  return (
+    <div className="mb-1">
+      <PrivateDisclosure summary={tr("Received privately from {{name}}", "收到来自 {{name}} 的私信", { name: source.name })}>
+        <section className="rounded-xl bg-black/[0.035] p-3 dark:bg-white/[0.05]">
+          <p className="mb-1 text-xs text-muted-foreground">{tr("From {{name}}", "来自 {{name}}", { name: source.name })}</p>
+          <div className="whitespace-pre-wrap break-words text-sm text-foreground">
+            {source.content || tr("Private message details are unavailable.", "这条私信没有保存详情。")}
+          </div>
+        </section>
+      </PrivateDisclosure>
+    </div>
+  );
+}
+
+type ToolKind = "command" | "read" | "edit" | "list" | "web" | "skill" | "schedule" | "search" | "other";
+
+function parseToolArgs(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function firstStringArg(args: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return value.replace(/\s+/g, " ").trim();
+  }
+  return "";
+}
+
+function toolKind(name: string): ToolKind {
+  if (name === "exec" || name === "bash" || name === "shell" || name === "bash_output" || name === "start_app_preview") return "command";
+  if (name === "read_file") return "read";
+  if (name === "write_file" || name === "edit_file" || name === "apply_patch") return "edit";
+  if (name === "list_dir" || name === "glob" || name === "grep") return "list";
+  if (name.startsWith("web_") || name === "browser") return "web";
+  if (name.includes("skill")) return "skill";
+  if (name.includes("cron")) return "schedule";
+  if (name.endsWith("_search")) return "search";
+  return "other";
+}
+
+const TOOL_KIND_ICON: Record<ToolKind, typeof Wrench> = {
+  command: Terminal,
+  read: FileText,
+  edit: Pencil,
+  list: FolderSearch,
+  web: Globe2,
+  skill: Sparkles,
+  schedule: Clock,
+  search: BookOpen,
+  other: Wrench,
+};
+
+// describeToolCall turns one call into the "Ran pwd && ls" style line:
+// a past-tense verb plus the one argument that tells calls apart.
+function describeToolCall(tc: ToolCallEntry, tr: (en: string, zh: string, vars?: Record<string, string | number>) => string): string {
+  const args = parseToolArgs(tc.arguments);
+  const kind = toolKind(tc.name);
+  if (tc.name === "delegate_task" && typeof args.task === "string") {
+    const m = args.task.match(/^#+\s*Target:\s*(.+)$/m) || args.task.match(/^#+\s+(.+)$/m);
+    const task = m ? m[1].trim() : args.task.replace(/\s+/g, " ").slice(0, 120);
+    return tr("Delegated {{task}}", "委派 {{task}}", { task });
+  }
+  const target = firstStringArg(args, ["command", "cmd", "path", "file", "file_path", "url", "query", "q", "name", "slug", "skill", "id"]);
+  if (tc.name === "bash_output") return tr("Checked command output", "查看命令输出");
+  if (tc.name === "install_skill") return target ? tr("Installed skill {{target}}", "安装技能 {{target}}", { target }) : tr("Installed a skill", "安装了技能");
+  if (tc.name === "search_skills") return target ? tr("Searched skills for {{target}}", "搜索技能 {{target}}", { target }) : tr("Searched skills", "搜索了技能");
+  if (tc.name === "load_skill") return target ? tr("Loaded skill {{target}}", "加载技能 {{target}}", { target }) : tr("Loaded a skill", "加载了技能");
+  switch (kind) {
+    case "command":
+      return target ? tr("Ran {{target}}", "运行 {{target}}", { target }) : tr("Ran a command", "运行了命令");
+    case "read":
+      return target ? tr("Read {{target}}", "读取 {{target}}", { target }) : tr("Read a file", "读取了文件");
+    case "edit":
+      return target
+        ? (tc.name === "write_file" ? tr("Wrote {{target}}", "写入 {{target}}", { target }) : tr("Edited {{target}}", "编辑 {{target}}", { target }))
+        : tr("Edited files", "编辑了文件");
+    case "list":
+      return target ? tr("Listed {{target}}", "查看 {{target}}", { target }) : tr("Listed files", "查看了目录");
+    case "web":
+      return target
+        ? (tc.name === "web_search" ? tr("Searched {{target}}", "搜索 {{target}}", { target }) : tr("Fetched {{target}}", "抓取 {{target}}", { target }))
+        : tr("Browsed the web", "浏览了网页");
+    case "skill":
+      return target ? tr("Used skill {{target}}", "使用技能 {{target}}", { target }) : tr("Used a skill", "使用了技能");
+    default: {
+      const label = tc.name.replace(/_/g, " ");
+      return target ? `${label} · ${target}` : label;
+    }
+  }
+}
+
+// summarizeToolCalls is the collapsed header: one clause per kind of
+// work, in the order it first happened ("Ran 3 commands, read a file").
+function summarizeToolCalls(tools: ToolCallEntry[], tr: (en: string, zh: string, vars?: Record<string, string | number>) => string): string {
+  const counts = new Map<ToolKind, number>();
+  for (const tc of tools) {
+    const kind = toolKind(tc.name);
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+  }
+  const phrase = (kind: ToolKind, n: number): string => {
+    switch (kind) {
+      case "command": return n === 1 ? tr("ran a command", "运行了 1 条命令") : tr("ran {{n}} commands", "运行了 {{n}} 条命令", { n });
+      case "read": return n === 1 ? tr("read a file", "读取了 1 个文件") : tr("read {{n}} files", "读取了 {{n}} 个文件", { n });
+      case "edit": return n === 1 ? tr("edited a file", "编辑了 1 个文件") : tr("edited {{n}} files", "编辑了 {{n}} 个文件", { n });
+      case "list": return tr("browsed files", "查看了目录");
+      case "web": return n === 1 ? tr("visited the web", "访问了 1 次网页") : tr("visited the web {{n}} times", "访问了 {{n}} 次网页", { n });
+      case "skill": return n === 1 ? tr("used a skill", "使用了技能") : tr("used {{n}} skills", "使用了 {{n}} 个技能", { n });
+      case "schedule": return tr("updated schedules", "更新了定时任务");
+      case "search": return tr("searched notes", "检索了资料");
+      default: return n === 1 ? tr("used a tool", "使用了 1 个工具") : tr("used {{n}} tools", "使用了 {{n}} 个工具", { n });
+    }
+  };
+  const text = [...counts.entries()].map(([kind, n]) => phrase(kind, n)).join(tr(", ", "，"));
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** ToolActivity is the quiet, card-less record of what the agent did:
+ *  a one-line summary that expands into one line per call ("Ran …",
+ *  "Read …"), each of which opens its input / output. It sits in the
+ *  assistant lane like secondary text, not as a bordered panel. */
+export function ToolActivity({ items, subagentProgress }: { items: ToolActivityItem[]; subagentProgress?: ToolSubagentProgress | null }) {
+  const { tr } = useLocale();
+  const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const tools = items.flatMap((item) => (item.kind === "tool" ? [item.tc] : []));
+  if (tools.length === 0) return null;
+  const running = tools.some((tc) => tc.result == null);
+  // delegate_task runs serially, so only the first unfinished one is
+  // the call the live subagentProgress stream belongs to.
+  const activeDelegateId = tools.find((tc) => tc.name === "delegate_task" && tc.result == null)?.id ?? null;
+
+  return (
+    <div className="max-w-full text-sm md:max-w-xl leading-6 text-muted-foreground">
+      <button
+        type="button"
+        onClick={() => {
+          releaseChatBottomStick();
+          setOpen((value) => !value);
+        }}
+        className="group/activity flex max-w-full items-center gap-2 rounded-md text-left transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        aria-expanded={open}
+      >
+        {running ? (
+          <LoaderCircle className="size-4 shrink-0 animate-spin" />
+        ) : (
+          <Wrench className="size-4 shrink-0 stroke-[1.8]" />
+        )}
+        <span className="truncate">
+          {running
+            ? tr("Working… {{summary}}", "正在处理…{{summary}}", { summary: summarizeToolCalls(tools, tr).toLowerCase() })
+            : summarizeToolCalls(tools, tr)}
+        </span>
+        <ChevronDown className={`size-4 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        // Bounded like an image in a bubble: long runs scroll inside
+        // instead of stretching the reply.
+        <div className="-mx-1 mt-1 max-h-72 space-y-0.5 overflow-y-auto px-1 pb-0.5">
+          {items.map((item) => {
+            if (item.kind === "note") {
+              return (
+                <p key={item.id} className="line-clamp-2 pl-6 text-[13px] leading-5 text-muted-foreground/80">
+                  {item.text}
+                </p>
+              );
+            }
+            const tc = item.tc;
+            const Icon = TOOL_KIND_ICON[toolKind(tc.name)];
+            const isOpen = expanded[tc.id];
+            return (
+              <div key={tc.id}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    releaseChatBottomStick();
+                    setExpanded((prev) => ({ ...prev, [tc.id]: !prev[tc.id] }));
+                  }}
+                  className="flex w-full min-w-0 items-center gap-2 rounded-md text-left transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-expanded={isOpen}
+                >
+                  {tc.result == null ? (
+                    <LoaderCircle className="size-4 shrink-0 animate-spin" />
+                  ) : (
+                    <Icon className="size-4 shrink-0 stroke-[1.8]" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate">{describeToolCall(tc, tr)}</span>
+                </button>
+                {isOpen && (
+                  <div className="mb-2 mt-1 w-fit min-w-[12rem] max-w-full space-y-2 rounded-xl bg-black/[0.035] p-3 text-xs dark:bg-white/[0.05]">
+                    <div>
+                      <p className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/80">{tr("Input", "输入")}</p>
+                      <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-foreground/80">
+                        {(() => {
+                          try { return JSON.stringify(JSON.parse(tc.arguments), null, 2); }
+                          catch { return tc.arguments; }
+                        })()}
+                      </pre>
+                    </div>
+                    {tc.result != null ? (
+                      <div>
+                        <p className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/80">{tr("Output", "输出")}</p>
+                        <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all font-mono text-foreground/80">
+                          {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
+                        </pre>
+                      </div>
+                    ) : tc.name === "delegate_task" && tc.id === activeDelegateId && subagentProgress ? (
+                      <p className="italic">
+                        {(() => {
+                          const { iteration: it, max: mx, phase, tools: running } = subagentProgress;
+                          const counter = it && mx
+                            ? tr("Iteration {{current}}/{{max}}", "迭代 {{current}}/{{max}}", { current: it, max: mx })
+                            : tr("Sub-agent running", "子 Agent 正在运行");
+                          let detail = "";
+                          if (phase === "thinking") detail = tr("thinking", "思考中");
+                          else if (phase === "running" && running?.length) detail = tr("running {{tools}}", "正在运行 {{tools}}", { tools: running.join(", ") });
+                          else if (phase === "final-delivery") detail = tr("synthesizing final answer", "正在整理最终回答");
+                          return detail ? `${counter} · ${detail}` : counter;
+                        })()}
+                      </p>
+                    ) : tc.name === "delegate_task" && tc.id !== activeDelegateId ? (
+                      <p className="italic">{tr("Queued (waiting for the previous sub-agent)…", "已排队（等待前一个子 Agent）…")}</p>
+                    ) : (
+                      <p className="italic">{tr("Executing…", "正在执行…")}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -3008,69 +5519,29 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId, nested = false, 
  *  layer doesn't show up unless it earns its keep. */
 function ToolRoundsBundle({
   rounds,
-  surfacedSrcs,
-  agentId,
-  sessionId,
   subagentProgress,
-  onKnowledgeCitationClick,
 }: {
   rounds: ChatMessage[];
   surfacedSrcs?: ReadonlySet<string>;
   agentId: string;
   sessionId: string;
-  subagentProgress?: { iteration?: number; max?: number; phase?: "thinking" | "running" | "final-delivery" | "done"; tools?: string[] } | null;
+  subagentProgress?: ToolSubagentProgress | null;
   onKnowledgeCitationClick?: (source: KnowledgeSource) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const allTools = rounds.flatMap((r) => r.toolCalls || []);
-  const totalTools = allTools.length;
-  const doneCount = allTools.filter((tc) => tc.result != null).length;
-  const allDone = doneCount === totalTools;
+  // Text the agent wrote between rounds becomes a short note line in
+  // the expanded list, so the narrative between calls isn't lost.
+  const items: ToolActivityItem[] = rounds.flatMap((round, idx) => [
+    ...(round.content?.trim()
+      ? [{ kind: "note" as const, id: `${round.id || idx}-note`, text: round.content.trim() }]
+      : []),
+    ...(round.toolCalls || []).filter((tc) => !isMessageAgentCall(tc)).map((tc) => ({ kind: "tool" as const, tc })),
+  ]);
+  const deliveries = rounds.flatMap((round) => (round.toolCalls || []).filter(isMessageAgentCall));
   return (
-    <div className="flex justify-start">
-      <div className="max-w-full w-full">
-        <div className="rounded-lg border border-border bg-card/50 overflow-hidden">
-          <button
-            onClick={() => setOpen(!open)}
-            className="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-muted/50 transition-colors"
-          >
-            {!allDone ? (
-              <div className="h-3.5 w-3.5 shrink-0 rounded-full border-2 border-amber-500 border-t-transparent animate-spin" />
-            ) : (
-              <Wrench className="h-3.5 w-3.5 text-amber-500 shrink-0" />
-            )}
-            <span className="font-medium text-foreground">
-              {allDone
-                ? `Used ${totalTools} tool${totalTools === 1 ? "" : "s"} across ${rounds.length} round${rounds.length === 1 ? "" : "s"}`
-                : `Running tools… (${doneCount}/${totalTools} across ${rounds.length} rounds)`}
-            </span>
-            <span className="ml-auto" />
-            {open ? (
-              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-            )}
-          </button>
-          {open && (
-            <div className="border-t border-border p-2 space-y-1.5 bg-background/30">
-              {rounds.map((round, idx) => (
-                <ToolCallGroup
-                  key={round.id || idx}
-                  msg={round}
-                  surfacedSrcs={surfacedSrcs}
-                  agentId={agentId}
-                  sessionId={sessionId}
-                  nested
-                  roundIndex={idx + 1}
-                  subagentProgress={subagentProgress}
-                  onKnowledgeCitationClick={onKnowledgeCitationClick}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
+    <AgentLaneRow>
+      <PrivateDeliveryCard calls={deliveries} />
+      <ToolActivity items={items} subagentProgress={subagentProgress} />
+    </AgentLaneRow>
   );
 }
 
@@ -3132,14 +5603,10 @@ function zipUrl(agentId: string, sessionId: string, projectId?: string): string 
   return `/api/agents/${agentId}/files.zip${qs ? "?" + qs : ""}`;
 }
 
-// FilesPanel no longer inlines the produced-file list into the message
-// bubble — a long workspace (skills/, .DS_Store, lockfiles, …) buried the
-// reply. Instead it surfaces a single "Open files" affordance that opens
-// the WorkspacePanel side sheet, which already handles the tree, preview,
-// and download. onOpen is wired to setFilesSheetOpen(true) at the call site.
 // BuildLogView renders the live scaffold/dev log as a scrolling terminal,
 // auto-pinned to the bottom so the latest pnpm-install lines stay visible.
 function BuildLogView({ text }: { text: string }) {
+  const { tr } = useLocale();
   const ref = useRef<HTMLPreElement>(null);
   useEffect(() => {
     const el = ref.current;
@@ -3150,38 +5617,39 @@ function BuildLogView({ text }: { text: string }) {
       ref={ref}
       className="h-full w-full overflow-auto whitespace-pre-wrap break-words bg-zinc-950 px-4 py-3 text-left font-mono text-[11px] leading-relaxed text-zinc-300"
     >
-      {text || "Starting build…"}
+      {text || tr("Starting build…", "正在开始构建…")}
     </pre>
-  );
-}
-
-function FilesPanel({ files, onOpen }: { files: ProducedFile[]; onOpen: () => void }) {
-  return (
-    <div className="mt-2 max-w-[85%]">
-      <button
-        type="button"
-        onClick={onOpen}
-        className="group inline-flex items-center gap-2 rounded-lg border border-border bg-card/50 px-3 py-2 hover:bg-card/80 transition-colors"
-        title="Open workspace files"
-      >
-        <FolderOpen className="h-4 w-4 text-muted-foreground shrink-0 group-hover:text-foreground transition-colors" />
-        <span className="text-sm font-medium text-foreground">Open files</span>
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground/80 tabular-nums">
-          {files.length}
-        </span>
-      </button>
-    </div>
   );
 }
 
 const FILES_PANEL_MIN = 280;
 const FILES_PANEL_MAX = 1000; // wide enough to view a desktop preview iframe
-const FILES_PANEL_DEFAULT = 280;
+const FILES_PANEL_DEFAULT = BOT_PANEL_DEFAULT_WIDTH;
 const FILES_PANEL_KEY = "chat:filesPanelWidth";
 // When the user switches to the Preview tab and the panel is still narrow,
 // auto-grow to this so the embedded site isn't cramped. Transient (not
 // persisted), so the Code tab keeps its own saved width.
 const PREVIEW_AUTO_WIDTH = 760;
+
+function compactWorkspaceWidth(): number {
+  if (typeof window === "undefined") return FILES_PANEL_DEFAULT;
+  const botWidth = Number(window.localStorage.getItem(BOT_PANEL_WIDTH_KEY));
+  return Number.isFinite(botWidth)
+    && botWidth >= BOT_PANEL_MIN_WIDTH
+    && botWidth <= BOT_PANEL_MAX_WIDTH
+    ? botWidth
+    : FILES_PANEL_DEFAULT;
+}
+
+function expandedWorkspaceWidth(): number {
+  if (typeof window === "undefined") return PREVIEW_AUTO_WIDTH;
+  const stored = Number(window.localStorage.getItem(FILES_PANEL_KEY));
+  return Number.isFinite(stored)
+    && stored >= PREVIEW_AUTO_WIDTH
+    && stored <= FILES_PANEL_MAX
+    ? stored
+    : PREVIEW_AUTO_WIDTH;
+}
 
 // WorkspacePanel renders the files in the active scope:
 //   - chat scope (sessionId set): files produced in this conversation.
@@ -3236,6 +5704,38 @@ function buildFileTree(files: WorkspaceFile[], stripPrefix: string): FileTreeNod
   return root.children;
 }
 
+// scopeRootPrefix is the deepest directory every file shares, used as the
+// tree's implicit root. The backend may store a conversation's files under
+// a key other than the URL's session id (channel sessions), so the prefix
+// is derived from the paths rather than built from the id.
+export function scopeRootPrefix(files: WorkspaceFile[]): string {
+  if (files.length === 0) return "";
+  let dirs = files[0].path.split("/").slice(0, -1);
+  for (const f of files.slice(1)) {
+    const parts = f.path.split("/").slice(0, -1);
+    let i = 0;
+    while (i < dirs.length && i < parts.length && dirs[i] === parts[i]) i++;
+    dirs = dirs.slice(0, i);
+    if (dirs.length === 0) return "";
+  }
+  return dirs.length ? dirs.join("/") + "/" : "";
+}
+
+// scopeWorkdirPrefix is the conversation's working directory for a scoped
+// file list: sessions/<chat>/ for a loose chat, projects/<pid>/… for a
+// project — never deeper, even when every file sits in one subfolder.
+function scopeWorkdirPrefix(files: WorkspaceFile[]): string {
+  const segs = scopeRootPrefix(files).split("/").filter(Boolean);
+  const depth = segs[0] === "sessions" ? 2 : segs[0] === "projects" ? Math.min(segs.length, 3) : segs.length;
+  const kept = segs.slice(0, depth);
+  return kept.length ? kept.join("/") + "/" : "";
+}
+
+// workdirLabel names the scoped root folder after its directory.
+function workdirLabel(prefix: string): string {
+  return prefix.split("/").filter(Boolean).pop() || "workspace";
+}
+
 function sortFileTree(nodes: FileTreeNode[]) {
   nodes.sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; // folders before files
@@ -3244,22 +5744,30 @@ function sortFileTree(nodes: FileTreeNode[]) {
   for (const n of nodes) if (n.isDir) sortFileTree(n.children);
 }
 
-function FileTreeView({
+export function FileTreeView({
   files,
   rootPrefix,
   selectedPath,
   onSelect,
   defaultExpandDepth = 1,
+  rootLabel,
 }: {
   files: WorkspaceFile[];
   rootPrefix: string;
   selectedPath?: string;
   onSelect: (f: ProducedFile) => void;
+  // When set, the tree hangs off one collapsible root folder with this
+  // name (the scoped view's working directory), like the "All" view.
+  rootLabel?: string;
   // Folders shallower than this are open on first load (1 = open the root
   // folders only) so the user sees the top entries without a deep dump.
   defaultExpandDepth?: number;
 }) {
-  const tree = useMemo(() => buildFileTree(files, rootPrefix), [files, rootPrefix]);
+  const tree = useMemo(() => {
+    const nodes = buildFileTree(files, rootPrefix);
+    if (!rootLabel || nodes.length === 0) return nodes;
+    return [{ name: rootLabel, path: rootPrefix || "/", isDir: true, children: nodes }];
+  }, [files, rootPrefix, rootLabel]);
   // Expansion state keys on stable relative paths, so it survives refreshes.
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   // Auto-expand the first `defaultExpandDepth` folder levels once, when the
@@ -3384,24 +5892,52 @@ function langForPath(path: string): string {
   return map[ext] || "text";
 }
 
-function WorkspacePanel({
+// chatFolderOf returns the chat folder an agent-relative path sits in —
+// "sessions/<chat>" or "projects/<pid>/<chat>" — or "" for files outside
+// one (project-root files, skills, …), which have no version history.
+function chatFolderOf(path?: string): string {
+  if (!path) return "";
+  const parts = path.split("/");
+  if (parts[0] === "sessions" && parts.length > 2) return parts.slice(0, 2).join("/");
+  if (parts[0] === "projects" && parts.length > 3) return parts.slice(0, 3).join("/");
+  return "";
+}
+
+export function WorkspacePanel({
   agentId,
   sessionId,
   projectId,
+  allFiles = false,
+  initialPreview,
   knowledgePreview,
   onClearKnowledgePreview,
+  onPreviewStateChange,
+  onBack,
   onClose,
+  onAsk,
+  reloadNonce = 0,
 }: {
   agentId: string;
   sessionId: string;
   projectId?: string;
+  // The whole agent workspace instead of one conversation / project. The
+  // backend only lists it for the owner (and super_admins).
+  allFiles?: boolean;
+  // File to open in the viewer on mount (picked in the Agent panel).
+  initialPreview?: ProducedFile | null;
   knowledgePreview?: KnowledgeSource | null;
   onClearKnowledgePreview?: () => void;
+  onPreviewStateChange?: (active: boolean) => void;
+  onBack?: () => void;
   onClose: () => void;
+  // See FileViewer.
+  onAsk?: (text: string) => void;
+  reloadNonce?: number;
 }) {
+  const { locale, t, tr } = useLocale();
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
   const [loading, setLoading] = useState(false);
-  const [previewing, setPreviewing] = useState<ProducedFile | null>(null);
+  const [previewing, setPreviewing] = useState<ProducedFile | null>(initialPreview ?? null);
   // Live dev-server preview for this chat scope (from start_app_preview).
   const [appPreview, setAppPreview] = useState<ScopePreview>({ status: "none" });
   // Live build/dev log tail, shown in the preview pane while the app is
@@ -3411,6 +5947,9 @@ function WorkspacePanel({
   const [tab, setTab] = useState<"code" | "preview">("code");
   // Collapse the left file tree to give the viewer the full width.
   const [treeCollapsed, setTreeCollapsed] = useState(false);
+  // Set when the person opens the tree beside a file themselves: it then
+  // stays open on the next files until they close it again.
+  const treeKeptOpenRef = useRef(false);
   // Files the agent changed vs the template baseline (so the tree can show
   // just this task's output), and whether to show all files instead.
   const [changed, setChanged] = useState<{ files: WorkspaceFile[]; available: boolean }>({ files: [], available: false });
@@ -3439,14 +5978,7 @@ function WorkspacePanel({
       cancelled = true;
     };
   }, []);
-  const [width, setWidth] = useState<number>(() => {
-    if (typeof window === "undefined") return FILES_PANEL_DEFAULT;
-    const stored = Number(window.localStorage.getItem(FILES_PANEL_KEY));
-    if (Number.isFinite(stored) && stored >= FILES_PANEL_MIN && stored <= FILES_PANEL_MAX) {
-      return stored;
-    }
-    return FILES_PANEL_DEFAULT;
-  });
+  const [width, setWidth] = useState<number>(compactWorkspaceWidth);
   const [resizing, setResizing] = useState(false);
 
   // Measure the panel's ACTUAL rendered width (not the `width` state, which
@@ -3466,6 +5998,7 @@ function WorkspacePanel({
   // Below this the secondary action icons fold into a "⋯" menu and the
   // "Files" label drops, so the header always fits the narrow panel.
   const compactHeader = panelW < 480;
+  const viewerExpanded = tab === "preview" || Boolean(previewing || knowledgePreview);
 
   useEffect(() => {
     if (!resizing) return;
@@ -3478,9 +6011,11 @@ function WorkspacePanel({
     };
     const handleUp = () => {
       setResizing(false);
-      try {
-        window.localStorage.setItem(FILES_PANEL_KEY, String(width));
-      } catch { /* ignore quota errors */ }
+      if (viewerExpanded) {
+        try {
+          window.localStorage.setItem(FILES_PANEL_KEY, String(width));
+        } catch { /* ignore quota errors */ }
+      }
     };
     window.addEventListener("mousemove", handleMove);
     window.addEventListener("mouseup", handleUp);
@@ -3492,10 +6027,10 @@ function WorkspacePanel({
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-  }, [resizing, width]);
+  }, [resizing, viewerExpanded, width]);
 
   const handleReveal = useCallback(async () => {
-    if (!agentId || (!sessionId && !projectId)) return;
+    if (!agentId || (!sessionId && !projectId && !allFiles)) return;
     setRevealing(true);
     try {
       const res = await revealAgentWorkspace(agentId, sessionId || undefined, projectId);
@@ -3504,30 +6039,36 @@ function WorkspacePanel({
         // toast lib we don't have. The message comes from the
         // backend (e.g. "S3-backed store, no host path").
         // eslint-disable-next-line no-alert
-        alert(res.error || "Could not open workspace folder");
+        alert(res.error || tr("Could not open workspace folder", "无法打开工作区文件夹"));
       }
     } finally {
       setRevealing(false);
     }
-  }, [agentId, sessionId, projectId]);
+  }, [agentId, sessionId, projectId, allFiles, tr]);
 
   const refresh = useCallback(async () => {
     // Project scope (no session) is handled via projectId; chat scope
-    // requires sessionId. With neither, there's nothing to fetch.
-    if (!agentId || (!sessionId && !projectId)) return;
+    // requires sessionId. With neither, there's nothing to fetch — unless
+    // this is the agent-wide view, which lists without scope.
+    if (!agentId || (!sessionId && !projectId && !allFiles)) return;
     setLoading(true);
     try {
       // When projectId is set we skip sessionId — backend scope filter
       // expects exactly one of them to drive the prefix match. Mixing
       // them would fall into the chat-scope branch and miss other
       // chats' files.
-      const list = projectId
-        ? await listAgentFiles(agentId, undefined, projectId)
-        : await listAgentFiles(agentId, sessionId);
+      const list = allFiles
+        ? await listAgentFiles(agentId)
+        : projectId
+          ? await listAgentFiles(agentId, undefined, projectId)
+          : await listAgentFiles(agentId, sessionId);
       const cleaned = list
         .filter((f) => !isSystemFile(f.path))
         .sort((a, b) => (b.modTime || 0) - (a.modTime || 0));
       setFiles(cleaned);
+      // App previews and template diffs are per conversation / project;
+      // the agent-wide view has neither.
+      if (allFiles) return;
       // Best-effort: is there a live app preview for this scope?
       getScopePreview(agentId, projectId ? undefined : sessionId, projectId)
         .then(setAppPreview)
@@ -3539,54 +6080,74 @@ function WorkspacePanel({
     } finally {
       setLoading(false);
     }
-  }, [agentId, sessionId, projectId]);
+  }, [agentId, sessionId, projectId, allFiles]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
+  // A finished agent turn may have written files: refetch the tree.
+  const lastReload = useRef(reloadNonce);
+  useEffect(() => {
+    if (lastReload.current === reloadNonce) return;
+    lastReload.current = reloadNonce;
+    refresh();
+  }, [reloadNonce, refresh]);
 
   // Workspace version history: load commits when the dropdown opens;
   // restore checks out the whole session workspace to that commit and
   // refreshes the file tree/viewer.
+  // Version history belongs to one chat folder. In a session view that's
+  // the session; in the agent-wide view it's the folder of the previewed
+  // file, so both views offer history for the same files.
+  const historyFolder = allFiles ? chatFolderOf(previewing?.path) : "";
+  const hasHistory = allFiles ? Boolean(historyFolder) : Boolean(sessionId && !projectId);
   const toggleHistory = useCallback(async () => {
     if (historyOpen) {
       setHistoryOpen(false);
       return;
     }
-    if (!sessionId) return;
+    if (!historyFolder && !sessionId) return;
     setHistoryOpen(true);
     try {
-      setHistory(await getSessionHistory(agentId, sessionId));
+      setHistory(historyFolder
+        ? await getFolderHistory(agentId, historyFolder)
+        : await getSessionHistory(agentId, sessionId));
     } catch {
       setHistory([]);
     }
-  }, [historyOpen, agentId, sessionId]);
+  }, [historyOpen, agentId, sessionId, historyFolder]);
 
   const handleRestore = useCallback(
     async (commit: string) => {
-      if (!sessionId || restoring) return;
+      if ((!historyFolder && !sessionId) || restoring) return;
       // eslint-disable-next-line no-alert
-      if (!window.confirm("将此会话的工作区回滚到该版本？当前未提交的文件修改会被覆盖。")) return;
+      if (!window.confirm(tr("Restore this session's workspace to this version? Current uncommitted file changes will be overwritten.", "将此会话的工作区回滚到该版本？当前未提交的文件修改会被覆盖。"))) return;
       setRestoring(true);
       try {
-        await restoreSessionHistory(agentId, sessionId, commit);
+        if (historyFolder) await restoreFolderHistory(agentId, historyFolder, commit);
+        else await restoreSessionHistory(agentId, sessionId, commit);
         setHistoryOpen(false);
         setPreviewing(null);
         await refresh();
       } catch (error) {
         // eslint-disable-next-line no-alert
-        alert("回滚失败：" + String(error));
+        alert(tr("Restore failed: {{error}}", "回滚失败：{{error}}", { error: String(error) }));
       } finally {
         setRestoring(false);
       }
     },
-    [agentId, sessionId, restoring, refresh],
+    [agentId, sessionId, historyFolder, restoring, refresh, tr],
   );
 
   // Switching conversations swaps the file tree to the new scope — clear the
   // selected file too, so the viewer never shows a file from the previous
   // conversation (the tree refetches but `previewing` would otherwise linger).
+  // The mount run is skipped so `initialPreview` survives.
+  const previewScopeRef = useRef(`${agentId}|${sessionId}|${projectId ?? ""}`);
   useEffect(() => {
+    const scope = `${agentId}|${sessionId}|${projectId ?? ""}`;
+    if (previewScopeRef.current === scope) return;
+    previewScopeRef.current = scope;
     setPreviewing(null);
   }, [agentId, sessionId, projectId]);
 
@@ -3615,22 +6176,24 @@ function WorkspacePanel({
     };
   }, [tab, agentId, sessionId, projectId]);
 
-  // Open at a comfortable width: the 280px drag-floor is far too cramped to
-  // read a file tree + viewer. Grow to PREVIEW_AUTO_WIDTH on mount (panel
-  // open) — capped by the 70% container maxWidth, so it never overflows. The
-  // user can still drag narrower within the session; reopening re-widens.
+  // Default to the same width as the Bot panel and show only the file tree.
+  // Selecting a file (or the live Preview tab) promotes the workspace into
+  // its wide inspection mode; closing the viewer returns it to navigation.
   useEffect(() => {
-    setWidth((w) => (w < PREVIEW_AUTO_WIDTH ? Math.min(PREVIEW_AUTO_WIDTH, FILES_PANEL_MAX) : w));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    setWidth(viewerExpanded ? expandedWorkspaceWidth() : compactWorkspaceWidth());
+    onPreviewStateChange?.(viewerExpanded);
+    return () => {
+      if (viewerExpanded) onPreviewStateChange?.(false);
+    };
+  }, [onPreviewStateChange, viewerExpanded]);
 
-  // Also grow when entering Preview / opening a file (in case the user dragged
-  // narrow earlier) so the iframe / viewer column isn't cramped.
+  // Opening a file hands the viewer the full width: the tree folds away
+  // unless the person opened it with the header toggle, in which case it
+  // stays until they close it. Back in navigation mode the tree is all
+  // there is, so show it.
   useEffect(() => {
-    if (tab === "preview" || previewing || knowledgePreview) {
-      setWidth((w) => (w < PREVIEW_AUTO_WIDTH ? Math.min(PREVIEW_AUTO_WIDTH, FILES_PANEL_MAX) : w));
-    }
-  }, [tab, previewing, knowledgePreview]);
+    setTreeCollapsed(Boolean(previewing || knowledgePreview) && !treeKeptOpenRef.current);
+  }, [previewing, knowledgePreview]);
 
   // The Preview tab only exists for coding projects with a live dev server.
   // When there's no app preview, hide the tab and snap back to Files.
@@ -3648,15 +6211,21 @@ function WorkspacePanel({
         // the viewport. A container-relative cap auto-shrinks the panel when the
         // sidebar expands (the container narrows, 70% narrows with it), so the
         // chat always keeps ≥30% and the page never scrolls horizontally. min()
-        // still bounds it to FILES_PANEL_MAX on very wide screens. overflow-
-        // hidden is the belt-and-suspenders against inner content overflow.
-        style={{ width, maxWidth: `min(${FILES_PANEL_MAX}px, 70%)` }}
-        className="relative z-30 hidden md:flex shrink-0 flex-col overflow-hidden border-l border-border bg-background -mt-12 h-screen"
+        // still bounds it to FILES_PANEL_MAX on very wide screens. The panel
+        // still shrinks (down to FILES_PANEL_MIN): at xl the chat column keeps
+        // a 520px minimum, and 70% + 520px is wider than the container once
+        // the sidebar is open, which used to push the panel off-screen.
+        // overflow-hidden is the belt-and-suspenders against inner content
+        // overflow.
+        style={{ width, maxWidth: `min(${FILES_PANEL_MAX}px, 70%)`, minWidth: FILES_PANEL_MIN }}
+        className={`relative z-30 hidden md:flex flex-col overflow-hidden border-l border-border bg-background -mt-14 h-screen ${
+          resizing ? "" : "transition-[width] duration-200 ease-out motion-reduce:transition-none"
+        }`}
       >
         <div
           onMouseDown={(e) => { e.preventDefault(); setResizing(true); }}
           className={`absolute left-0 top-0 bottom-0 w-2 cursor-col-resize z-10 group ${resizing ? "" : ""}`}
-          title="Drag to resize"
+          title={tr("Drag to resize", "拖动调整大小")}
         >
           <div
             className={`absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors ${
@@ -3666,8 +6235,24 @@ function WorkspacePanel({
         </div>
         <div className="flex h-12 items-center justify-between gap-2 border-b border-border px-4">
           <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
-            <FolderOpen className="h-4 w-4 shrink-0" />
-            {!compactHeader && <span className="truncate">{knowledgePreview ? "Knowledge" : "Workspace"}</span>}
+            {onBack ? (
+              <button
+                type="button"
+                onClick={onBack}
+                className="-ml-1 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label={t("workspace.back")}
+                title={t("workspace.back")}
+              >
+                <ArrowLeft className="size-4" />
+              </button>
+            ) : (
+              <FolderOpen className="h-4 w-4 shrink-0" />
+            )}
+            {!compactHeader && (
+              <span className="truncate">
+                {knowledgePreview ? tr("Knowledge", "知识库") : t("workspace.title")}
+              </span>
+            )}
           </div>
           <div className="flex shrink-0 items-center gap-1">
             {/* Secondary actions: inline on a wide panel, folded into a "⋯"
@@ -3679,7 +6264,7 @@ function WorkspacePanel({
                   render={
                     <button
                       className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-                      title="More actions"
+                      title={tr("More actions", "更多操作")}
                     >
                       <MoreHorizontal className="h-4 w-4" />
                     </button>
@@ -3693,7 +6278,7 @@ function WorkspacePanel({
                       }
                     >
                       <ExternalLink className="h-4 w-4 text-muted-foreground" />
-                      <span>Open in new tab</span>
+                      <span>{tr("Open in new tab", "在新标签页中打开")}</span>
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuItem
@@ -3707,20 +6292,20 @@ function WorkspacePanel({
                     }}
                   >
                     <Download className="h-4 w-4 text-muted-foreground" />
-                    <span>Download zip</span>
+                    <span>{tr("Download zip", "下载 ZIP")}</span>
                   </DropdownMenuItem>
                   {deployMode === "self-hosted" && (
                     <DropdownMenuItem
-                      disabled={revealing || (!sessionId && !projectId)}
+                      disabled={revealing || (!sessionId && !projectId && !allFiles)}
                       onClick={handleReveal}
                     >
                       <FolderSearch className="h-4 w-4 text-muted-foreground" />
-                      <span>Open in Finder</span>
+                      <span>{tr("Open in Finder", "在访达中打开")}</span>
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuItem disabled={loading} onClick={refresh}>
                     <RefreshCw className="h-4 w-4 text-muted-foreground" />
-                    <span>Refresh</span>
+                    <span>{tr("Refresh", "刷新")}</span>
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -3732,7 +6317,7 @@ function WorkspacePanel({
                     target="_blank"
                     rel="noopener noreferrer"
                     className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-                    title={`Open preview in new tab: ${appPreview.previewUrl}`}
+                    title={tr("Open preview in a new tab: {{url}}", "在新标签页中打开预览：{{url}}", { url: appPreview.previewUrl })}
                   >
                     <ExternalLink className="h-4 w-4" />
                   </a>
@@ -3745,16 +6330,16 @@ function WorkspacePanel({
                       ? "pointer-events-none text-muted-foreground/40"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                   }`}
-                  title="Download all as zip"
+                  title={tr("Download all as zip", "下载全部文件为 ZIP")}
                 >
                   <Download className="h-4 w-4" />
                 </a>
                 {deployMode === "self-hosted" && (
                   <button
                     onClick={handleReveal}
-                    disabled={revealing || (!sessionId && !projectId)}
+                    disabled={revealing || (!sessionId && !projectId && !allFiles)}
                     className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
-                    title="Open folder in Finder"
+                    title={tr("Open folder in Finder", "在访达中打开文件夹")}
                   >
                     <FolderSearch className="h-4 w-4" />
                   </button>
@@ -3763,25 +6348,25 @@ function WorkspacePanel({
                   onClick={refresh}
                   disabled={loading}
                   className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
-                  title="Refresh"
+                  title={tr("Refresh", "刷新")}
                 >
                   <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
                 </button>
-                {sessionId && !projectId && (
+                {hasHistory && (
                   <span className="relative">
                     <button
                       onClick={toggleHistory}
                       disabled={restoring}
                       className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
-                      title="版本历史（回滚工作区）"
+                      title={tr("Version history (restore workspace)", "版本历史（回滚工作区）")}
                     >
                       <RotateCcw className={`h-4 w-4 ${restoring ? "animate-spin" : ""}`} />
                     </button>
                     {historyOpen && (
                       <div className="absolute right-0 top-8 z-20 w-72 rounded-md border border-border bg-popover p-1 shadow-lg">
-                        <div className="px-2 py-1 text-xs font-medium text-muted-foreground">版本历史</div>
+                        <div className="px-2 py-1 text-xs font-medium text-muted-foreground">{tr("Version history", "版本历史")}</div>
                         {history.length === 0 ? (
-                          <div className="px-2 py-3 text-center text-xs text-muted-foreground">暂无历史快照</div>
+                          <div className="px-2 py-3 text-center text-xs text-muted-foreground">{tr("No history snapshots", "暂无历史快照")}</div>
                         ) : (
                           history.slice(0, 20).map((entry) => (
                             <div
@@ -3791,7 +6376,7 @@ function WorkspacePanel({
                               <div className="min-w-0 flex-1">
                                 <div className="truncate text-xs">{entry.message}</div>
                                 <div className="text-[10px] text-muted-foreground">
-                                  {entry.hash.slice(0, 7)} · {new Date(entry.time * 1000).toLocaleString()}
+                                  {entry.hash.slice(0, 7)} · {new Date(entry.time * 1000).toLocaleString(locale === "zh-CN" ? "zh-CN" : "en-US")}
                                 </div>
                               </div>
                               <button
@@ -3799,7 +6384,7 @@ function WorkspacePanel({
                                 disabled={restoring}
                                 className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs hover:bg-accent disabled:opacity-50"
                               >
-                                回滚
+                                {tr("Restore", "回滚")}
                               </button>
                             </div>
                           ))
@@ -3813,16 +6398,29 @@ function WorkspacePanel({
             <button
               onClick={onClose}
               className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-              title="Close"
+              title={tr("Close", "关闭")}
             >
               <X className="h-4 w-4" />
             </button>
           </div>
         </div>
-        {/* Row 2: Files (tree) / Preview (dev server) toggle + tree collapse.
+        {/* Row 2: tree collapse (left, above the tree it toggles) + Files
+            (tree) / Preview (dev server) toggle.
             The Preview tab is shown only for coding projects with a live dev
             server; a plain file session (a PDF, some docs) just shows Files. */}
-        <div className="flex h-10 items-center justify-between gap-2 border-b border-border px-3">
+        <div className="flex h-10 items-center gap-0.5 border-b border-border px-4">
+          {tab === "code" && viewerExpanded && (
+            <button
+              onClick={() => {
+                treeKeptOpenRef.current = treeCollapsed;
+                setTreeCollapsed(!treeCollapsed);
+              }}
+              className="-ml-1.5 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+              title={treeCollapsed ? tr("Show file tree", "显示文件树") : tr("Hide file tree", "隐藏文件树")}
+            >
+              {treeCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+            </button>
+          )}
           {hasPreview ? (
             <div className="flex items-center rounded-md bg-muted p-0.5 text-xs">
               <button
@@ -3833,7 +6431,7 @@ function WorkspacePanel({
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
-                Files
+                {tr("Files", "文件")}
               </button>
               <button
                 onClick={() => setTab("preview")}
@@ -3843,30 +6441,21 @@ function WorkspacePanel({
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
-                Preview
+                {tr("Preview", "预览")}
                 {(appPreview.status === "starting" || appPreview.status === "scaffolding") && (
                   <RefreshCw className="h-3 w-3 animate-spin" />
                 )}
               </button>
             </div>
           ) : (
-            <span className="px-1 text-xs font-medium text-muted-foreground">Files</span>
-          )}
-          {tab === "code" && (
-            <button
-              onClick={() => setTreeCollapsed((c) => !c)}
-              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-              title={treeCollapsed ? "Show file tree" : "Hide file tree"}
-            >
-              {treeCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
-            </button>
+            <span className="text-xs font-medium text-muted-foreground">{tr("Files", "文件")}</span>
           )}
         </div>
         {tab === "code" ? (
           <div className="flex min-h-0 flex-1">
             {/* Left: file tree (collapsible). */}
-            {!treeCollapsed && (
-            <div className="flex w-56 shrink-0 flex-col border-r border-border">
+            {!(viewerExpanded && treeCollapsed) && (
+            <div className={`flex flex-col ${viewerExpanded ? "w-56 shrink-0 border-r border-border" : "w-full"}`}>
               {/* When there's a template baseline, default to showing only the
                   files THIS task changed; let the user flip to the full tree. */}
               {changed.available && (
@@ -3877,7 +6466,7 @@ function WorkspacePanel({
                       !showAll ? "bg-muted font-medium text-foreground" : "text-muted-foreground hover:text-foreground"
                     }`}
                   >
-                    Changed{changed.files.length ? ` (${changed.files.length})` : ""}
+                    {tr("Changed", "已更改")}{changed.files.length ? ` (${changed.files.length})` : ""}
                   </button>
                   <button
                     onClick={() => setShowAll(true)}
@@ -3885,7 +6474,7 @@ function WorkspacePanel({
                       showAll ? "bg-muted font-medium text-foreground" : "text-muted-foreground hover:text-foreground"
                     }`}
                   >
-                    All files
+                    {tr("All files", "全部文件")}
                   </button>
                 </div>
               )}
@@ -3897,17 +6486,20 @@ function WorkspacePanel({
                     return (
                       <p className="px-3 py-8 text-center text-sm text-muted-foreground">
                         {showChanged
-                          ? "No changes yet — the agent hasn't edited any files."
+                          ? tr("No changes yet — the agent has not edited any files.", "还没有更改——Agent 尚未编辑任何文件。")
+                          : allFiles
+                            ? tr("No files in this workspace yet.", "工作区中还没有文件。")
                           : projectId
-                            ? "No files in this project yet."
-                            : "No files in this session yet."}
+                            ? tr("No files in this project yet.", "此项目中还没有文件。")
+                            : tr("No files in this session yet.", "此会话中还没有文件。")}
                       </p>
                     );
                   }
                   return (
                     <FileTreeView
                       files={list}
-                      rootPrefix={projectId ? `projects/${projectId}/` : `sessions/${sessionId}/`}
+                      rootPrefix={allFiles ? "" : scopeWorkdirPrefix(list)}
+                      rootLabel={allFiles ? undefined : workdirLabel(scopeWorkdirPrefix(list))}
                       selectedPath={previewing?.path}
                       onSelect={(f) => {
                         onClearKnowledgePreview?.();
@@ -3921,6 +6513,7 @@ function WorkspacePanel({
             )}
             {/* Right: viewer for the selected file — overflow-hidden so wide
                 content (a PDF, long code lines) never scrolls the panel. */}
+            {viewerExpanded && (
             <div className="min-w-0 flex-1 overflow-hidden">
               {knowledgePreview ? (
                 <KnowledgeFileViewer
@@ -3937,14 +6530,12 @@ function WorkspacePanel({
                   agentId={agentId}
                   file={previewing}
                   onClose={() => setPreviewing(null)}
+                  onAsk={onAsk}
+                  reloadNonce={reloadNonce}
                 />
-              ) : (
-                <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
-                  <FileText className="h-6 w-6" />
-                  <p className="text-sm">Select a file to view it here.</p>
-                </div>
-              )}
+              ) : null}
             </div>
+            )}
           </div>
         ) : (
           <div className="flex-1 min-h-0">
@@ -3952,7 +6543,7 @@ function WorkspacePanel({
               <iframe
                 src={appPreview.previewUrl}
                 className="h-full w-full border-0 bg-white"
-                title="App preview"
+                title={tr("App preview", "应用预览")}
               />
             ) : appPreview.status === "starting" || appPreview.status === "scaffolding" ? (
               <div className="flex h-full flex-col">
@@ -3960,8 +6551,8 @@ function WorkspacePanel({
                   <RefreshCw className="h-4 w-4 shrink-0 animate-spin" />
                   <span>
                     {appPreview.status === "scaffolding"
-                      ? "Installing dependencies — this can take a few minutes…"
-                      : "Starting the dev server…"}
+                      ? tr("Installing dependencies — this can take a few minutes…", "正在安装依赖——可能需要几分钟…")
+                      : tr("Starting the dev server…", "正在启动开发服务器…")}
                   </span>
                 </div>
                 <div className="min-h-0 flex-1">
@@ -3970,17 +6561,17 @@ function WorkspacePanel({
               </div>
             ) : appPreview.status === "crashed" ? (
               <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
-                <p className="text-sm text-destructive">Preview failed to start.</p>
+                <p className="text-sm text-destructive">{tr("Preview failed to start.", "预览启动失败。")}</p>
                 <p className="text-xs text-muted-foreground">
-                  Ask the agent to check the dev-server logs (app_preview_logs).
+                  {tr("Ask the agent to check the development server logs (app_preview_logs).", "请让 Agent 检查开发服务器日志（app_preview_logs）。")}
                 </p>
               </div>
             ) : (
               <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
                 <Eye className="h-6 w-6" />
-                <p className="text-sm">No preview yet.</p>
+                <p className="text-sm">{tr("No preview yet.", "还没有预览。")}</p>
                 <p className="text-xs">
-                  Ask the agent to build an app, and it shows up here.
+                  {tr("Ask the agent to build an app, and it will appear here.", "让 Agent 构建应用后，预览会显示在这里。")}
                 </p>
               </div>
             )}
@@ -3991,26 +6582,16 @@ function WorkspacePanel({
   );
 }
 
-function formatRelativeTime(ts?: number): string {
-  if (!ts) return "—";
-  const d = new Date(ts * 1000);
-  const now = Date.now();
-  const diff = now - d.getTime();
-  if (diff < 60_000) return "just now";
-  if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h ago`;
-  if (diff < 7 * 86400_000) return `${Math.floor(diff / 86400_000)}d ago`;
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
 // FileViewer renders a selected workspace file inline (right column of the
 // Files tab): image / pdf / markdown / highlighted text / rendered-or-source
 // HTML. onClose, when given, deselects the file.
 function KnowledgeFileViewer({ agentId, source, onClose }: { agentId: string; source: KnowledgeSource; onClose?: () => void }) {
+  const { tr } = useLocale();
   const storedName = source.path.startsWith("knowledge/") ? source.path.slice("knowledge/".length) : source.path;
   const [file, setFile] = useState<{ name: string; content: string; size: number; hash?: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<"rendered" | "source">("source");
+  // Rendered first; the toggle flips to source.
+  const [view, setView] = useState<"rendered" | "source">("rendered");
 
   useEffect(() => {
     let cancelled = false;
@@ -4038,8 +6619,8 @@ function KnowledgeFileViewer({ agentId, source, onClose }: { agentId: string; so
           </div>
           <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
             {source.id}
-            {source.chunk ? ` · chunk ${source.chunk}` : ""}
-            {source.score ? ` · score ${source.score}` : ""}
+            {source.chunk ? ` · ${tr("chunk", "分块")} ${source.chunk}` : ""}
+            {source.score ? ` · ${tr("score", "相关度")} ${source.score}` : ""}
             {file?.hash ? ` · ${file.hash.slice(0, 8)}` : ""}
           </p>
         </div>
@@ -4048,7 +6629,7 @@ function KnowledgeFileViewer({ agentId, source, onClose }: { agentId: string; so
             <button
               onClick={() => setView(view === "rendered" ? "source" : "rendered")}
               className="rounded-md p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50"
-              title={view === "rendered" ? "View source" : "View rendered"}
+              title={view === "rendered" ? tr("View source", "查看源码") : tr("View rendered", "查看渲染结果")}
             >
               {view === "rendered" ? <Code2 className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
             </button>
@@ -4057,7 +6638,7 @@ function KnowledgeFileViewer({ agentId, source, onClose }: { agentId: string; so
             <button
               onClick={onClose}
               className="rounded-md p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50"
-              title="Close knowledge file"
+              title={tr("Close knowledge file", "关闭知识库文件")}
             >
               <X className="h-4 w-4" />
             </button>
@@ -4066,10 +6647,10 @@ function KnowledgeFileViewer({ agentId, source, onClose }: { agentId: string; so
       </div>
       <div className="min-h-0 flex-1">
         {error ? (
-          <p className="p-4 text-sm text-destructive">Failed to load: {error}</p>
+          <p className="p-4 text-sm text-destructive">{tr("Failed to load: {{error}}", "加载失败：{{error}}", { error })}</p>
         ) : !file ? (
-          <p className="p-4 text-sm text-muted-foreground">Loading…</p>
-        ) : preview !== "text" && view === "rendered" ? (
+          <p className="p-4 text-sm text-muted-foreground">{tr("Loading…", "正在加载…")}</p>
+        ) : (preview === "markdown" || preview === "html") && view === "rendered" ? (
           <div className="h-full overflow-auto p-4">
             <ChatMarkdown text={file.content} />
           </div>
@@ -4085,21 +6666,60 @@ function KnowledgeFileViewer({ agentId, source, onClose }: { agentId: string; so
   );
 }
 
-function FileViewer({ agentId, file, onClose }: { agentId: string; file: ProducedFile; onClose?: () => void }) {
+function FileViewer({
+  agentId,
+  file,
+  onClose,
+  onAsk,
+  reloadNonce = 0,
+}: {
+  agentId: string;
+  file: ProducedFile;
+  onClose?: () => void;
+  // An editable design page asked the agent to change something.
+  onAsk?: (text: string) => void;
+  // Bumped after each agent turn: reloads a rendered HTML page so the
+  // user sees the agent's latest change.
+  reloadNonce?: number;
+}) {
+  const { tr } = useLocale();
   const { preview } = fileKind(file.path);
   const src = fileUrl(agentId, file.path, false);
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
+
+  // Editable designs (skills/image-to-editable-html) talk to the chat from
+  // their sandboxed iframe: manual edits are saved next to the design so
+  // the agent's next change builds on them; "ask AI" posts an instruction
+  // into the conversation. Only messages from this viewer's own frame count.
+  useEffect(() => {
+    if (preview !== "html") return;
+    const onMessage = (e: MessageEvent) => {
+      if (!frameRef.current || e.source !== frameRef.current.contentWindow) return;
+      const data = e.data as { type?: string; text?: string; version?: number; changed?: unknown; deleted?: unknown };
+      if (data?.type === "fastclaw:scene-edits") {
+        saveSceneEdits(agentId, file.path, { version: data.version, changed: data.changed, deleted: data.deleted }).catch(() => {});
+      } else if (data?.type === "fastclaw:ask" && typeof data.text === "string" && data.text.trim()) {
+        onAsk?.(data.text.trim());
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [preview, agentId, file.path, onAsk]);
   const downloadUrl = fileUrl(agentId, file.path, true);
   const basename = file.path.split("/").pop() || file.path;
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Default to SOURCE for markdown/html — clicking a file shows its code; the
-  // toggle flips to rendered when wanted.
-  const [view, setView] = useState<"rendered" | "source">("source");
+  // Default to the RENDERED preview for markdown/html; the toggle flips to
+  // source when wanted.
+  const [view, setView] = useState<"rendered" | "source">("rendered");
 
   useEffect(() => {
-    // Fetch the raw text for anything we show as source: markdown, code/text,
-    // and html (html starts in source view too).
+    // Fetch the raw text for anything we show as text: markdown (rendered or
+    // source), code/text, and html only once the source view is opened —
+    // rendered html loads in the iframe, and generated pages can be several
+    // MB of inlined assets.
     if (preview !== "markdown" && preview !== "text" && preview !== "html") return;
+    if (preview === "html" && view !== "source") return;
     if (text !== null) return;
     let cancelled = false;
     fetch(src)
@@ -4107,7 +6727,7 @@ function FileViewer({ agentId, file, onClose }: { agentId: string; file: Produce
       .then((t) => { if (!cancelled) setText(t); })
       .catch((e) => { if (!cancelled) setError(String(e)); });
     return () => { cancelled = true; };
-  }, [src, preview, text]);
+  }, [src, preview, text, view]);
 
   return (
     <div className="flex h-full flex-col">
@@ -4124,7 +6744,7 @@ function FileViewer({ agentId, file, onClose }: { agentId: string; file: Produce
               <button
                 onClick={() => setView(view === "rendered" ? "source" : "rendered")}
                 className="rounded-md p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50"
-                title={view === "rendered" ? "View source" : "View rendered"}
+                title={view === "rendered" ? tr("View source", "查看源码") : tr("View rendered", "查看渲染结果")}
               >
                 {view === "rendered" ? <Code2 className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
               </button>
@@ -4134,7 +6754,7 @@ function FileViewer({ agentId, file, onClose }: { agentId: string; file: Produce
               target="_blank"
               rel="noopener noreferrer"
               className="rounded-md p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50"
-              title="Open in new tab"
+              title={tr("Open in new tab", "在新标签页中打开")}
             >
               <ExternalLink className="h-4 w-4" />
             </a>
@@ -4142,7 +6762,7 @@ function FileViewer({ agentId, file, onClose }: { agentId: string; file: Produce
               <button
                 onClick={onClose}
                 className="rounded-md p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50"
-                title="Close file"
+                title={tr("Close file", "关闭文件")}
               >
                 <X className="h-4 w-4" />
               </button>
@@ -4159,13 +6779,15 @@ function FileViewer({ agentId, file, onClose }: { agentId: string; file: Produce
             <iframe src={src} className="h-full w-full border-0" title={basename} />
           )}
           {(preview === "markdown" || preview === "text" || preview === "html") && (
-            // Rendered view (markdown / html) only when toggled; otherwise the
-            // default is full-bleed highlighted SOURCE.
+            // Rendered view (markdown / html) by default; the toggle switches
+            // to full-bleed highlighted SOURCE.
             preview !== "text" && view === "rendered" ? (
               preview === "html" ? (
                 // sandbox="allow-scripts": CSS/animations work; scripts can't
                 // reach parent cookies/storage — safe for untrusted output.
                 <iframe
+                  key={reloadNonce}
+                  ref={frameRef}
                   src={src}
                   sandbox="allow-scripts"
                   className="h-full w-full border-0 bg-white"
@@ -4177,12 +6799,13 @@ function FileViewer({ agentId, file, onClose }: { agentId: string; file: Produce
                 </div>
               )
             ) : error ? (
-              <p className="p-4 text-sm text-destructive">Failed to load: {error}</p>
+              <p className="p-4 text-sm text-destructive">{tr("Failed to load: {{error}}", "加载失败：{{error}}", { error })}</p>
             ) : text === null ? (
-              <p className="p-4 text-sm text-muted-foreground">Loading…</p>
-            ) : text.includes("```") ? (
-              // Content with its own fences would break the fenced wrapper —
-              // fall back to a plain (unhighlighted) full-bleed block.
+              <p className="p-4 text-sm text-muted-foreground">{tr("Loading…", "正在加载…")}</p>
+            ) : text.includes("```") || text.length > 200_000 ? (
+              // Content with its own fences would break the fenced wrapper, and
+              // highlighting a multi-MB file freezes the tab — fall back to a
+              // plain (unhighlighted) full-bleed block.
               <pre className="h-full overflow-auto whitespace-pre-wrap break-all p-3 font-mono text-xs">{text}</pre>
             ) : (
               // Shiki-highlighted source, no card / copy pill / padding —
@@ -4195,9 +6818,9 @@ function FileViewer({ agentId, file, onClose }: { agentId: string; file: Produce
           {preview === "none" && (
             <div className="flex h-full flex-col items-center justify-center gap-3 p-4 text-center">
               <File className="h-12 w-12 text-muted-foreground/50" />
-              <p className="text-sm text-muted-foreground">Preview not available for this file type.</p>
+              <p className="text-sm text-muted-foreground">{tr("Preview is not available for this file type.", "此文件类型不支持预览。")}</p>
               <a href={downloadUrl} className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
-                <Download className="h-3.5 w-3.5" /> Download
+                <Download className="h-3.5 w-3.5" /> {tr("Download", "下载")}
               </a>
             </div>
           )}
@@ -4217,13 +6840,29 @@ function SlashMenu({
   onHover: (i: number) => void;
   onSelect: (s: SlashItem) => void;
 }) {
+  const { tr } = useLocale();
+  const commandDescriptions: Record<string, string> = {
+    new: tr("Clear session history", "清空会话历史"),
+    reset: tr("Clear session history", "清空会话历史"),
+    retry: tr("Re-run last message", "重新运行上一条消息"),
+    undo: tr("Undo last turn", "撤销上一轮对话"),
+    compact: tr("Compress context window", "压缩上下文窗口"),
+    status: tr("Agent status & memory info", "Agent 状态与记忆信息"),
+    usage: tr("Billing usage and session stats", "计费用量与会话统计"),
+    insights: tr("Activity insights (last N days)", "最近 N 天的活动分析"),
+    personality: tr("List or switch personality", "查看或切换个性") ,
+    model: tr("Show or switch LLM model", "查看或切换模型"),
+    goal: tr("Persistent multi-turn objective", "持续多轮目标"),
+    help: tr("Show command help", "显示命令帮助"),
+    version: tr("Show version", "显示版本"),
+  };
   return (
     <div className="absolute bottom-full left-0 right-0 mb-2 rounded-xl border border-border bg-popover shadow-lg overflow-hidden z-20">
       <div className="max-h-[320px] overflow-y-auto py-1">
         {items.map((it, i) => {
           const isCmd = it.kind === "command";
           const Icon = isCmd ? Terminal : Puzzle;
-          const badge = isCmd ? "command" : (it.type || "skill");
+          const badge = isCmd ? tr("command", "命令") : (it.type || tr("skill", "技能"));
           const label = isCmd ? `/${it.name}` : it.name;
           return (
             <button
@@ -4249,7 +6888,7 @@ function SlashMenu({
                 </div>
                 {it.description && (
                   <p className="text-xs text-muted-foreground line-clamp-1">
-                    {it.description}
+                    {isCmd ? commandDescriptions[it.name] || it.description : it.description}
                   </p>
                 )}
               </div>
@@ -4258,11 +6897,11 @@ function SlashMenu({
         })}
       </div>
       <Link
-        href="/skills/"
+        href="/console/skills/"
         className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
       >
         <SlidersHorizontal className="h-3.5 w-3.5" />
-        Manage Skills
+        {tr("Manage Skills", "管理技能")}
       </Link>
     </div>
   );

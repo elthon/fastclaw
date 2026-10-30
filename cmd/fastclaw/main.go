@@ -15,6 +15,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/api"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/connectors"
 	"github.com/fastclaw-ai/fastclaw/internal/daemon"
 	"github.com/fastclaw-ai/fastclaw/internal/gateway"
 	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
@@ -89,11 +90,16 @@ func (a *apiResolver) DispatchFeishuWebhook(accountID string, body []byte) ([]by
 	return a.gw.DispatchFeishuWebhook(accountID, body)
 }
 
-func (a *apiResolver) DispatchLINEWebhook(accountID string, body []byte, signature string) ([]byte, int, error) {
-	return a.gw.DispatchLINEWebhook(accountID, body, signature)
+func (a *apiResolver) DispatchLINEWebhook(accountID string, body []byte, signature, publicBase string) ([]byte, int, error) {
+	return a.gw.DispatchLINEWebhook(accountID, body, signature, publicBase)
+}
+
+func (a *apiResolver) ServeLINEMedia(accountID, name string) ([]byte, string, error) {
+	return a.gw.ServeLINEMedia(accountID, name)
 }
 
 func main() {
+	var showVersion bool
 	rootCmd := &cobra.Command{
 		Use:   "fastclaw",
 		Short: "FastClaw - Multi-User AI Agent Platform",
@@ -111,12 +117,17 @@ func main() {
 			})))
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if showVersion {
+				versionCmd().Run(cmd, args)
+				return nil
+			}
 			if isInteractiveTerminal(os.Stdin, os.Stdout) {
 				return runChat(cmd.Context(), chatOptions{})
 			}
 			return runGateway(18953)
 		},
 	}
+	rootCmd.Flags().BoolVar(&showVersion, "version", false, "Print FastClaw version")
 
 	rootCmd.AddCommand(gatewayCmd())
 	rootCmd.AddCommand(chatCmd())
@@ -188,6 +199,10 @@ func runGateway(port int) error {
 		port = env.Gateway.Port
 	}
 
+	if home, err := config.HomeDir(); err == nil {
+		slog.Info("fastclaw instance", "home", home, "port", port)
+	}
+
 	agent.InstallBundledSkills()
 
 	if err := daemon.WritePIDFile(); err != nil {
@@ -198,6 +213,14 @@ func runGateway(port int) error {
 	gw, err := gateway.New(env)
 	if err != nil {
 		return fmt.Errorf("create gateway: %w", err)
+	}
+
+	// The person's connected third-party accounts (internal/connectors):
+	// configured in System → Tools → Connectors, else from
+	// FASTCLAW_CONNANY_URL + FASTCLAW_CONNANY_API_KEY; off when neither.
+	connectors.SetEnvFallback(connectors.Settings{URL: env.Connany.URL, APIKey: env.Connany.APIKey})
+	if _, err := connectors.Apply(context.Background(), gw.Store()); err != nil {
+		slog.Error("connectors disabled", "error", err)
 	}
 
 	// Remove credential-bearing env vars from the process environment
@@ -241,6 +264,8 @@ func runGateway(port int) error {
 	apiSrv := api.NewServer(&apiResolver{gw: gw}, authResolver, gwCfg)
 	apiSrv.SetMeter(gw.Usage())
 	apiSrv.SetQuotaStore(gw.QuotaStore())
+	apiSrv.SetStore(gw.Store())
+	apiSrv.SetWorkspaceStore(gw.Workspace())
 	webSrv.SetAPIServer(apiSrv)
 
 	// Coding-agent project runtime: long-lived dev-server sandbox +

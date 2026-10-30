@@ -51,12 +51,18 @@ func registerChannelInstance(rec store.ConfigRecord, mb *bus.MessageBus, chanMgr
 		return registerSlackChannels(cc, mb, chanMgr, hot)
 	case "line":
 		return registerLINEChannels(cc, mb, chanMgr, hot)
+	case "imessage":
+		return registerIMessageChannels(cc, mb, chanMgr, hot)
 	case "wechat":
 		return registerWeChatChannels(rec, cc, mb, chanMgr, st, hot)
 	case "feishu":
 		return registerFeishuChannels(cc, mb, chanMgr, hot)
 	case "dingtalk":
 		return registerDingTalkChannels(cc, mb, chanMgr, hot)
+	case "wecom":
+		return registerWeComChannels(cc, mb, chanMgr, hot)
+	case "whatsapp":
+		return registerWhatsAppChannels(cc, mb, chanMgr, st, hot)
 	}
 	return nil
 }
@@ -74,11 +80,17 @@ func registerChannelFromRecord(rec store.ChannelRecord, mb *bus.MessageBus, chan
 		return registerSlackChannels(cc, mb, chanMgr, hot)
 	case "line":
 		return registerLINEChannels(cc, mb, chanMgr, hot)
+	case "imessage":
+		return registerIMessageChannels(cc, mb, chanMgr, hot)
 	case "wechat":
 		cfgRec := channelRecordToConfigRecord(rec)
 		return registerWeChatChannels(cfgRec, cc, mb, chanMgr, st, hot)
 	case "feishu":
 		return registerFeishuChannels(cc, mb, chanMgr, hot)
+	case "wecom":
+		return registerWeComChannels(cc, mb, chanMgr, hot)
+	case "whatsapp":
+		return registerWhatsAppChannels(cc, mb, chanMgr, st, hot)
 	}
 	return nil
 }
@@ -304,6 +316,52 @@ func registerDingTalkChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, ch
 			return err
 		}
 		registerSingleton(chanMgr, dt, hot)
+	}
+	return nil
+}
+
+func registerWeComChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, chanMgr *channels.Manager, hot bool) error {
+	// One row per bot, keyed by Bot ID; AccountConfig.BotToken is the
+	// bot Secret. The long connection is exclusive per bot (a second
+	// subscribe kicks the first), so it always takes the lease.
+	for botID, acct := range chCfg.Accounts {
+		secret := acct.BotToken
+		if secret == "" {
+			secret = chCfg.BotToken
+		}
+		wc, err := channels.NewWeCom(botID, secret, mb)
+		if err != nil {
+			return err
+		}
+		registerSingleton(chanMgr, wc, hot)
+	}
+	return nil
+}
+
+func registerWhatsAppChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, chanMgr *channels.Manager, st store.Store, hot bool) error {
+	// One row per linked number, keyed by phone number;
+	// AccountConfig.UserID is the device JID in the whatsmeow store. A
+	// device holds one live connection, so it always takes the lease.
+	for accountID, acct := range chCfg.Accounts {
+		wa, err := channels.NewWhatsApp(acct.UserID, accountID, mb)
+		if err != nil {
+			return err
+		}
+		// Unlinked from the phone (or revoked by WhatsApp): the session
+		// is gone for good, so drop the channel row — the user has to
+		// scan a new QR code from the dashboard.
+		if st != nil {
+			wa.SetOnLoggedOut(func(dead string) {
+				ctx := context.Background()
+				if ch, err := st.LookupChannel(ctx, "whatsapp", dead); err == nil && ch != nil {
+					if err := st.DeleteChannel(ctx, ch.ID); err != nil {
+						slog.Warn("whatsapp logged-out cleanup failed", "account", dead, "error", err)
+					}
+				}
+				chanMgr.Unregister("whatsapp", dead)
+			})
+		}
+		registerSingleton(chanMgr, wa, hot)
 	}
 	return nil
 }

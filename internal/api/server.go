@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
+	"github.com/fastclaw-ai/fastclaw/internal/workspace"
 )
 
 // UserResolver looks up a user space by user ID.
@@ -21,11 +24,8 @@ type UserResolver interface {
 
 // AgentInjector is the optional capability for resolvers that can
 // dynamically attach a foreign agent_id into a caller's UserSpace.
-// Used by super_admin chat handlers so the admin operates on the agent
-// (which lives in the owner's account) under the admin's own user_id —
-// sessions, memory, provider scope all stay admin-keyed, while the
-// agent's persistent identity (system prompt, agent-scope config,
-// skills) is reused. Implementations MUST be idempotent.
+// Used by public-link chat, API-key access, and super_admin's explicit
+// read-only ?actAs= audit flow. Implementations MUST be idempotent.
 type AgentInjector interface {
 	EnsureAgent(ctx context.Context, userID, agentID string) error
 }
@@ -45,6 +45,14 @@ type Server struct {
 	limiter      *rateLimiter
 	meter        usage.Meter
 	quotaStore   usage.QuotaStore
+	// store backs the /v1/agents management API and strict agent
+	// resolution. Nil in unit tests that only exercise chat plumbing.
+	store store.Store
+	// workspace holds conversation workspaces; /v1 returns the files an
+	// agent produces from it. Nil disables file return.
+	workspace workspace.Store
+	acpMu     sync.Mutex
+	acpRuns   map[string]*acpRunState
 }
 
 // NewServer creates a new API server. authResolver is mandatory — there is
@@ -66,6 +74,7 @@ func NewServer(resolver UserResolver, authResolver *auth.Resolver, gatewayCfg *c
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ws", s.HandleWebSocket)
 	mux.HandleFunc("OPTIONS /v1/", s.handleCORS)
+	mux.HandleFunc("OPTIONS /acp/", s.handleCORS)
 
 	getUserID := func(r *http.Request) string { return config.UserIDFromContext(r.Context()) }
 
@@ -74,8 +83,21 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleChatCompletions)))
 	}
 	if s.gatewayCfg == nil || s.gatewayCfg.HTTP.Endpoints.Agents.Enabled {
-		mux.HandleFunc("GET /v1/agents",
-			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleListAgents)))
+		// Agent management for integrating apps. Agents created here
+		// belong to the api key's app, never to an
+		// end-user, so X-Fastclaw-End-User does not change what these
+		// endpoints see.
+		for pattern, h := range map[string]http.HandlerFunc{
+			"GET /v1/agents":                                         s.HandleListAgents,
+			"POST /v1/agents":                                        s.HandleCreateAgent,
+			"GET /v1/agents/{id}":                                    s.HandleGetAgent,
+			"PATCH /v1/agents/{id}":                                  s.HandleUpdateAgent,
+			"DELETE /v1/agents/{id}":                                 s.HandleDeleteAgent,
+			"PUT /v1/agents/{id}/system-files/{name}":                s.HandlePutAgentSystemFile,
+			"GET /v1/agents/{id}/sessions/{session}/files/{path...}": s.HandleGetSessionFile,
+		} {
+			mux.HandleFunc(pattern, s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, h)))
+		}
 	}
 	// Explicit provisioning of an app_user for a downstream end-user.
 	// Always available — any api_key call can use the same identity-
@@ -96,6 +118,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetQuota)))
 	mux.HandleFunc("DELETE /v1/quota",
 		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleDeleteQuota)))
+
+	// Agent Communication Protocol (ACP) 0.2. The protocol defines root
+	// paths such as /agents and /runs relative to a server base URL. FastClaw
+	// exposes that base at /acp because /agents is already a dashboard route.
+	s.registerACPRoutes(mux, getUserID)
 }
 
 // SetMeter installs the token usage meter for the /v1/usage endpoint.
@@ -104,6 +131,14 @@ func (s *Server) SetMeter(m usage.Meter) { s.meter = m }
 // SetQuotaStore installs the quota store for /v1/quota endpoints.
 func (s *Server) SetQuotaStore(qs usage.QuotaStore) { s.quotaStore = qs }
 
+// SetStore installs the platform store used by /v1/agents and by strict
+// agent resolution on /v1/chat/completions.
+func (s *Server) SetStore(st store.Store) { s.store = st }
+
+// SetWorkspaceStore installs the conversation workspace store used to
+// return agent-produced files from /v1.
+func (s *Server) SetWorkspaceStore(ws workspace.Store) { s.workspace = ws }
+
 // RegisterAdminRoutes is kept as a no-op for callers that still call it
 // during gateway boot. Admin user/apikey CRUD now lives under /api/admin
 // in the setup server, which has proper cookie-session auth.
@@ -111,50 +146,11 @@ func (s *Server) RegisterAdminRoutes(mux *http.ServeMux) {}
 
 func (s *Server) handleCORS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-fastclaw-agent-id, x-fastclaw-session-key")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-fastclaw-agent-id, x-fastclaw-session-key, x-fastclaw-end-user")
+	w.Header().Set("Access-Control-Expose-Headers", "Run-ID")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleListAgents handles GET /v1/agents. Returns only the agents this
-// caller is authorized for.
-func (s *Server) HandleListAgents(w http.ResponseWriter, r *http.Request) {
-	space, err := s.userSpaceFor(r)
-	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "authentication_error"},
-		})
-		return
-	}
-	ident, _ := auth.FromContext(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"agents": buildAgentList(space, ident)})
-}
-
-func buildAgentList(space *UserSpaceView, ident auth.Identity) []map[string]string {
-	all := space.Agents.All()
-	modelMap := make(map[string]string)
-	if space.Config != nil {
-		for _, ra := range config.ResolveAgents(space.Config, nil) {
-			modelMap[ra.ID] = ra.Model
-		}
-	}
-	agents := make([]map[string]string, 0, len(all))
-	for _, ag := range all {
-		if !ident.CanAccessAgent(ag.Name()) {
-			continue
-		}
-		model := ag.Model()
-		if model == "" {
-			model = modelMap[ag.Name()]
-		}
-		agents = append(agents, map[string]string{
-			"id":    ag.Name(),
-			"name":  ag.Name(),
-			"model": model,
-		})
-	}
-	return agents
 }
 
 // userSpaceFor resolves the user space from the request's identity.
@@ -176,14 +172,20 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			writeUnauth(w, "auth resolver not configured")
 			return
 		}
-		s.authResolver.Middleware(next)(w, r)
+		// Optional + our own check (instead of auth.Middleware) so a
+		// missing/invalid key gets the unified /v1 error body.
+		s.authResolver.Optional(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := auth.FromContext(r.Context()); !ok {
+				writeUnauth(w, "missing or invalid credentials")
+				return
+			}
+			next(w, r)
+		})(w, r)
 	}
 }
 
 func writeUnauth(w http.ResponseWriter, msg string) {
-	writeJSON(w, http.StatusUnauthorized, map[string]any{
-		"error": map[string]string{"message": msg, "type": "authentication_error"},
-	})
+	writeAPIError(w, http.StatusUnauthorized, errTypeAuthentication, codeUnauthorized, msg)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

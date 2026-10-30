@@ -1,12 +1,16 @@
 #!/bin/sh
 set -e
 
-# Build web
-cd web && pnpm build && cd ..
+# `make dev` serves the web UI from `next dev` (hot reload) and sets
+# FASTCLAW_DEV_SKIP_WEB so Go rebuilds don't re-export the frontend.
+if [ -z "$FASTCLAW_DEV_SKIP_WEB" ]; then
+  # Build web
+  (cd web && pnpm build)
 
-# Copy web output to embed dir
-rm -rf internal/setup/web
-cp -r web/out internal/setup/web
+  # Copy web output to embed dir
+  rm -rf internal/setup/web
+  cp -r web/out internal/setup/web
+fi
 
 # Build Go binary. Stamp the same version/commit/date that the release
 # Makefile sets — so dev binaries report a real `git describe` tag (e.g.

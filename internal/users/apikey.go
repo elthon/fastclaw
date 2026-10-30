@@ -221,13 +221,9 @@ func (k *APIKeys) LookupByToken(ctx context.Context, token string) (*Resolved, e
 	case APIKeyTypeUser:
 		// All agents owned by the apikey owner. A second list per
 		// request is the price of "no ACL maintenance for new agents".
-		ags, err := k.store.ListAgents(ctx, rec.UserID)
+		agents, err = k.store.ListAgentIDs(ctx, rec.UserID)
 		if err != nil {
 			return nil, err
-		}
-		agents = make([]string, 0, len(ags))
-		for _, a := range ags {
-			agents = append(agents, a.ID)
 		}
 	default:
 		// type=agent (and any legacy/unknown value) → explicit ACL.

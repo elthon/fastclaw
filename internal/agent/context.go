@@ -13,6 +13,7 @@ import (
 
 // GroupContext holds information about the group chat environment for system prompt injection.
 type GroupContext struct {
+	Instruction string   // authenticated topic transcript and turn instructions
 	BotUsername string   // this agent's bot username
 	Teammates   []string // other agent names in the group
 }
@@ -163,6 +164,30 @@ func (cb *ContextBuilder) BuildSystemPrompt() string {
 // every mode so the model internalizes "who it is" before operational
 // instructions.
 func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Memory, trusted bool) string {
+	return cb.buildSystemPromptAs(chatterUID, chatterMem, trusted, cb.groupCtx)
+}
+
+// BuildSystemPromptAsWithGroup supplies group identity for one turn only.
+// Unlike SetGroupContext it cannot leak a web group's membership into a
+// simultaneous direct-message turn handled by the same Agent instance.
+func (cb *ContextBuilder) BuildSystemPromptAsWithGroup(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext) string {
+	return cb.buildSystemPromptAs(chatterUID, chatterMem, trusted, groupCtx)
+}
+
+// BuildTurnSystemPrompt is BuildSystemPromptAsWithGroup plus the turn's
+// host working directory (Registry.HostWorkDir — the session workspace).
+// Per call for the same reason as trusted/groupCtx: one builder serves
+// every chat of the agent concurrently. Empty workdir falls back to the
+// agent-level workspace.
+func (cb *ContextBuilder) BuildTurnSystemPrompt(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext, workdir string) string {
+	return cb.buildSystemPrompt(chatterUID, chatterMem, trusted, groupCtx, workdir)
+}
+
+func (cb *ContextBuilder) buildSystemPromptAs(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext) string {
+	return cb.buildSystemPrompt(chatterUID, chatterMem, trusted, groupCtx, "")
+}
+
+func (cb *ContextBuilder) buildSystemPrompt(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext, workdir string) string {
 	if chatterUID == "" {
 		chatterUID = cb.userID
 	}
@@ -176,6 +201,7 @@ func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Mem
 
 	p := &promptCtx{
 		cb:         cb,
+		groupCtx:   groupCtx,
 		chatterUID: chatterUID,
 		chatterMem: chatterMem,
 		mode:       mode,
@@ -183,6 +209,7 @@ func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Mem
 		loc:        loc,
 		dateLine:   buildDateLine(now, tzExplicit),
 		trusted:    trusted,
+		workdir:    workdir,
 	}
 
 	var parts []string

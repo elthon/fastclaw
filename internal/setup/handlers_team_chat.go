@@ -2,14 +2,12 @@ package setup
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
+	"github.com/fastclaw-ai/fastclaw/internal/bus"
 )
 
 type teamChatRequest struct {
@@ -21,6 +19,9 @@ type teamChatRequest struct {
 	Attachments []attachmentRequest `json:"attachments,omitempty"`
 	Members     []teamChatMember    `json:"members"`
 	Params      map[string]any      `json:"params,omitempty"`
+	Name        string              `json:"-"`
+	Description string              `json:"-"`
+	HumanName   string              `json:"-"`
 }
 
 type teamChatMember struct {
@@ -28,58 +29,12 @@ type teamChatMember struct {
 	SessionID string `json:"sessionId"`
 }
 
-func (s *Server) handleTeamChatStream(w http.ResponseWriter, r *http.Request) {
-	var req teamChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if strings.TrimSpace(req.TeamID) == "" || len(req.Members) == 0 {
-		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "teamId and members required"})
-		return
-	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": "streaming unsupported"})
-		return
-	}
-	uid := s.effectiveUserID(r)
-	if uid == "" {
-		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-		return
-	}
-
-	members := s.resolveTeamMembers(r, req)
-	if len(members) == 0 {
-		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "no accessible team agents"})
-		return
-	}
-	selected := s.selectTeamMembers(req.Message, members)
-	if len(selected) == 0 {
-		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "no routed team agents"})
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	flusher.Flush()
-
-	for _, member := range selected {
-		if !s.runTeamAgentTurn(w, flusher, r, uid, req, member) {
-			return
-		}
-	}
-	fmt.Fprintf(w, "data: %s\n\n", `{"type":"done"}`)
-	flusher.Flush()
-}
-
 type resolvedTeamMember struct {
-	AgentID   string
-	SessionID string
-	Handle    AgentHandle
-	Name      string
+	AgentID     string
+	SessionID   string
+	Handle      AgentHandle
+	Name        string
+	Description string
 }
 
 func (s *Server) resolveTeamMembers(r *http.Request, req teamChatRequest) []resolvedTeamMember {
@@ -94,20 +49,22 @@ func (s *Server) resolveTeamMembers(r *http.Request, req teamChatRequest) []reso
 		if ag == nil {
 			continue
 		}
-		sessionID := strings.TrimSpace(m.SessionID)
-		if sessionID == "" {
-			sessionID = teamAgentSessionID(req.SessionID, req.TeamID, agentID)
-		}
+		sessionID := teamAgentSessionID(req.SessionID, req.TeamID, agentID)
 		name := agentID
+		description := ""
 		if s.dataStore != nil {
-			if rec, err := s.dataStore.GetAgent(r.Context(), agentID); err == nil && rec != nil && strings.TrimSpace(rec.Name) != "" {
-				name = strings.TrimSpace(rec.Name)
+			if rec, err := s.dataStore.GetAgent(r.Context(), agentID); err == nil && rec != nil {
+				if strings.TrimSpace(rec.Name) != "" {
+					name = strings.TrimSpace(rec.Name)
+				}
+				if value, ok := rec.Config["description"].(string); ok {
+					description = strings.TrimSpace(value)
+				}
 			}
 		}
 		seen[agentID] = true
-		out = append(out, resolvedTeamMember{AgentID: agentID, SessionID: sessionID, Handle: ag, Name: name})
+		out = append(out, resolvedTeamMember{AgentID: agentID, SessionID: sessionID, Handle: ag, Name: name, Description: description})
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -116,55 +73,70 @@ func teamAgentSessionID(baseSessionID, teamID, agentID string) string {
 	if base == "" {
 		base = "team-" + strings.TrimSpace(teamID)
 	}
-	if strings.Contains(base, "-agent-"+agentID) {
+	if strings.HasSuffix(base, "-agent-"+agentID) {
 		return base
 	}
 	return base + "-agent-" + agentID
 }
 
 func (s *Server) selectTeamMembers(message string, members []resolvedTeamMember) []resolvedTeamMember {
-	text := strings.ToLower(strings.TrimSpace(message))
-	if strings.Contains(text, "@all") || strings.Contains(text, "所有人") || strings.Contains(text, "大家") {
+	if len(members) == 0 {
+		return nil
+	}
+	if mentioned, all := teamMentions(message, members); all {
 		return members
-	}
-	var mentioned []resolvedTeamMember
-	for _, m := range members {
-		name := strings.ToLower(m.Name)
-		id := strings.ToLower(m.AgentID)
-		if strings.Contains(text, "@"+name) || strings.Contains(text, "@"+id) || strings.Contains(text, name) {
-			mentioned = append(mentioned, m)
-		}
-	}
-	if len(mentioned) > 0 {
+	} else {
 		return mentioned
 	}
-	best := members[0]
-	bestScore := -1
-	for _, m := range members {
-		score := teamRouteScore(text, m)
-		if score > bestScore {
-			bestScore = score
-			best = m
-		}
-	}
-	return []resolvedTeamMember{best}
 }
 
-func teamRouteScore(text string, member resolvedTeamMember) int {
-	score := 0
-	for _, token := range strings.Fields(strings.ToLower(member.Name + " " + member.AgentID)) {
-		token = strings.Trim(token, ".,，。:：;；()（）[]【】")
-		if len([]rune(token)) < 2 {
-			continue
-		}
-		if strings.Contains(text, token) {
-			score += len([]rune(token))
+func teamMemberParams(base map[string]any, member resolvedTeamMember, members []resolvedTeamMember) map[string]any {
+	params := make(map[string]any, len(base)+1)
+	for key, value := range base {
+		params[key] = value
+	}
+	teammates := make([]string, 0, len(members)-1)
+	for _, candidate := range members {
+		if candidate.AgentID != member.AgentID {
+			teammates = append(teammates, candidate.Name)
 		}
 	}
-	return score
+	var instruction string
+	if previous, ok := base["__fastclawGroupChat"].(map[string]any); ok {
+		instruction, _ = previous["instruction"].(string)
+	}
+	params["__fastclawGroupChat"] = map[string]any{
+		"instruction": instruction,
+		"botUsername": member.Name,
+		"teammates":   teammates,
+	}
+	return params
 }
 
-func (s *Server) runTeamAgentTurn(w http.ResponseWriter, flusher http.Flusher, r *http.Request, uid string, req teamChatRequest, member resolvedTeamMember) bool {
+type teamMessageInjector interface {
+	InjectGroupMessage(context.Context, bus.InboundMessage)
+}
+
+func injectTeamMessage(ctx context.Context, target resolvedTeamMember, uid, teamID, senderName, text string, bot bool) {
+	injector, ok := target.Handle.(teamMessageInjector)
+	if !ok || strings.TrimSpace(text) == "" {
+		return
+	}
+	injector.InjectGroupMessage(ctx, bus.InboundMessage{
+		Channel:      "web",
+		ChatID:       target.SessionID,
+		ProjectID:    teamID,
+		UserID:       uid,
+		OwnerUserID:  uid,
+		AgentID:      target.AgentID,
+		Text:         text,
+		PeerKind:     "group",
+		SenderName:   senderName,
+		IsBotMessage: bot,
+	})
+}
+
+func (s *Server) runTeamAgentTurn(r *http.Request, uid string, req teamChatRequest, member resolvedTeamMember, members []resolvedTeamMember, emit func(agent.EventEnvelope)) (bool, string) {
 	chatReq := chatRequest{
 		AgentID:     member.AgentID,
 		SessionID:   member.SessionID,
@@ -172,98 +144,104 @@ func (s *Server) runTeamAgentTurn(w http.ResponseWriter, flusher http.Flusher, r
 		Images:      req.Images,
 		ImageURLs:   req.ImageURLs,
 		Attachments: req.Attachments,
-		Params:      req.Params,
+		Params:      teamMemberParams(req.Params, member, members),
 	}
 	atts := chatReq.allAttachments()
 	imageURLs := chatReq.inlineImageURLs()
 	msgText := chatReq.Message
 	if !chatReq.preMaterialized() {
-		projectID := s.resolveSessionProject(r.Context(), r, member.AgentID, member.SessionID)
+		projectID := req.TeamID
 		paths := member.Handle.WriteSessionAttachments(r.Context(), member.SessionID, projectID, atts)
 		msgText = annotateMessageWithAttachments(chatReq.Message, paths)
 	}
 
-	hub := s.chatEventHub()
-	sub, unsubscribe := hub.Subscribe(uid, member.AgentID, member.SessionID)
-	defer unsubscribe()
-
-	agentCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), agentTurnTimeout)
+	// The execution owner consumes a reliable channel. EventHub observers may
+	// drop bursts, which must never drop final private deliveries or handoffs.
+	events := make(chan agent.ChatEvent, 32)
+	agentCtx, cancel := context.WithTimeout(r.Context(), agentTurnTimeout)
 	defer cancel()
-	agentCtx = agent.ContextWithStream(agentCtx, nil, s.dataStore, hub, uid, member.AgentID, member.SessionID)
-
-	agentDone := make(chan struct{})
+	agentCtx = agent.ContextWithStream(agentCtx, events, s.dataStore, s.chatEventHub(), uid, member.AgentID, member.SessionID)
+	type result struct {
+		reply  string
+		failed bool
+	}
+	completed := make(chan result, 1)
 	go func() {
-		defer close(agentDone)
-		_ = member.Handle.HandleWebChatStream(agentCtx, member.SessionID, req.TeamID, uid, msgText, imageURLs, req.Params, nil)
+		defer func() {
+			if recover() != nil {
+				completed <- result{failed: true}
+			}
+		}()
+		reply := member.Handle.HandleWebChatStream(agentCtx, member.SessionID, req.TeamID, uid, msgText, imageURLs, chatReq.Params, events)
+		completed <- result{reply: reply}
 	}()
-
-	keepalive := time.NewTicker(30 * time.Second)
-	defer keepalive.Stop()
-	clientGone := r.Context().Done()
-	turnPending := false
+	pending, done, failed := false, false, false
+	response := ""
+	inactivity := time.NewTimer(teamInactivityTimeout)
+	defer inactivity.Stop()
+	consume := func(event agent.ChatEvent) {
+		if !inactivity.Stop() {
+			select {
+			case <-inactivity.C:
+			default:
+			}
+		}
+		inactivity.Reset(teamInactivityTimeout)
+		if event.Type == "turn_pending" {
+			pending = true
+			return
+		}
+		if event.Type == "done" {
+			done = true
+			return
+		}
+		if event.Type == "error" {
+			failed = true
+		}
+		env := agent.EventEnvelope{Seq: -1, Event: event}
+		response = teamEventContent(response, env)
+		emit(env)
+	}
 	for {
 		select {
-		case <-clientGone:
-			return false
-		case <-agentDone:
-		drain:
-			for {
-				select {
-				case env, ok := <-sub:
-					if !ok {
-						return false
-					}
-					if env.Event.Type == "turn_pending" {
-						turnPending = true
-						continue
-					}
-					if env.Event.Type == "done" {
-						return true
-					}
-					forwardTeamEvent(w, flusher, member.AgentID, env)
-				default:
-					break drain
-				}
-			}
-			if turnPending {
-				agentDone = nil
-				continue
-			}
-			return true
 		case <-agentCtx.Done():
-			return false
-		case <-keepalive.C:
-			fmt.Fprintf(w, ": ping\n\n")
-			flusher.Flush()
-		case env, ok := <-sub:
-			if !ok {
-				return false
+			return false, response
+		case <-inactivity.C:
+			return false, response
+		case event := <-events:
+			consume(event)
+			if done && completed == nil {
+				return !failed, response
 			}
-			if env.Event.Type == "turn_pending" {
-				turnPending = true
-				continue
+		case result := <-completed:
+			for len(events) > 0 {
+				consume(<-events)
 			}
-			if env.Event.Type == "done" {
-				return true
+			if result.reply != "" {
+				response = result.reply
 			}
-			forwardTeamEvent(w, flusher, member.AgentID, env)
+			failed = failed || result.failed
+			if !pending || done {
+				return !failed, response
+			}
+			completed = nil
 		}
 	}
 }
 
-func forwardTeamEvent(w http.ResponseWriter, flusher http.Flusher, agentID string, env agent.EventEnvelope) {
-	payload := map[string]any{
-		"seq":     env.Seq,
-		"type":    env.Event.Type,
-		"agentId": agentID,
+func teamEventContent(current string, env agent.EventEnvelope) string {
+	if env.Event.Data == nil {
+		return current
 	}
-	if env.Event.Data != nil {
-		payload["data"] = env.Event.Data
+	if env.Event.Type == "content" {
+		if content, ok := env.Event.Data["content"].(string); ok && content != "" {
+			return content
+		}
 	}
-	data, _ := json.Marshal(payload)
-	if env.Seq >= 0 {
-		fmt.Fprintf(w, "id: %d\n", env.Seq)
+	if env.Event.Type == "content_delta" {
+		if delta, ok := env.Event.Data["delta"].(string); ok {
+			return current + delta
+		}
 	}
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
+	return current
 }

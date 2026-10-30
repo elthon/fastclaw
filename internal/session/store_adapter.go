@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
@@ -16,9 +17,10 @@ import (
 // scoping is implicit at the call site instead of getting plumbed through
 // every agent loop call.
 type StoreAdapter struct {
-	st             store.Store
-	userID         string
-	ownerCache     map[string]string // sessionKey → resolved owner userID
+	st         store.Store
+	userID     string
+	ownerMu    sync.Mutex
+	ownerCache map[string]string // sessionKey → resolved owner userID
 }
 
 func NewStoreAdapter(st store.Store, userID string) *StoreAdapter {
@@ -32,29 +34,40 @@ func NewStoreAdapter(st store.Store, userID string) *StoreAdapter {
 // session_key on a shared/public agent cannot read another user's chat.
 func (a *StoreAdapter) resolveSessionOwner(ctx context.Context, agentID, sessionKey string) string {
 	// Check cache first to avoid repeated DB lookups for the same session.
-	if a.ownerCache != nil {
-		if cached, ok := a.ownerCache[sessionKey]; ok {
-			return cached
-		}
+	a.ownerMu.Lock()
+	cached, ok := a.ownerCache[sessionKey]
+	a.ownerMu.Unlock()
+	if ok {
+		return cached
+	}
+	owner, err := a.st.LookupSessionOwner(ctx, agentID, sessionKey)
+	if err != nil || owner == "" {
+		// No row yet (a chat about to be created) or a failed lookup (e.g.
+		// a busy database): answer self/deny for now, but don't remember
+		// it — a cached failure would hide a real session until restart.
+		return a.userID
 	}
 	result := a.userID // default: deny / self
-	owner, err := a.st.LookupSessionOwner(ctx, agentID, sessionKey)
-	if err == nil && owner != "" {
-		if owner == a.userID {
+	if owner == a.userID {
+		result = owner
+	} else {
+		// Check if the owner is a child of the caller (app_user whose
+		// owner_user_id == a.userID). If not, deny by returning a.userID
+		// so the downstream query simply returns no rows.
+		u, err := a.st.GetUser(ctx, owner)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return a.userID
+		}
+		if u != nil && u.OwnerUserID == a.userID {
 			result = owner
-		} else {
-			// Check if the owner is a child of the caller (app_user whose
-			// owner_user_id == a.userID). If not, deny by returning a.userID
-			// so the downstream query simply returns no rows.
-			if u, err := a.st.GetUser(ctx, owner); err == nil && u != nil && u.OwnerUserID == a.userID {
-				result = owner
-			}
 		}
 	}
+	a.ownerMu.Lock()
 	if a.ownerCache == nil {
 		a.ownerCache = make(map[string]string)
 	}
 	a.ownerCache[sessionKey] = result
+	a.ownerMu.Unlock()
 	return result
 }
 
@@ -182,6 +195,30 @@ func (a *StoreAdapter) ListMessages(ctx context.Context, agentID, sessionKey str
 		msgs[i] = providerMessageFromStored(m)
 	}
 	return msgs, nil
+}
+
+// ListMessagesPage reads one page of the archive; see
+// store.Store.ListSessionMessagesPage for the cursor contract.
+func (a *StoreAdapter) ListMessagesPage(ctx context.Context, agentID, sessionKey string, before int64, limit int) ([]provider.Message, int64, bool, error) {
+	sms, start, hasMore, err := a.st.ListSessionMessagesPage(ctx, a.resolveSessionOwner(ctx, agentID, sessionKey), agentID, sessionKey, before, limit)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	msgs := make([]provider.Message, len(sms))
+	for i, m := range sms {
+		msgs[i] = providerMessageFromStored(m)
+	}
+	return msgs, start, hasMore, nil
+}
+
+// SessionExists checks for the session row without reading its
+// messages, under the same owner rules as GetSession.
+func (a *StoreAdapter) SessionExists(ctx context.Context, agentID, sessionKey string) (bool, error) {
+	_, _, _, err := a.st.LookupSessionTriple(ctx, a.resolveSessionOwner(ctx, agentID, sessionKey), agentID, sessionKey)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // sessionMessageFromProvider converts a provider.Message into the wire
@@ -323,7 +360,20 @@ func (a *StoreAdapter) BuildWebSession(ctx context.Context, m store.SessionMeta)
 		break
 	}
 	if preview == "" {
+		// Agent-initiated sessions (a group chat's private message to the
+		// human) have no user turn; their first reply stands in so they
+		// still list and can be reopened.
+		preview = firstAssistantPreview(source)
+	}
+	if preview == "" {
 		return nil
+	}
+	lastMessage, lastMessageAt := latestMessagePreview(source)
+	if lastMessage == "" {
+		lastMessage = preview
+	}
+	if lastMessageAt == 0 {
+		lastMessageAt = m.UpdatedAt.UnixMilli()
 	}
 	title := displaySessionTitle(m.Title, m.Key, m.ChatID, preview)
 	return &WebSession{
@@ -334,11 +384,74 @@ func (a *StoreAdapter) BuildWebSession(ctx context.Context, m store.SessionMeta)
 		ProjectID:     m.ProjectID,
 		Title:         title,
 		Preview:       preview,
-		ThumbnailURL:  thumb,
+		LastMessage:   lastMessage,
+		LastMessageAt: lastMessageAt,
+		ThumbnailURL:  listThumbnail(thumb),
 		CreatedAt:     m.UpdatedAt.UnixMilli(),
 		UpdatedAt:     m.UpdatedAt.UnixMilli(),
 		ChatterUserID: m.ChatterUserID,
 	}
+}
+
+// firstAssistantPreview returns the first user-visible assistant message,
+// compacted for a listing.
+func firstAssistantPreview(source []store.SessionMessage) string {
+	for _, msg := range source {
+		if msg.Origin != provider.OriginUser || msg.Role != "assistant" {
+			continue
+		}
+		if text := compactMessagePreview(msg.Content); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+// latestMessagePreview returns the newest user-visible message in a session
+// and the timestamp of that same message. Tool rows and runtime-injected
+// prompts are deliberately excluded so contact previews match chat history.
+func latestMessagePreview(source []store.SessionMessage) (string, int64) {
+	for i := len(source) - 1; i >= 0; i-- {
+		msg := source[i]
+		if msg.Origin != provider.OriginUser {
+			continue
+		}
+
+		var text string
+		switch msg.Role {
+		case "assistant":
+			text = msg.Content
+		case "user":
+			text = userText(msg)
+			if text == "" && userImage(msg) != "" {
+				text = "[image]"
+			}
+		default:
+			continue
+		}
+
+		text = compactMessagePreview(text)
+		if text == "" {
+			continue
+		}
+		var timestamp int64
+		if !msg.Timestamp.IsZero() {
+			timestamp = msg.Timestamp.UnixMilli()
+		}
+		return text, timestamp
+	}
+	return "", 0
+}
+
+// compactMessagePreview makes multi-line Markdown suitable for the single-line
+// contact row and caps the API payload without splitting UTF-8 characters.
+func compactMessagePreview(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	runes := []rune(text)
+	if len(runes) > 100 {
+		return string(runes[:100]) + "..."
+	}
+	return text
 }
 
 // displaySessionTitle normalizes legacy rows that persisted the opaque

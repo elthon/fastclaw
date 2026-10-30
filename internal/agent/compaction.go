@@ -18,6 +18,10 @@ const (
 	PruneTurnAge = 20
 	// truncatedPlaceholder replaces pruned tool results.
 	truncatedPlaceholder = "[Result truncated - see memory logs]"
+	// estimatedInlineImageTokens is a deliberately conservative fixed cost.
+	// Exact vision accounting depends on provider-side tiling and dimensions,
+	// but counting images as zero lets multimodal sessions evade compaction.
+	estimatedInlineImageTokens = 1500
 )
 
 // EstimateTokens provides a rough token estimate: chars/4.
@@ -25,6 +29,14 @@ func EstimateTokens(messages []provider.Message) int {
 	total := 0
 	for _, m := range messages {
 		total += len(m.Content) / 4
+		for _, part := range m.ContentParts {
+			switch part.Type {
+			case "text":
+				total += len(part.Text) / 4
+			case "image_url":
+				total += estimatedInlineImageTokens
+			}
+		}
 		for _, tc := range m.ToolCalls {
 			total += len(tc.Function.Arguments) / 4
 			total += len(tc.Function.Name) / 4
@@ -167,7 +179,7 @@ func compressOlderMessages(messages []provider.Message, prov provider.Provider, 
 		if m.Origin != provider.OriginUser {
 			continue
 		}
-		text += fmt.Sprintf("[%s] %s\n", m.Role, m.Content)
+		text += fmt.Sprintf("[%s] %s\n", m.Role, m.TextContent())
 	}
 
 	summaryPrompt := []provider.Message{

@@ -12,6 +12,8 @@ type ChatEvent struct {
 	Data map[string]any `json:"data,omitempty"`
 }
 
+const chatErrorCodeLLMProviderNotConfigured = "llm_provider_not_configured"
+
 type chatEventsKey struct{}
 
 // ChatEventsFromContext retrieves the events channel from context, if present.

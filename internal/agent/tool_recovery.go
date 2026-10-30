@@ -191,7 +191,9 @@ var parameterRE = regexp.MustCompile(`(?s)<(?:antml:)?parameter\s+name="([^"]+)"
 //   - the optional outer <tool_calls> / <function_calls> / <DSML>
 //     wrappers some models add (open AND close tags), so the residual
 //     content doesn't keep a dangling `</tool_calls>`.
-var stripRE = regexp.MustCompile(`(?s)<(?:antml:)?invoke\s+name="[^"]+"\s*>.*?</(?:antml:)?invoke>|</?(?:antml:)?(?:tool_calls|function_calls|DSML)\s*/?>`)
+//
+// Handle both antml-prefixed calls and DeepSeek DSML wrappers.
+var stripRE = regexp.MustCompile(`(?s)<(?:antml:)?invoke\s+name="[^"]+"\s*>.*?</(?:antml:)?invoke>|</?(?:antml:)?(?:tool_calls|function_calls)\s*/?>|</?(?:antml:)?DSML[^>]*>`)
 
 // tagLeakHintRE flags content worth running the leaked-token normalizer
 // on. We match either a normal `<invoke` (the original recovery

@@ -26,9 +26,12 @@ import (
 //	  "name":   "<skill slug / folder name>",
 //	  "repo":   "owner/repo"  (github only),
 //	  "agent":  "<agent-id>"  (optional; if set, install into the agent's own
-//	                           skills dir and hot-reload it; otherwise install
-//	                           globally — admin only)
+//	                           skills dir and hot-reload it)
+//	  "scope":  "user"        (optional; install into the caller's own skills,
+//	                           available in all their conversations)
 //	}
+//
+// With neither, the install is global — admin only.
 //
 // Source precedence when source is empty: skills.sh → clawhub.
 // Global installs (no `agent`) require the local/admin user — cloud users
@@ -40,6 +43,7 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		Skill  string `json:"skill"` // legacy alias for "name"
 		Repo   string `json:"repo"`
 		Agent  string `json:"agent"`
+		Scope  string `json:"scope"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
@@ -53,10 +57,11 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.authorizeSkillInstallTarget(w, r, req.Agent) {
+	target, ok := s.skillInstallTarget(w, r, req.Agent, req.Scope == "user")
+	if !ok {
 		return
 	}
-	targetDir, err := resolveInstallTarget(r, req.Agent)
+	targetDir, err := target.dir(r)
 	if err != nil {
 		jsonResponse(w, http.StatusForbidden, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -73,10 +78,7 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 	// the skill only exists on this pod's emptyDir, and a chat request
 	// balanced to another pod wouldn't see it.
 	if s.workspaceStore != nil && result != nil && result.Name != "" {
-		owner := req.Agent
-		if owner == "" {
-			owner = skills.GlobalSkillOwner
-		}
+		owner := target.storeOwner()
 		if uerr := skills.SyncSkillUp(r.Context(), s.workspaceStore, owner, result.Name, targetDir); uerr != nil {
 			slog.Warn("failed to mirror skill to object store",
 				"owner", owner, "skill", result.Name, "error", uerr)
@@ -91,7 +93,7 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("skill installed",
 		"source", result.Source, "name", result.Name,
-		"version", result.Version, "path", result.InstalledAt, "agent", req.Agent)
+		"version", result.Version, "path", result.InstalledAt, "agent", req.Agent, "user", target.UserID)
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"source":      result.Source,
@@ -164,8 +166,8 @@ func runInstall(source, name, repo, targetDir string) (*skills.Result, error) {
 // handleUploadSkill installs a skill from a user-supplied .zip file.
 // Multipart POST: field `file` is the zip; optional `name` form field
 // overrides the inferred skill folder name. Optional `?agent=<id>` query
-// param scopes the install to one agent's home (same auth + target rules
-// as handleInstallSkill).
+// param scopes the install to one agent's home, `?scope=user` to the
+// caller's own skills (same auth + target rules as handleInstallSkill).
 //
 // Layout assumptions:
 //   - Zip with a single common top-level directory (e.g. `my-skill/...`):
@@ -182,7 +184,8 @@ func runInstall(source, name, repo, targetDir string) (*skills.Result, error) {
 func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 	const maxUploadSize = 64 << 20 // 64 MiB
 	agentID := r.URL.Query().Get("agent")
-	if !s.authorizeSkillInstallTarget(w, r, agentID) {
+	target, ok := s.skillInstallTarget(w, r, agentID, r.URL.Query().Get("scope") == "user")
+	if !ok {
 		return
 	}
 
@@ -202,7 +205,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetDir, err := resolveInstallTarget(r, agentID)
+	targetDir, err := target.dir(r)
 	if err != nil {
 		jsonResponse(w, http.StatusForbidden, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -354,10 +357,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.workspaceStore != nil {
-		owner := agentID
-		if owner == "" {
-			owner = skills.GlobalSkillOwner
-		}
+		owner := target.storeOwner()
 		if uerr := skills.SyncSkillUp(r.Context(), s.workspaceStore, owner, skillName, targetDir); uerr != nil {
 			slog.Warn("failed to mirror uploaded skill to object store",
 				"owner", owner, "skill", skillName, "error", uerr)

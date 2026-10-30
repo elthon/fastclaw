@@ -15,6 +15,30 @@ import (
 // --- Skills ---
 
 func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
+	// ?scope=user lists the caller's own skills instead of the global ones.
+	if r.URL.Query().Get("scope") == "user" {
+		uid, ok := ownSkillsUser(w, r)
+		if !ok {
+			return
+		}
+		dir, err := userSkillsDir(uid)
+		if err != nil {
+			jsonResponse(w, http.StatusOK, []any{})
+			return
+		}
+		if s.workspaceStore != nil {
+			if err := skills.HydrateSkillsDown(r.Context(), s.workspaceStore, skills.UserSkillOwner(uid), dir); err != nil {
+				slog.Warn("failed to hydrate user skills from object store", "user", uid, "error", err)
+			}
+		}
+		out := scanSkillsDir(dir)
+		if out == nil {
+			jsonResponse(w, http.StatusOK, []any{})
+			return
+		}
+		jsonResponse(w, http.StatusOK, out)
+		return
+	}
 	homeDir, err := config.HomeDir()
 	if err != nil {
 		jsonResponse(w, http.StatusOK, []any{})
@@ -43,14 +67,24 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, out)
 }
 
+// handleDeleteSkill removes a global skill (platform admin) or, with
+// ?scope=user, one of the caller's own skills.
 func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	homeDir, err := config.HomeDir()
+	if name == "" || sanitizeSkillName(name) != name {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid skill name"})
+		return
+	}
+	target, ok := s.skillInstallTarget(w, r, "", r.URL.Query().Get("scope") == "user")
+	if !ok {
+		return
+	}
+	dir, err := target.dir(r)
 	if err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	skillPath := filepath.Join(homeDir, "skills", name)
+	skillPath := filepath.Join(dir, name)
 	if err := os.RemoveAll(skillPath); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -60,8 +94,8 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	// copy is gone already and a stale remote copy will just re-appear
 	// next reload (annoying but not dangerous).
 	if s.workspaceStore != nil {
-		if derr := skills.DeleteSkillUp(r.Context(), s.workspaceStore, skills.GlobalSkillOwner, name); derr != nil {
-			slog.Warn("failed to remove global skill from object store", "skill", name, "error", derr)
+		if derr := skills.DeleteSkillUp(r.Context(), s.workspaceStore, target.storeOwner(), name); derr != nil {
+			slog.Warn("failed to remove skill from object store", "owner", target.storeOwner(), "skill", name, "error", derr)
 		}
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})

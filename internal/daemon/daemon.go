@@ -10,15 +10,18 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fastclaw-ai/fastclaw/internal/config"
 )
 
-// Paths returns the daemon directory paths under ~/.fastclaw.
+// Paths returns the daemon directory paths under $FASTCLAW_HOME
+// (default ~/.fastclaw), so a dev instance never shares a PID file
+// with the release one.
 func Paths() (pidFile, logFile, logDir string, err error) {
-	home, err := os.UserHomeDir()
+	base, err := config.HomeDir()
 	if err != nil {
 		return "", "", "", err
 	}
-	base := filepath.Join(home, ".fastclaw")
 	logDir = filepath.Join(base, "logs")
 	pidFile = filepath.Join(base, "fastclaw.pid")
 	logFile = filepath.Join(logDir, "gateway.log")

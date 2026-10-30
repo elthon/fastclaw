@@ -33,14 +33,17 @@ import (
 const tagPrefixPattern = `(?:antml:|｜｜[^｜<>]+｜｜)?`
 
 var (
-	leakedFunctionCallsRe = regexp.MustCompile(`(?s)<` + tagPrefixPattern + `(?:function|tool)_calls>(.*?)</` + tagPrefixPattern + `(?:function|tool)_calls>`)
+	// The wrapper name is `function_calls` / `tool_calls`, or a bare
+	// `calls` after the DSML marker (`<｜｜DSML｜｜ calls>`), as some
+	// DeepSeek-backed gateways emit.
+	leakedFunctionCallsRe = regexp.MustCompile(`(?s)<` + tagPrefixPattern + `\s*(?:function_|tool_)?calls>(.*?)</` + tagPrefixPattern + `\s*(?:function_|tool_)?calls>`)
 	leakedInvokeRe        = regexp.MustCompile(`(?s)<` + tagPrefixPattern + `invoke\s+name="([^"]+)"\s*>(.*?)</` + tagPrefixPattern + `invoke>`)
 	leakedParameterRe     = regexp.MustCompile(`(?s)<` + tagPrefixPattern + `parameter\s+name="([^"]+)"([^>]*)>(.*?)</` + tagPrefixPattern + `parameter>`)
 	leakedStringAttrRe    = regexp.MustCompile(`string="(true|false)"`)
 )
 
 func extractLeakedToolCalls(text string) (cleaned string, calls []ToolCall) {
-	if text == "" || (!strings.Contains(text, "function_calls") && !strings.Contains(text, "tool_calls")) {
+	if text == "" || (!strings.Contains(text, "function_calls") && !strings.Contains(text, "tool_calls") && !strings.Contains(text, "DSML")) {
 		return text, nil
 	}
 

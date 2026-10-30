@@ -327,9 +327,110 @@ func (l *Feishu) doSend(tok string, payload map[string]string) error {
 
 // SendTyping is a no-op. Feishu's open platform doesn't expose a typing
 // indicator API for custom-app bots — only first-party apps get it.
-// The gateway's typing relay still fires every 5s but degenerates to
-// a cheap no-op call.
+// The typing cue is StartMessageTyping's reaction instead.
 func (l *Feishu) SendTyping(_ string) error { return nil }
+
+// feishuTypingEmoji is Feishu's built-in "Typing" reaction — the same
+// cue the official OpenClaw Feishu plugin uses while a reply is pending.
+const feishuTypingEmoji = "Typing"
+
+// StartMessageTyping adds a "Typing" reaction to the user's message and
+// returns a func that removes it. Best-effort: both calls run in the
+// background and failures (e.g. missing im:message.reactions scope) are
+// only logged, so the cue never delays or blocks the reply.
+func (l *Feishu) StartMessageTyping(_ string, messageID string) func() {
+	// Synthetic IDs (dedup fallback when Feishu omitted message_id)
+	// aren't addressable.
+	if !strings.HasPrefix(messageID, "om_") {
+		return func() {}
+	}
+	added := make(chan string, 1)
+	go func() {
+		id, err := l.addReaction(messageID, feishuTypingEmoji)
+		if err != nil {
+			slog.Debug("feishu typing reaction add failed", "account", l.accountID, "message", messageID, "error", err)
+		}
+		added <- id
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			go func() {
+				id := <-added
+				if id == "" {
+					return
+				}
+				if err := l.deleteReaction(messageID, id); err != nil {
+					slog.Debug("feishu typing reaction remove failed", "account", l.accountID, "message", messageID, "error", err)
+				}
+			}()
+		})
+	}
+}
+
+func (l *Feishu) addReaction(messageID, emojiType string) (string, error) {
+	body, _ := json.Marshal(map[string]any{
+		"reaction_type": map[string]string{"emoji_type": emojiType},
+	})
+	var out struct {
+		Data struct {
+			ReactionID string `json:"reaction_id"`
+		} `json:"data"`
+	}
+	u := fmt.Sprintf("%s/open-apis/im/v1/messages/%s/reactions", l.apiBaseURL, messageID)
+	if err := l.callAPI(http.MethodPost, u, body, &out); err != nil {
+		return "", err
+	}
+	return out.Data.ReactionID, nil
+}
+
+func (l *Feishu) deleteReaction(messageID, reactionID string) error {
+	u := fmt.Sprintf("%s/open-apis/im/v1/messages/%s/reactions/%s", l.apiBaseURL, messageID, reactionID)
+	return l.callAPI(http.MethodDelete, u, nil, nil)
+}
+
+// callAPI does one authenticated JSON round-trip against the Feishu
+// open API and checks the envelope's code. out may be nil.
+func (l *Feishu) callAPI(method, u string, body []byte, out any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), feishuSendTimeout)
+	defer cancel()
+	tok, err := l.tenantAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, rd)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := l.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	var env struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(respBody, &env); err != nil {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
+	}
+	if env.Code != 0 {
+		return fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+	}
+	if out != nil {
+		return json.Unmarshal(respBody, out)
+	}
+	return nil
+}
 
 // --- Inbound (webhook handler entry point) ---
 

@@ -39,6 +39,8 @@ func RegisterLoadSkill(r *Registry, skillDirs []string) {
 
 func makeLoadSkill(r *Registry, skillDirs []string) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var args loadSkillArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)

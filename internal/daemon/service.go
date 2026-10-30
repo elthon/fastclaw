@@ -36,9 +36,45 @@ func Uninstall() error {
 	}
 }
 
+// instanceSuffix tells a non-default FASTCLAW_HOME apart in service
+// names, so installing a dev daemon (FASTCLAW_HOME=~/.fastclaw-dev)
+// doesn't overwrite the release one. "" for the default home.
+func instanceSuffix() string {
+	h := os.Getenv("FASTCLAW_HOME")
+	if h == "" {
+		return ""
+	}
+	if def, err := os.UserHomeDir(); err == nil && filepath.Clean(h) == filepath.Join(def, ".fastclaw") {
+		return ""
+	}
+	name := strings.TrimPrefix(strings.TrimLeft(filepath.Base(h), "."), "fastclaw")
+	name = strings.Trim(strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '-'
+	}, name), "-")
+	if name == "" {
+		name = "custom"
+	}
+	return "-" + name
+}
+
+// serviceEnv is the FASTCLAW_* instance selectors forwarded into the
+// service definition; launchd/systemd don't inherit the shell's env.
+func serviceEnv() [][2]string {
+	var env [][2]string
+	for _, k := range []string{"FASTCLAW_HOME", "FASTCLAW_PORT"} {
+		if v := os.Getenv(k); v != "" {
+			env = append(env, [2]string{k, v})
+		}
+	}
+	return env
+}
+
 // --- macOS launchd ---
 
-const launchdLabel = "ai.fastclaw.gateway"
+func launchdLabel() string { return "ai.fastclaw.gateway" + instanceSuffix() }
 
 var launchdPlistTemplate = template.Must(template.New("plist").Parse(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -60,7 +96,12 @@ var launchdPlistTemplate = template.Must(template.New("plist").Parse(`<?xml vers
     <key>StandardErrorPath</key>
     <string>{{.LogDir}}/gateway.stderr.log</string>
     <key>WorkingDirectory</key>
-    <string>{{.HomeDir}}</string>
+    <string>{{.HomeDir}}</string>{{if .Env}}
+    <key>EnvironmentVariables</key>
+    <dict>{{range .Env}}
+        <key>{{index . 0}}</key>
+        <string>{{index . 1}}</string>{{end}}
+    </dict>{{end}}
 </dict>
 </plist>
 `))
@@ -70,7 +111,7 @@ func launchdPlistPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist"), nil
+	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel()+".plist"), nil
 }
 
 func installLaunchd() error {
@@ -85,7 +126,10 @@ func installLaunchd() error {
 		return err
 	}
 
-	logDir := filepath.Join(home, ".fastclaw", "logs")
+	_, _, logDir, err := Paths()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
 	}
@@ -104,11 +148,13 @@ func installLaunchd() error {
 		BinaryPath string
 		LogDir     string
 		HomeDir    string
+		Env        [][2]string
 	}{
-		Label:      launchdLabel,
+		Label:      launchdLabel(),
 		BinaryPath: bin,
 		LogDir:     logDir,
 		HomeDir:    home,
+		Env:        serviceEnv(),
 	}
 
 	var buf strings.Builder
@@ -159,7 +205,7 @@ func uninstallLaunchd() error {
 
 // --- Linux systemd ---
 
-const systemdUnit = "fastclaw-gateway.service"
+func systemdUnitName() string { return "fastclaw-gateway" + instanceSuffix() + ".service" }
 
 var systemdUnitTemplate = template.Must(template.New("unit").Parse(`[Unit]
 Description=FastClaw AI Agent Gateway
@@ -171,7 +217,8 @@ ExecStart={{.BinaryPath}} gateway
 Restart=always
 RestartSec=5
 Environment=HOME={{.HomeDir}}
-WorkingDirectory={{.HomeDir}}
+{{range .Env}}Environment={{index . 0}}={{index . 1}}
+{{end}}WorkingDirectory={{.HomeDir}}
 StandardOutput=append:{{.LogDir}}/gateway.stdout.log
 StandardError=append:{{.LogDir}}/gateway.stderr.log
 
@@ -184,7 +231,7 @@ func systemdUnitPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".config", "systemd", "user", systemdUnit), nil
+	return filepath.Join(home, ".config", "systemd", "user", systemdUnitName()), nil
 }
 
 func installSystemd() error {
@@ -199,7 +246,10 @@ func installSystemd() error {
 		return err
 	}
 
-	logDir := filepath.Join(home, ".fastclaw", "logs")
+	_, _, logDir, err := Paths()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
 	}
@@ -217,10 +267,12 @@ func installSystemd() error {
 		BinaryPath string
 		HomeDir    string
 		LogDir     string
+		Env        [][2]string
 	}{
 		BinaryPath: bin,
 		HomeDir:    home,
 		LogDir:     logDir,
+		Env:        serviceEnv(),
 	}
 
 	var buf strings.Builder
@@ -235,8 +287,8 @@ func installSystemd() error {
 	// Enable and start
 	for _, args := range [][]string{
 		{"--user", "daemon-reload"},
-		{"--user", "enable", systemdUnit},
-		{"--user", "start", systemdUnit},
+		{"--user", "enable", systemdUnitName()},
+		{"--user", "start", systemdUnitName()},
 	} {
 		cmd := exec.Command("systemctl", args...)
 		cmd.Stdout = os.Stdout
@@ -262,8 +314,8 @@ func uninstallSystemd() error {
 	}
 
 	for _, args := range [][]string{
-		{"--user", "stop", systemdUnit},
-		{"--user", "disable", systemdUnit},
+		{"--user", "stop", systemdUnitName()},
+		{"--user", "disable", systemdUnitName()},
 	} {
 		cmd := exec.Command("systemctl", args...)
 		cmd.Stdout = os.Stdout

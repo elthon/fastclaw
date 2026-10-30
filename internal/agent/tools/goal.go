@@ -50,6 +50,8 @@ func RegisterGoalTools(r *Registry, st goal.Store, agentID string) {
 // non-conforming model response.
 func makeUpdateGoal(st goal.Store, r *Registry, agentID string) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
+		r := r.forContext(ctx)
+
 		var a struct {
 			Status string `json:"status"`
 		}

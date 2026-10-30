@@ -114,3 +114,27 @@ func TestConcurrentPushDrainNoLossNoDup(t *testing.T) {
 		t.Fatalf("message count mismatch: got %d want %d", got, producers*perProducer)
 	}
 }
+
+// An untrusted sender's steer must not be folded into a turn running with
+// host access; trusted steers and steers into untrusted turns still are.
+func TestSteerRefusesUntrustedIntoTrustedTurn(t *testing.T) {
+	s := &Session{}
+	s.BeginTurn()
+	if !s.PushSteerIfActiveFrom(um("guest"), false) {
+		t.Fatal("untrusted steer into an untrusted turn should be accepted")
+	}
+	s.MarkTurnTrusted()
+	if s.PushSteerIfActiveFrom(um("guest"), false) {
+		t.Fatal("untrusted steer into a trusted turn must be refused")
+	}
+	if !s.PushSteerIfActiveFrom(um("owner"), true) {
+		t.Fatal("trusted steer into a trusted turn should be accepted")
+	}
+	s.DrainSteer()
+	s.EndTurn()
+
+	s.BeginTurn()
+	if !s.PushSteerIfActiveFrom(um("guest"), false) {
+		t.Fatal("trust flag must reset when the turn ends")
+	}
+}

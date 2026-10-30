@@ -14,6 +14,8 @@ export interface StatusResponse {
   userId?: string;
   isAdmin?: boolean;
   users?: number;
+  // Every agent in the deployment; super_admin only.
+  totalAgents?: number;
 }
 
 export interface RegisterRequest {
@@ -103,8 +105,9 @@ export interface AgentDetail {
   // design. Extend tools via Plugin or MCP, not per-agent toggles.
   promptMode?: string;
   // splitReplies is the per-agent multi-bubble override. Applies to
-  // every IM channel uniformly — when on, the agent may emit the
-  // SplitMessageMarker between bubbles and the dispatcher honors it.
+  // web chat and every IM channel uniformly — when on, the agent emits
+  // the SplitMessageMarker between bubbles and the renderer/dispatcher
+  // honors it.
   // null / undefined / false-ish = single bubble per reply (default).
   splitReplies?: boolean | null;
   // autoPersist is the per-agent "remember the chatter automatically"
@@ -126,6 +129,7 @@ export interface AgentDetail {
   soul?: string;
   skills?: string[];
   tools?: string[];
+  createdAt?: string;
 }
 
 export interface SkillEnvSpec {
@@ -151,16 +155,18 @@ export interface SkillEntryCfg {
 
 // updateSkillEntries persists skill env / apiKey patches. When agentId
 // is set the patch lands in cfg.Skills.AgentEntries[agentId] (per-agent
-// override), otherwise in cfg.Skills.Entries (global default). The
-// runtime resolves agent-scoped first, falling back to global.
+// override); otherwise configScope selects the caller's personal layer or
+// the system default. Runtime resolution is agent → user → system.
 export async function updateSkillEntries(
   entries: Record<string, SkillEntryCfg>,
   agentId?: string,
+  configScope?: "user" | "system",
 ) {
   const body = agentId
     ? { skills: { agentEntries: { [agentId]: entries } } }
     : { skills: { entries } };
-  const res = await apiFetch("/api/config", {
+  const scopeQuery = !agentId && configScope ? `?scope=${configScope}` : "";
+  const res = await apiFetch(`/api/config${scopeQuery}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -261,6 +267,7 @@ export interface ConfigResponse {
     // first, falling back to the global entries map.
     agentEntries?: Record<string, Record<string, SkillEntryCfg>>;
   };
+  teams?: Record<string, TeamEntry>;
   // Presentation hints the dashboard needs to render inheritance state
   // without re-resolving the scope chain client-side. systemDefaultModel
   // is the value `agents.defaults.model` would resolve to from system
@@ -270,6 +277,20 @@ export interface ConfigResponse {
     systemDefaultModel?: string;
     serverTimezone?: string;
   };
+}
+
+export interface TeamEntry {
+  description?: string;
+  humanName?: string;
+  name?: string;
+  agents: string[];
+  defaultAgent?: string;
+  sessionId?: string;
+  groupBehavior?: string;
+  createdAt?: number;
+  // The group's own picture (a small image data URL); empty shows the
+  // members' avatars.
+  avatarUrl?: string;
 }
 
 // Auth token for cloud mode. Set via setAuthToken() on login; empty in local mode.
@@ -695,13 +716,18 @@ export async function saveConfig(config: Record<string, unknown>) {
   return res.json();
 }
 
-export async function getConfig(): Promise<ConfigResponse> {
-  const res = await apiFetch("/api/config");
+export async function getConfig(configScope?: "user" | "system"): Promise<ConfigResponse> {
+  const scopeQuery = configScope ? `?scope=${configScope}` : "";
+  const res = await apiFetch(`/api/config${scopeQuery}`);
   return res.json();
 }
 
-export async function updateConfig(config: Record<string, unknown>) {
-  const res = await apiFetch("/api/config", {
+export async function updateConfig(
+  config: Record<string, unknown>,
+  configScope?: "user" | "system",
+) {
+  const scopeQuery = configScope ? `?scope=${configScope}` : "";
+  const res = await apiFetch(`/api/config${scopeQuery}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(config),
@@ -715,6 +741,14 @@ export interface WorkspaceFile {
   path: string;
   size: number;
   modTime: number;
+}
+
+// revealLogs opens the gateway's log directory in the operator's file
+// browser. Super_admin and self-hosted only.
+export async function revealLogs(): Promise<{ ok: boolean; path?: string; error?: string }> {
+  const res = await apiFetch("/api/admin/logs/reveal", { method: "POST" });
+  const data = await res.json().catch(() => ({}));
+  return res.ok ? { ok: true, path: data.path } : { ok: false, error: data.error || `HTTP ${res.status}` };
 }
 
 // revealAgentWorkspace opens the workspace folder for this scope in
@@ -859,6 +893,7 @@ export interface ChatHistoryMessage {
   // attachments. The chat UI renders these as inline thumbnails on
   // bubbles loaded from history.
   imageUrls?: string[];
+  attachments?: Array<{ url: string; name: string }>;
   // Populated for user turns that arrived via an IM bridge (Discord,
   // Telegram, ...). The chat panel renders an avatar + nickname header
   // on each such bubble so the agent owner can see who they're looking
@@ -868,6 +903,20 @@ export interface ChatHistoryMessage {
   senderAvatarUrl?: string;
   senderId?: string;
   senderChannel?: string;
+  timestamp?: number;
+  groupTurnId?: string;
+  // A private message from another agent (message_agent) that started
+  // this turn; rendered as a "received privately from …" card.
+  privateFrom?: PrivateSource;
+}
+
+// PrivateSource is where a private message came from: a group chat that
+// sent it to the human, or another agent (with its original request).
+export interface PrivateSource {
+  kind: "group" | "agent";
+  id: string;
+  name: string;
+  content?: string;
 }
 
 export interface TodoItem {
@@ -915,21 +964,35 @@ export async function getChatHistory(agentId: string, sessionId: string): Promis
 export interface ChatHistoryResult {
   history: ChatHistoryMessage[];
   latestEventSeq: number; // -1 when there's nothing logged yet
+  historyStart: number;
+  hasMoreHistory: boolean;
 }
 
-export async function getChatHistoryWithCursor(agentId: string, sessionId: string): Promise<ChatHistoryResult> {
-  const res = await apiFetch(`/api/chat/history?agentId=${encodeURIComponent(agentId)}&sessionId=${encodeURIComponent(sessionId)}`);
-  if (!res.ok) return { history: [], latestEventSeq: -1 };
+export async function getChatHistoryWithCursor(
+  agentId: string,
+  sessionId: string,
+  options: { limit?: number; before?: number } = {},
+): Promise<ChatHistoryResult> {
+  const params = new URLSearchParams({ agentId, sessionId });
+  if (options.limit && options.limit > 0) params.set("limit", String(options.limit));
+  if (typeof options.before === "number") params.set("before", String(options.before));
+  const res = await apiFetch(`/api/chat/history?${params.toString()}`);
+  if (!res.ok) {
+    return { history: [], latestEventSeq: -1, historyStart: 0, hasMoreHistory: false };
+  }
   const data = await res.json();
   const history: ChatHistoryMessage[] = Array.isArray(data?.history)
     ? data.history
     : Array.isArray(data) ? data : [];
   const seqRaw = data?.latestEventSeq;
   const latestEventSeq = typeof seqRaw === "number" ? seqRaw : -1;
-  return { history, latestEventSeq };
+  const historyStart = typeof data?.historyStart === "number" ? data.historyStart : 0;
+  const hasMoreHistory = data?.hasMoreHistory === true;
+  return { history, latestEventSeq, historyStart, hasMoreHistory };
 }
 
 export interface ChatSessionEntry {
+  status?: "running" | "completed" | "stopped" | "failed";
   id: string;
   // channel/accountId/chatId let the sidebar render a per-channel icon
   // and the chats page tell apart "the same agent's wechat thread vs
@@ -943,6 +1006,10 @@ export interface ChatSessionEntry {
   projectId?: string;
   title?: string;
   preview: string;
+  // The opening preview remains the conversation's default title; these
+  // fields power contact rows with the actual latest exchange instead.
+  lastMessage?: string;
+  lastMessageAt?: number;
   thumbnailUrl?: string;
   createdAt?: number;
   updatedAt?: number;
@@ -1116,6 +1183,10 @@ export async function steerChat(
 
 export interface ToolResultMetadata {
   sandbox?: boolean;
+  // A connect / access card the connectors tool put in the conversation.
+  connectorRequest?: { id: string; connector: string; title: string; kind: "connect" | "reconnect" | "access" };
+  // Assistant message delivered privately to the human from a group.
+  privateFrom?: PrivateSource;
   knowledgeSources?: KnowledgeSource[];
   // Stamped on the forced-final-delivery assistant message that the
   // backend emits when the per-turn tool-iteration cap was hit. Lets the
@@ -1123,6 +1194,9 @@ export interface ToolResultMetadata {
   // under-budget and may be incomplete.
   iterationCapReached?: boolean;
   iterationCapValue?: number;
+  // Why the tool loop was cut off: "cap" (budget used up) or "loop"
+  // (kept repeating an identical call after a warning). Absent = "cap".
+  iterationStopReason?: "cap" | "loop";
   // Stamped on assistant messages produced by plan mode (composer toggle).
   // The bubble is a plan, not an execution result — UI shows a distinct
   // badge so the user knows to review it and reply with "go" (or edits).
@@ -1146,7 +1220,8 @@ export interface ChatStreamEvent {
     | "steer"
     | "error"
     | "done"
-    | "subagent_progress";
+    | "subagent_progress"
+    | "status";
   // Per-session monotonic sequence assigned by chat_events. Lets the
   // chat page dedupe events arriving on both the active POST stream
   // and the parallel /api/chat/subscribe SSE connection. -1 means
@@ -1166,14 +1241,23 @@ export interface ChatStreamEvent {
     name?: string;
     arguments?: string;
     result?: string;
+    code?: string;
     message?: string;
     metadata?: ToolResultMetadata;
     // subagent_progress payload — only populated when type === "subagent_progress".
     iteration?: number;
     max?: number;
-    phase?: "thinking" | "running" | "final-delivery" | "done";
+    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up";
     tools?: string[];
+    // status payload (type === "status", phase "retrying"): the model call
+    // failed and the backend is retrying it.
+    attempt?: number;
+    maxAttempts?: number;
   };
+}
+
+export interface TeamChatStreamEvent extends ChatStreamEvent {
+  agentId?: string;
 }
 
 export async function sendChatStream(
@@ -1271,6 +1355,126 @@ export async function sendChatStream(
   }
 }
 
+export interface TeamMessage {
+  id: string;
+  role: "user" | "agent" | "status" | "tool";
+  imageUrls?: string[];
+  attachments?: Array<{ url: string; name: string }>;
+  content: string;
+  timestamp: number;
+  agentId?: string;
+  groupTurnId?: string;
+  // Envelopes of private messages the member sent with this message; the
+  // body reaches only the recipient (or the human's direct chat).
+  deliveries?: TeamDelivery[];
+}
+
+export interface TeamDelivery {
+  id: string;
+  recipientId: string;
+  recipientName: string;
+  intent?: string;
+  session?: string;
+}
+
+export interface TeamTopic {
+  phase?: string;
+  phaseDetail?: { kind: string; name?: string; attempt?: number; total?: number };
+  rounds?: number;
+  limited?: boolean;
+  sessionId: string;
+  turnId?: string;
+  title: string;
+  // Latest message ("Name: text"); only on topic listings.
+  preview?: string;
+  status: "idle" | "running" | "completed" | "stopped" | "failed";
+  updatedAt: number;
+  activeAgents: string[];
+}
+
+export interface TeamRun extends TeamTopic { messages: TeamMessage[]; completeHistory?: boolean }
+
+async function teamRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await apiFetch(path, init);
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || `Group request failed: ${response.status}`);
+  return body as T;
+}
+
+export function getTeamTopics(teamId: string) {
+  return teamRequest<{ topics: TeamTopic[] }>(`/api/chat/team/topics?${new URLSearchParams({ teamId })}`);
+}
+export async function getTeamRun(teamId: string, sessionId: string): Promise<{ run: TeamRun | null; deleted?: boolean }> {
+  const response = await apiFetch(`/api/chat/team/run?${new URLSearchParams({ teamId, sessionId })}`);
+  const body = await response.json();
+  if (response.status === 410 && body.code === "team_topic_deleted") return { run: null, deleted: true };
+  if (!response.ok) throw new Error(body.error || `Group request failed: ${response.status}`);
+  return body;
+}
+export function startTeamRun(teamId: string, sessionId: string, message: string, imageUrls: string[] = [], attachments: Array<{ url: string; name: string }> = []) {
+  return teamRequest<TeamRun>("/api/chat/team/run", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ teamId, sessionId, message, imageUrls, attachments }),
+  });
+}
+export function stopTeamRun(teamId: string, sessionId: string) {
+  return teamRequest<{ ok: boolean }>(`/api/chat/team/stop?${new URLSearchParams({ teamId, sessionId })}`, { method: "POST" });
+}
+
+// Team chat uses the same SSE event vocabulary as one-to-one chat, with
+// agentId on each member event so the UI can keep simultaneous identities
+// visually separate. The final team-level done event has no agentId.
+export async function sendTeamChatStream(
+  teamId: string,
+  sessionId: string,
+  members: Array<{ agentId: string; sessionId?: string }>,
+  message: string,
+  onEvent: (evt: TeamChatStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await apiFetch("/api/chat/team/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ teamId, sessionId, members, message }),
+    signal,
+  });
+  if (!res.ok) {
+    let msg = `team stream failed: ${res.status}`;
+    try {
+      const data = await res.json();
+      if (data?.error) msg = String(data.error);
+    } catch { /* keep the status fallback */ }
+    throw new Error(msg);
+  }
+  if (!res.body) throw new Error("team stream failed: no body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sawEvent = false;
+  let finished = false;
+  while (!finished) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const event = JSON.parse(line.slice(6)) as TeamChatStreamEvent;
+        sawEvent = true;
+        onEvent(event);
+        if (event.type === "done" && !event.agentId) finished = true;
+      } catch {
+        throw new Error("team stream failed: malformed event from server");
+      }
+    }
+  }
+  try { await reader.cancel(); } catch { /* ignore */ }
+  if (!sawEvent) throw new Error("team stream ended without a response");
+}
+
 export interface UploadedFile {
   path: string;
   size: number;
@@ -1280,10 +1484,16 @@ export async function uploadAgentFiles(
   agentId: string,
   sessionId: string,
   files: File[],
+  // projectId places the first upload of a new chat started in a project
+  // (the session doesn't exist yet, so the server can't look it up).
+  projectId?: string,
 ): Promise<UploadedFile[]> {
   const fd = new FormData();
   for (const f of files) fd.append("file", f, f.name);
-  const qs = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
+  if (projectId) params.set("projectId", projectId);
+  const qs = params.toString() ? `?${params}` : "";
   const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/files${qs}`, {
     method: "POST",
     body: fd,
@@ -1401,7 +1611,7 @@ export interface AgentUpdatePayload {
   // (only the date anchor + bootstrap files — author writes the whole
   // system prompt themselves via SOUL.md / IDENTITY.md). Pass "" to clear.
   promptMode?: "" | "agent" | "chatbot" | "customize";
-  // Multi-bubble per-agent override (applies to all IM channels).
+  // Multi-bubble per-agent override (applies to web and all IM channels).
   // Tri-state: omit to leave the saved value alone; pass true/false to
   // set explicit; pass `splitRepliesReset: true` to delete the override
   // so default behavior (single bubble) applies.
@@ -1497,13 +1707,16 @@ export async function deleteAgent(id: string) {
 }
 
 // Skills
-export async function getSkills(): Promise<SkillInfo[]> {
-  const res = await apiFetch("/api/skills");
+// getSkills lists the global skills, or with scope "user" the caller's
+// own skills (loaded in all their conversations).
+export async function getSkills(scope?: "user"): Promise<SkillInfo[]> {
+  const res = await apiFetch(scope === "user" ? "/api/skills?scope=user" : "/api/skills");
   return res.json();
 }
 
-export async function deleteSkill(name: string) {
-  const res = await apiFetch(`/api/skills/${name}`, {
+export async function deleteSkill(name: string, scope?: "user") {
+  const qs = scope === "user" ? "?scope=user" : "";
+  const res = await apiFetch(`/api/skills/${encodeURIComponent(name)}${qs}`, {
     method: "DELETE",
   });
   return res.json();
@@ -1548,6 +1761,7 @@ export interface InstallSkillRequest {
   source?: "skillssh" | "clawhub" | "github" | "auto";
   repo?: string;
   agent?: string;  // omit for global install (admin only)
+  scope?: "user";  // install into the caller's own skills instead
 }
 
 export interface InstallSkillResponse {
@@ -1578,11 +1792,16 @@ export async function uploadSkill(
   file: File,
   agentId?: string,
   name?: string,
+  scope?: "user",
 ): Promise<InstallSkillResponse> {
   const fd = new FormData();
   fd.append("file", file, file.name);
   if (name) fd.append("name", name);
-  const qs = agentId ? `?agent=${encodeURIComponent(agentId)}` : "";
+  const qs = agentId
+    ? `?agent=${encodeURIComponent(agentId)}`
+    : scope === "user"
+      ? "?scope=user"
+      : "";
   const res = await apiFetch(`/api/skills/upload${qs}`, {
     method: "POST",
     body: fd,
@@ -1780,6 +1999,15 @@ export interface AgentChannel {
   enabled: boolean;
   sharedIdentity: boolean;
   updatedAt?: string;
+  // Pairing: an unpaired channel answers every message with a "not
+  // paired" notice until its binder sends `pairCommand` to the bot.
+  paired: boolean;
+  pairedName?: string;
+  // The paired account may act on the host (self-hosted, agent owner's
+  // own channel only).
+  hostAccess: boolean;
+  pairCommand?: string;       // outstanding "/pair XXXXXXXX", binder only
+  pairCodeExpiresAt?: string; // RFC3339
 }
 
 // AgentCronJob mirrors store.CronJobRecord. Returned by GET
@@ -1908,6 +2136,32 @@ export async function pollAgentWeChatLoginStatus(
   return res.json();
 }
 
+export type IMessageStatus = {
+  available: boolean;
+  fullDiskAccess?: boolean;
+  binaryPath?: string;
+  error?: string;
+};
+
+// iMessage is only offered when fastclaw runs on macOS and the caller is
+// a platform admin; the UI hides the card otherwise.
+export async function getAgentIMessageStatus(agentId: string): Promise<IMessageStatus> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/imessage/status`);
+  if (!res.ok) return { available: false };
+  return res.json();
+}
+
+export async function connectAgentIMessage(
+  agentId: string,
+): Promise<{ ok?: boolean; accountId?: string; error?: string; code?: string }> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/imessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  return res.json();
+}
+
 export async function connectAgentLINE(
   agentId: string,
   channelToken: string,
@@ -1925,6 +2179,33 @@ export async function connectAgentLINE(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ channelToken, channelSecret }),
   });
+  return res.json();
+}
+
+export async function startAgentFeishuRegister(
+  agentId: string,
+): Promise<{ sessionId?: string; qrUrl?: string; interval?: number; expiresIn?: number; error?: string }> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/feishu/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  return res.json();
+}
+
+export async function pollAgentFeishuRegisterStatus(
+  agentId: string,
+  sessionId: string,
+): Promise<{
+  status?: "pending" | "confirmed" | "denied" | "expired" | "error";
+  connected?: boolean;
+  appId?: string;
+  botName?: string;
+  error?: string;
+}> {
+  const res = await apiFetch(
+    `/api/agents/${agentId}/channels/feishu/register/status?session=${encodeURIComponent(sessionId)}`,
+  );
   return res.json();
 }
 
@@ -1980,6 +2261,72 @@ export async function connectAgentDingTalk(
   return res.json();
 }
 
+export async function connectAgentWeCom(
+  agentId: string,
+  botId: string,
+  secret: string,
+): Promise<{ ok: boolean; botId?: string; error?: string }> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/wecom`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ botId, secret }),
+  });
+  return res.json();
+}
+
+export async function startAgentWeComRegister(
+  agentId: string,
+): Promise<{ sessionId?: string; qrUrl?: string; interval?: number; expiresIn?: number; error?: string }> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/wecom/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  return res.json();
+}
+
+export async function pollAgentWeComRegisterStatus(
+  agentId: string,
+  sessionId: string,
+): Promise<{
+  status?: "pending" | "confirmed" | "expired" | "error";
+  connected?: boolean;
+  botId?: string;
+  error?: string;
+}> {
+  const res = await apiFetch(
+    `/api/agents/${agentId}/channels/wecom/register/status?session=${encodeURIComponent(sessionId)}`,
+  );
+  return res.json();
+}
+
+export async function startAgentWhatsAppLogin(
+  agentId: string,
+): Promise<{ sessionId?: string; qrCode?: string; status?: string; error?: string }> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/whatsapp/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  return res.json();
+}
+
+export async function pollAgentWhatsAppLoginStatus(
+  agentId: string,
+  sessionId: string,
+): Promise<{
+  status?: "wait" | "confirmed" | "expired" | "error";
+  connected?: boolean;
+  qrCode?: string;
+  accountId?: string;
+  error?: string;
+}> {
+  const res = await apiFetch(
+    `/api/agents/${agentId}/channels/whatsapp/login/status?session=${encodeURIComponent(sessionId)}`,
+  );
+  return res.json();
+}
+
 export async function disconnectAgentChannel(
   agentId: string,
   type: string,
@@ -1990,6 +2337,72 @@ export async function disconnectAgentChannel(
     { method: "DELETE" },
   );
   return res.json();
+}
+
+export async function createChannelPairCode(
+  agentId: string,
+  type: string,
+  accountId: string,
+): Promise<{ code?: string; command?: string; expiresAt?: string; error?: string }> {
+  const res = await apiFetch(
+    `/api/agents/${agentId}/channels/${encodeURIComponent(type)}/${encodeURIComponent(accountId)}/pair-code`,
+    { method: "POST" },
+  );
+  return res.json();
+}
+
+export async function deleteChannelPairing(
+  agentId: string,
+  type: string,
+  accountId: string,
+): Promise<{ ok?: boolean; error?: string }> {
+  const res = await apiFetch(
+    `/api/agents/${agentId}/channels/${encodeURIComponent(type)}/${encodeURIComponent(accountId)}/pairing`,
+    { method: "DELETE" },
+  );
+  return res.json();
+}
+
+// Agent configuration archive (Settings → Advanced). The export is a
+// ZIP of identity files + the agent's own skills; import replaces both.
+export interface AgentArchivePreview {
+  ok?: boolean;
+  format: "fastclaw-agent" | "workspace";
+  name?: string;
+  description?: string;
+  files: string[];
+  skills: string[];
+  ignored: string[];
+  error?: string;
+}
+
+export async function exportAgentArchive(agentId: string): Promise<{ blob: Blob; filename: string }> {
+  const res = await apiFetch(`/api/agents/${agentId}/archive`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Export failed (${res.status})`);
+  }
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const plain = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  const filename = encoded ? decodeURIComponent(encoded) : plain || `${agentId}-config.zip`;
+  return { blob: await res.blob(), filename };
+}
+
+export async function importAgentArchive(
+  agentId: string,
+  file: File,
+  dryRun: boolean,
+): Promise<AgentArchivePreview> {
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  const res = await apiFetch(`/api/agents/${agentId}/archive${dryRun ? "?dryRun=1" : ""}`, {
+    method: "POST",
+    body: fd,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Import failed (${res.status})`);
+  return data;
 }
 
 export async function updateAgentChannel(
@@ -2064,12 +2477,31 @@ export async function getAgentTokenUsage(
 // cookie, so <img src>, <a href>, and direct downloads authenticate by cookie
 // like every other API call. (Putting `?token=<bearer>` in a URL leaked a full
 // API credential via Referer, browser history, and reverse-proxy access logs.)
-export function fileUrl(agentId: string, path: string, download = false): string {
+// With sessionId, path is relative to that conversation's folder and the
+// server resolves where the folder is.
+export function fileUrl(agentId: string, path: string, download = false, sessionId?: string): string {
   const encoded = path.split("/").map(encodeURIComponent).join("/");
   const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
   if (download) params.set("download", "1");
   const qs = params.toString();
   return `/api/agents/${agentId}/files/${encoded}${qs ? "?" + qs : ""}`;
+}
+
+// Editable designs (skills/image-to-editable-html): the page runs in a
+// sandboxed iframe and posts the user's manual edits up; they are saved to
+// <design>/scene/edits.json next to the page, where the skill merges them
+// before its next change. htmlPath is the page's workspace path.
+export async function saveSceneEdits(agentId: string, htmlPath: string, edits: unknown): Promise<void> {
+  const dir = htmlPath.split("/").slice(0, -1).join("/");
+  const rel = `${dir ? dir + "/" : ""}scene/edits.json`;
+  const encoded = rel.split("/").map(encodeURIComponent).join("/");
+  const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/scene-edits/${encoded}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(edits),
+  });
+  if (!res.ok) throw new Error(`save failed: ${res.status}`);
 }
 
 // Workspace version history (per-session git snapshots taken after each
@@ -2107,4 +2539,183 @@ export async function restoreSessionHistory(
     },
   );
   if (!res.ok) throw new Error(`restore failed: ${res.status}`);
+}
+
+// Folder-addressed history for the owner's agent-wide file view, where a
+// previewed file is known by its chat folder ("sessions/<chat>" or
+// "projects/<pid>/<chat>") rather than a session id.
+export async function getFolderHistory(
+  agentId: string,
+  dir: string,
+): Promise<WorkspaceHistoryEntry[]> {
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/workspace/history?dir=${encodeURIComponent(dir)}`,
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.history || []) as WorkspaceHistoryEntry[];
+}
+
+export async function restoreFolderHistory(
+  agentId: string,
+  dir: string,
+  commit: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/workspace/history/restore`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dir, commit }),
+    },
+  );
+  if (!res.ok) throw new Error(`restore failed: ${res.status}`);
+}
+
+export function renameTeamTopic(teamId: string, sessionId: string, title: string) {
+  return teamRequest<{ ok: boolean }>(`/api/chat/team/topic?${new URLSearchParams({ teamId, sessionId })}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }),
+  });
+}
+export function deleteTeamTopic(teamId: string, sessionId: string) {
+  return teamRequest<{ ok: boolean }>(`/api/chat/team/topic?${new URLSearchParams({ teamId, sessionId })}`, { method: "DELETE" });
+}
+
+export interface TeamInboxNotice { id: string; agentId: string; sessionId: string; timestamp: number }
+export function getTeamInbox() {
+  return teamRequest<{ messages: TeamInboxNotice[] }>("/api/chat/team/inbox");
+}
+
+// ── Connectors: the caller's own third-party accounts ──────────────────
+// Server routes in internal/setup/handlers_connectors.go. Errors come back
+// as a closed `code` the UI words itself (connectorErrorText).
+
+export interface ConnectorInfo {
+  name: string;
+  title: string;
+  category?: string;
+  description?: string;
+  avatarUrl: string;
+}
+
+export interface ConnectorCatalog {
+  configured: boolean;
+  categories: { name: string; title: string }[];
+  connectors: ConnectorInfo[];
+}
+
+export interface ConnectorAccount {
+  id: string;
+  connector: string;
+  status: "connected" | "reauth_required";
+  name: string;
+  accountName?: string;
+  workspaceName?: string;
+  displayName?: string;
+  needsAccess: boolean;
+  isDefault: boolean;
+}
+
+export interface ConnectorRequestView {
+  id: string;
+  connector: string;
+  kind: "connect" | "reconnect" | "access";
+  status: "requested" | "pending" | "connected" | "granted" | "error" | "expired" | "cancelled";
+  errorCode?: string;
+}
+
+export interface ConnectorAccess {
+  canAdd: boolean;
+  total: number;
+  grants: { id: string | number; type: string; name: string; selection: "all" | "selected"; suspended: boolean; manage_url: string }[];
+}
+
+export class ConnectorApiError extends Error {
+  constructor(public code: string) {
+    super(code);
+  }
+}
+
+async function connectorJSON<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await apiFetch(path, init);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ConnectorApiError((body as { code?: string }).code || "service_unavailable");
+  return body as T;
+}
+
+const jsonInit = (method: string, body?: unknown): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+});
+
+export function getConnectorCatalog(lang: string, fresh = false) {
+  return connectorJSON<ConnectorCatalog>(`/api/connectors?${new URLSearchParams({ lang, ...(fresh ? { fresh: "1" } : {}) })}`);
+}
+
+export async function getConnectorAccounts(fresh = false) {
+  const r = await connectorJSON<{ accounts: ConnectorAccount[] }>(`/api/connector-accounts${fresh ? "?fresh=1" : ""}`);
+  return r.accounts;
+}
+
+export function updateConnectorAccount(id: string, patch: { name?: string; isDefault?: boolean }) {
+  return connectorJSON<{ ok: boolean }>(`/api/connector-accounts/${encodeURIComponent(id)}`, jsonInit("PATCH", patch));
+}
+
+export function disconnectConnectorAccount(id: string) {
+  return connectorJSON<{ ok: boolean }>(`/api/connector-accounts/${encodeURIComponent(id)}`, jsonInit("DELETE"));
+}
+
+export function checkConnectorAccount(id: string) {
+  return connectorJSON<{ toolCount: number }>(`/api/connector-accounts/${encodeURIComponent(id)}/check`, jsonInit("POST", {}));
+}
+
+export function getConnectorAccess(id: string) {
+  return connectorJSON<ConnectorAccess>(`/api/connector-accounts/${encodeURIComponent(id)}/access`);
+}
+
+/** Mints the one-use authorization link for exactly one target. */
+export function authorizeConnector(target: { requestId: string } | { connector: string } | { reconnectId: string } | { accessId: string }) {
+  return connectorJSON<{ url: string; request: ConnectorRequestView }>("/api/connector-authorizations", jsonInit("POST", target));
+}
+
+export function getConnectorRequest(id: string) {
+  return connectorJSON<ConnectorRequestView>(`/api/connector-requests/${encodeURIComponent(id)}`);
+}
+
+export function recheckConnectorRequest(id: string) {
+  return connectorJSON<ConnectorRequestView>(`/api/connector-requests/${encodeURIComponent(id)}/recheck`, jsonInit("POST", {}));
+}
+
+export function cancelConnectorRequest(id: string) {
+  return connectorJSON<ConnectorRequestView>(`/api/connector-requests/${encodeURIComponent(id)}/cancel`, jsonInit("POST", {}));
+}
+
+export function confirmConnectorReturn(providerSessionId: string) {
+  return connectorJSON<ConnectorRequestView>("/api/connector-requests/confirm", jsonInit("POST", { providerSessionId }));
+}
+
+/** System → Tools → Connectors (super admin): where Connany is. The key
+ *  never comes back — only whether one is set and its last characters. */
+export interface ConnectorsConfig {
+  enabled: boolean;
+  source: "" | "settings" | "env";
+  url: string;
+  apiKeySet: boolean;
+  apiKeyHint: string;
+  envConfigured: boolean;
+}
+
+export function getConnectorsConfig() {
+  return connectorJSON<ConnectorsConfig>("/api/admin/connectors-config");
+}
+
+/** Validates against Connany, saves and applies at once. An empty apiKey
+ *  keeps the one already set. */
+export function saveConnectorsConfig(url: string, apiKey: string) {
+  return connectorJSON<ConnectorsConfig>("/api/admin/connectors-config", jsonInit("PUT", { url, apiKey }));
+}
+
+export function clearConnectorsConfig() {
+  return connectorJSON<ConnectorsConfig>("/api/admin/connectors-config", jsonInit("DELETE"));
 }

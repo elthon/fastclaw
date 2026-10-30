@@ -157,3 +157,23 @@ func TestExtractLeakedToolCalls_MultipleInvokes(t *testing.T) {
 		t.Errorf("names=%q,%q", calls[0].Function.Name, calls[1].Function.Name)
 	}
 }
+
+// Some DeepSeek-backed OpenAI-compatible gateways drop the `tool_`
+// prefix and emit `<｜｜DSML｜｜ calls>` as the wrapper.
+func TestExtractLeakedToolCalls_DSMLBareCallsWrapper(t *testing.T) {
+	in := "<" + "｜｜DSML｜｜ calls>\n" +
+		"<" + `｜｜DSML｜｜invoke name="exec">` + "\n" +
+		"<" + `｜｜DSML｜｜parameter name="command" string="true">date</` + "｜｜DSML｜｜parameter>\n" +
+		"</" + "｜｜DSML｜｜invoke>\n" +
+		"</" + "｜｜DSML｜｜ calls>"
+	cleaned, calls := extractLeakedToolCalls("Checking.\n" + in)
+	if strings.Contains(cleaned, "DSML") || strings.Contains(cleaned, "calls>") {
+		t.Errorf("wrapper not stripped: %q", cleaned)
+	}
+	if strings.TrimSpace(cleaned) != "Checking." {
+		t.Errorf("cleaned = %q, want the preamble only", cleaned)
+	}
+	if len(calls) != 1 || calls[0].Function.Name != "exec" || calls[0].Function.Arguments != `{"command":"date"}` {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
