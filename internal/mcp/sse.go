@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,10 +14,80 @@ import (
 	"time"
 )
 
-// SSEClient implements the legacy MCP SSE transport. It opens a long-lived
+// SSEClient manages a legacy MCP SSE session. A dead session is replaced
+// before the next request. Requests already sent are never replayed.
+type SSEClient struct {
+	url     string
+	headers map[string]string
+	mu      sync.Mutex
+	session *sseSession
+	closed  bool
+}
+
+// NewSSEClient creates a client for a legacy MCP SSE server.
+func NewSSEClient(url string, headers map[string]string) *SSEClient {
+	return &SSEClient{url: url, headers: headers}
+}
+
+func (c *SSEClient) activeSession() (*sseSession, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, fmt.Errorf("SSE client is closed")
+	}
+	if c.session != nil {
+		select {
+		case <-c.session.done:
+			_ = c.session.Close()
+			c.session = nil
+		default:
+			return c.session, nil
+		}
+	}
+	session := newSSESession(c.url, c.headers)
+	if err := session.Connect(); err != nil {
+		_ = session.Close()
+		return nil, fmt.Errorf("connect SSE session: %w", err)
+	}
+	c.session = session
+	return session, nil
+}
+
+func (c *SSEClient) Connect() error {
+	_, err := c.activeSession()
+	return err
+}
+
+func (c *SSEClient) ListTools() ([]ToolDef, error) {
+	session, err := c.activeSession()
+	if err != nil {
+		return nil, err
+	}
+	return session.ListTools()
+}
+
+func (c *SSEClient) CallTool(name string, args json.RawMessage) (string, error) {
+	session, err := c.activeSession()
+	if err != nil {
+		return "", err
+	}
+	return session.CallTool(name, args)
+}
+
+func (c *SSEClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	if c.session != nil {
+		return c.session.Close()
+	}
+	return nil
+}
+
+// sseSession implements the legacy MCP SSE transport. It opens a long-lived
 // SSE stream, reads the server-provided message endpoint, then POSTs JSON-RPC
 // requests to that endpoint and waits for matching responses on the stream.
-type SSEClient struct {
+type sseSession struct {
 	url      string
 	headers  map[string]string
 	client   *http.Client
@@ -29,12 +100,13 @@ type SSEClient struct {
 	ready   chan error
 	done    chan struct{}
 	resp    *http.Response
+	readErr error
 	closeMu sync.Once
 }
 
-// NewSSEClient creates a new MCP client for legacy SSE servers.
-func NewSSEClient(url string, headers map[string]string) *SSEClient {
-	return &SSEClient{
+// newSSESession creates one MCP SSE session.
+func newSSESession(url string, headers map[string]string) *sseSession {
+	return &sseSession{
 		url:     url,
 		headers: expandHeaders(headers),
 		client:  &http.Client{},
@@ -47,7 +119,7 @@ func NewSSEClient(url string, headers map[string]string) *SSEClient {
 
 // Connect opens the SSE stream, waits for the endpoint event, and initializes
 // the MCP session.
-func (c *SSEClient) Connect() error {
+func (c *sseSession) Connect() error {
 	req, err := http.NewRequest("GET", c.url, nil)
 	if err != nil {
 		return fmt.Errorf("create SSE request: %w", err)
@@ -84,10 +156,13 @@ func (c *SSEClient) Connect() error {
 		ProtocolVersion: "2024-11-05",
 		ClientInfo:      clientInfo{Name: "fastclaw", Version: "0.1.0"},
 	})
+	if err != nil {
+		_ = c.Close()
+	}
 	return err
 }
 
-func (c *SSEClient) sendRequest(method string, params interface{}) (*jsonRPCResponse, error) {
+func (c *sseSession) sendRequest(method string, params interface{}) (*jsonRPCResponse, error) {
 	c.mu.Lock()
 	id := c.nextID
 	c.nextID++
@@ -96,21 +171,25 @@ func (c *SSEClient) sendRequest(method string, params interface{}) (*jsonRPCResp
 	endpoint := c.endpoint
 	c.mu.Unlock()
 
+	defer c.forgetPending(id)
+	select {
+	case <-c.done:
+		return nil, fmt.Errorf("SSE stream closed before request")
+	default:
+	}
+
 	if endpoint == "" {
-		c.forgetPending(id)
 		return nil, fmt.Errorf("SSE endpoint not ready")
 	}
 
 	req := jsonRPCRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}
 	body, err := json.Marshal(req)
 	if err != nil {
-		c.forgetPending(id)
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
 	if err != nil {
-		c.forgetPending(id)
 		return nil, fmt.Errorf("create POST request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -120,13 +199,11 @@ func (c *SSEClient) sendRequest(method string, params interface{}) (*jsonRPCResp
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		c.forgetPending(id)
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
-		c.forgetPending(id)
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -137,23 +214,29 @@ func (c *SSEClient) sendRequest(method string, params interface{}) (*jsonRPCResp
 		}
 		return rpcResp, nil
 	case <-c.done:
+		c.mu.Lock()
+		err := c.readErr
+		c.mu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("SSE stream closed before response: %w", err)
+		}
 		return nil, fmt.Errorf("SSE stream closed before response")
 	case <-time.After(60 * time.Second):
-		c.forgetPending(id)
 		return nil, fmt.Errorf("timeout waiting for SSE response")
 	}
 }
 
-func (c *SSEClient) forgetPending(id int) {
+func (c *sseSession) forgetPending(id int) {
 	c.mu.Lock()
 	delete(c.pending, id)
 	c.mu.Unlock()
 }
 
-func (c *SSEClient) readLoop(r io.Reader) {
+func (c *sseSession) readLoop(r io.Reader) {
 	defer close(c.done)
+	defer c.resp.Body.Close()
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 512*1024), 3*1024*1024)
 	eventType := "message"
 	var dataLines []string
 	endpointSent := false
@@ -219,7 +302,14 @@ func (c *SSEClient) readLoop(r io.Reader) {
 			dataLines = append(dataLines, value)
 		}
 	}
-	dispatch()
+	if err := scanner.Err(); err != nil {
+		c.mu.Lock()
+		c.readErr = fmt.Errorf("reading SSE stream: %w", err)
+		c.mu.Unlock()
+		slog.Warn("MCP SSE stream read failed", "error", err)
+	} else {
+		dispatch()
+	}
 	if !endpointSent {
 		select {
 		case c.ready <- fmt.Errorf("SSE stream ended before endpoint event"):
@@ -244,7 +334,7 @@ func resolveEndpoint(baseURL, endpoint string) (string, error) {
 }
 
 // ListTools returns the list of tools available on the MCP server.
-func (c *SSEClient) ListTools() ([]ToolDef, error) {
+func (c *sseSession) ListTools() ([]ToolDef, error) {
 	resp, err := c.sendRequest("tools/list", struct{}{})
 	if err != nil {
 		return nil, err
@@ -257,7 +347,7 @@ func (c *SSEClient) ListTools() ([]ToolDef, error) {
 }
 
 // CallTool calls a tool on the MCP server.
-func (c *SSEClient) CallTool(name string, args json.RawMessage) (string, error) {
+func (c *sseSession) CallTool(name string, args json.RawMessage) (string, error) {
 	resp, err := c.sendRequest("tools/call", toolCallParams{Name: name, Arguments: args})
 	if err != nil {
 		return "", err
@@ -276,7 +366,7 @@ func (c *SSEClient) CallTool(name string, args json.RawMessage) (string, error) 
 }
 
 // Close closes the SSE response body.
-func (c *SSEClient) Close() error {
+func (c *sseSession) Close() error {
 	c.closeMu.Do(func() {
 		if c.resp != nil && c.resp.Body != nil {
 			_ = c.resp.Body.Close()
