@@ -124,6 +124,24 @@ func (a *Agent) meterBackground(ctx context.Context, model string, u provider.Us
 	a.meterTokens(ctx, meterSessionFrom(ctx), model, u, durationMs)
 }
 
+// recordMainTurnContext updates the collector's lastContextTokens and
+// bare model name for a top-level agent turn. Calls made inside a
+// message_agent handoff (depth > 0) share the caller's collector for
+// total tokens/cost, but must not overwrite the caller's context window
+// size or model name.
+func (a *Agent) recordMainTurnContext(ctx context.Context, model string, u provider.Usage) {
+	if depth, _ := ctx.Value(messageAgentDepthKey{}).(int); depth > 0 {
+		return
+	}
+	c := usage.CollectorFrom(ctx)
+	if c == nil {
+		return
+	}
+	ctxTokens := int64(u.InputTokens) + int64(u.CacheReadTokens) + int64(u.CacheCreationTokens)
+	_, mdl := a.meterProviderModel(model)
+	c.SetLastContext(ctxTokens, mdl)
+}
+
 func agentUsesBYOK(model string, providers map[string]config.ProviderConfig) bool {
 	prefix, _ := provider.SplitProviderModel(model)
 	return providers[prefix].BYOK

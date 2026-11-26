@@ -16,6 +16,20 @@ type Collector struct {
 	// model had no price, making the whole request's cost unknown.
 	costUSD     float64
 	costUnknown bool
+	// lastContextTokens and model track the main turn loop's latest LLM
+	// context size and bare model name (updated via SetLastContext so
+	// helper calls like compaction or sub-agents do not clobber them).
+	lastContextTokens int64
+	model             string
+}
+
+// Snapshot is a consistent point-in-time view of a Collector.
+type Snapshot struct {
+	Tokens            Tokens
+	Calls             int
+	CostUSD           *float64
+	LastContextTokens int64
+	Model             string
 }
 
 type collectorKey struct{}
@@ -77,4 +91,46 @@ func (c *Collector) CostUSD() *float64 {
 	}
 	v := c.costUSD
 	return &v
+}
+
+// SetLastContext records the main turn loop's latest model call context
+// size (input + cacheRead + cacheCreation) and model name. Kept separate
+// from Add so helper calls (compaction, delegate_task sub-agents,
+// message_agent handoffs) still accumulate into Totals/CostUSD without
+// overwriting the main conversation's context watermark or model.
+// Zero contextTokens and empty model are ignored so a missing usage frame
+// never clobbers a previously recorded watermark.
+func (c *Collector) SetLastContext(contextTokens int64, model string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if contextTokens > 0 {
+		c.lastContextTokens = contextTokens
+	}
+	if model != "" {
+		c.model = model
+	}
+	c.mu.Unlock()
+}
+
+// Snapshot returns a consistent point-in-time copy of all metrics.
+func (c *Collector) Snapshot() Snapshot {
+	if c == nil {
+		return Snapshot{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var cost *float64
+	if !c.costUnknown {
+		v := c.costUSD
+		cost = &v
+	}
+	return Snapshot{
+		Tokens:            c.tokens,
+		Calls:             c.calls,
+		CostUSD:           cost,
+		LastContextTokens: c.lastContextTokens,
+		Model:             c.model,
+	}
 }
