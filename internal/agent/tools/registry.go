@@ -168,10 +168,11 @@ type ToolFunc func(ctx context.Context, args json.RawMessage) (string, error)
 type ToolSource int
 
 const (
-	SourceBuiltin ToolSource = iota // built-in tool
-	SourceMCP                       // MCP server tool
-	SourcePlugin                    // plugin-provided tool
-	SourceConnector                 // the person's connected accounts (connectors tool)
+	SourceBuiltin    ToolSource = iota // built-in tool
+	SourceMCP                          // MCP server tool
+	SourcePlugin                       // plugin-provided tool
+	SourceConnector                    // the person's connected accounts (connectors tool)
+	SourceLocalAgent                   // the person's own computers (local_agents / run_local_agent)
 )
 
 // Registry holds all registered tools.
@@ -750,6 +751,12 @@ func (r *Registry) RegisterFrom(name, description string, parameters interface{}
 		fn:     fn,
 		source: source,
 	}
+}
+
+// Unregister removes a tool (no-op when absent). For per-turn tools that
+// a later turn of the same agent may not be allowed to see.
+func (r *Registry) Unregister(name string) {
+	delete(r.tools, name)
 }
 
 // RegisterSerial registers a tool that must never have two invocations

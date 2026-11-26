@@ -15,28 +15,10 @@ import (
 // --- Skills ---
 
 func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
-	// ?scope=user lists the caller's own skills instead of the global ones.
+	// ?scope=user: the skills the caller's conversations use (see
+	// listUserScopeSkills), end users included.
 	if r.URL.Query().Get("scope") == "user" {
-		uid, ok := ownSkillsUser(w, r)
-		if !ok {
-			return
-		}
-		dir, err := userSkillsDir(uid)
-		if err != nil {
-			jsonResponse(w, http.StatusOK, []any{})
-			return
-		}
-		if s.workspaceStore != nil {
-			if err := skills.HydrateSkillsDown(r.Context(), s.workspaceStore, skills.UserSkillOwner(uid), dir); err != nil {
-				slog.Warn("failed to hydrate user skills from object store", "user", uid, "error", err)
-			}
-		}
-		out := scanSkillsDir(dir)
-		if out == nil {
-			jsonResponse(w, http.StatusOK, []any{})
-			return
-		}
-		jsonResponse(w, http.StatusOK, out)
+		s.listUserScopeSkills(w, r)
 		return
 	}
 	homeDir, err := config.HomeDir()
@@ -73,6 +55,10 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" || sanitizeSkillName(name) != name {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid skill name"})
+		return
+	}
+	if r.URL.Query().Get("scope") == "user" && isEndUserCaller(r) {
+		s.handleDeleteMySkill(w, r)
 		return
 	}
 	target, ok := s.skillInstallTarget(w, r, "", r.URL.Query().Get("scope") == "user")
@@ -131,6 +117,11 @@ func (s *Server) handleListAgentSkills(w http.ResponseWriter, r *http.Request) {
 	if out == nil {
 		jsonResponse(w, http.StatusOK, []any{})
 		return
+	}
+	for _, e := range out {
+		if name, _ := e["name"].(string); isCreatorSkill(skillsDir, name) {
+			e["creator"] = true
+		}
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
@@ -208,11 +199,18 @@ func (s *Server) handleDeleteAgentSkill(w http.ResponseWriter, r *http.Request) 
 	if s.requireAgentOwner(w, r, id) == nil {
 		return
 	}
+	// A path segment, never "." or "..": RemoveAll below would take the
+	// agent's whole home with it.
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid skill name"})
+		return
+	}
 	homePath, err := config.AgentHomeDir(id)
 	if err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	creator := isCreatorSkill(filepath.Join(homePath, "skills"), name)
 	skillPath := filepath.Join(homePath, "skills", name)
 	if err := os.RemoveAll(skillPath); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
@@ -224,6 +222,9 @@ func (s *Server) handleDeleteAgentSkill(w http.ResponseWriter, r *http.Request) 
 			slog.Warn("failed to remove agent skill from object store",
 				"agent", id, "skill", name, "error", derr)
 		}
+	}
+	if creator {
+		s.dropCreatorSkillEnv(r, id, name)
 	}
 	// Hot-reload the agent so the removed skill drops out of its context.
 	if ag := s.resolveAgent(r, id); ag != nil {

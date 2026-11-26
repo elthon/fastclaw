@@ -29,6 +29,7 @@ export default function RuntimeSettingsPage() {
   const [saveError, setSaveError] = useState("");
 
   const [sandboxEnabled, setSandboxEnabled] = useState(false);
+  const [sandboxEnforce, setSandboxEnforce] = useState(false);
   const [sandboxBackend, setSandboxBackend] = useState("docker");
   const [sandboxDockerImage, setSandboxDockerImage] = useState("");
   const [sandboxE2BTemplate, setSandboxE2BTemplate] = useState("base");
@@ -47,10 +48,13 @@ export default function RuntimeSettingsPage() {
         return;
       }
       setLoading(true);
-      getConfig()
+      // Explicit system scope: this page edits deployment-wide settings,
+      // and the default (merged) view lets a user-level row shadow them.
+      getConfig("system")
         .then((cfg) => {
           setConfig(cfg);
           setSandboxEnabled(cfg.sandbox?.enabled || false);
+          setSandboxEnforce(cfg.sandbox?.enforce || false);
           const backend = cfg.sandbox?.backend || "docker";
           setSandboxBackend(backend);
           // Each backend has its own persisted field. For configs
@@ -98,16 +102,23 @@ export default function RuntimeSettingsPage() {
         },
         sandbox: {
           enabled: sandboxEnabled,
+          enforce: sandboxEnabled && sandboxEnforce,
           backend: sandboxBackend,
-          image: activeImage || undefined,
-          dockerImage: sandboxDockerImage || undefined,
-          e2bTemplate: sandboxE2BTemplate || undefined,
-          boxliteSnapshot: sandboxBoxliteImage || undefined,
+          // Send "" (not undefined) for every optional field: the server
+          // PATCHes, so undefined means "keep", and a cleared field never
+          // cleared — e.g. an E2B template id left in the legacy slot got
+          // pulled as the BoxLite image, and a stale BoxLite image pinned
+          // a cached :latest instead of the current default. API keys stay
+          // undefined-when-empty so a blank field doesn't wipe a stored key.
+          image: activeImage,
+          dockerImage: sandboxDockerImage,
+          e2bTemplate: sandboxE2BTemplate,
+          boxliteSnapshot: sandboxBoxliteImage,
           e2bKey: sandboxE2BKey || undefined,
           boxliteKey: sandboxBoxliteKey || undefined,
-          boxliteUrl: sandboxBoxliteURL || undefined,
+          boxliteUrl: sandboxBoxliteURL,
         },
-      });
+      }, "system");
       if (result?.ok === false) {
         setSaveError(result.error || tr("Save failed", "保存失败"));
         return;
@@ -212,6 +223,18 @@ export default function RuntimeSettingsPage() {
         {sandboxEnabled && (
           <div className="px-5 pb-5 space-y-4">
             <Separator />
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <Label>{tr("Always run in the sandbox", "强制在沙盒执行")}</Label>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {tr(
+                    "On: every command runs inside the sandbox and never on this machine. Off: commands run on this machine by default and the agent opts into the sandbox per call (guest chatters are always sandboxed).",
+                    "开启后所有命令都在沙盒中执行，不会在本机运行。关闭时默认在本机执行，由智能体按需选择沙盒（非管理员的访客始终在沙盒中执行）。",
+                  )}
+                </p>
+              </div>
+              <Switch checked={sandboxEnforce} onCheckedChange={setSandboxEnforce} />
+            </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label>{tr("Backend", "后端")}</Label>
@@ -262,22 +285,22 @@ export default function RuntimeSettingsPage() {
                       type="password"
                       value={sandboxBoxliteKey}
                       onChange={(e) => setSandboxBoxliteKey(e.target.value)}
-                      placeholder="client_secret"
+                      placeholder="blk_live_..."
                       className="font-mono text-sm"
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label>{tr("Snapshot", "快照")}</Label>
+                    <Label>{tr("Image (optional)", "镜像（选填）")}</Label>
                     <Input
                       value={sandboxBoxliteImage}
                       onChange={(e) => setSandboxBoxliteImage(e.target.value)}
-                      placeholder="fastclaw-sandbox"
+                      placeholder="thinkany/fastclaw-sandbox:20261112"
                       className="font-mono text-sm"
                     />
                     <p className="text-xs text-muted-foreground">
                       {tr(
-                        "BoxLite snapshot name (imported through the BoxLite Dashboard), not a Docker Hub image reference.",
-                        "BoxLite 快照名称（通过 BoxLite 控制台导入），不是 Docker Hub 镜像地址。",
+                        "Any public registry image; short names resolve to Docker Hub. Leave empty to use the default.",
+                        "任意公共仓库镜像，短名称默认指向 Docker Hub。留空则使用默认镜像。",
                       )}
                     </p>
                   </div>
@@ -286,7 +309,7 @@ export default function RuntimeSettingsPage() {
                     <Input
                       value={sandboxBoxliteURL}
                       onChange={(e) => setSandboxBoxliteURL(e.target.value)}
-                      placeholder="https://api.dev.boxlite.ai/api/v1"
+                      placeholder="https://api.boxlite.ai/v1"
                       className="font-mono text-sm"
                     />
                   </div>
@@ -297,7 +320,7 @@ export default function RuntimeSettingsPage() {
                   <Input
                     value={sandboxDockerImage}
                     onChange={(e) => setSandboxDockerImage(e.target.value)}
-                    placeholder="thinkany/fastclaw-sandbox:latest"
+                    placeholder="thinkany/fastclaw-sandbox:20261112"
                     className="font-mono text-sm"
                   />
                 </div>

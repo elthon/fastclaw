@@ -26,9 +26,11 @@ import (
 // Auth is a static API key sent as `Authorization: Bearer <apikey>`.
 // Earlier revisions did an OAuth2 client_credentials exchange against
 // /oauth/tokens — that endpoint was removed upstream; the key the
-// operator pastes is now the bearer token directly. BoxliteClientID is
-// retained on the config struct for back-compat (existing admin rows
-// keep working) but it isn't sent anywhere anymore.
+// operator pastes is now the bearer token directly.
+//
+// Paths below are relative to the base URL. BoxLite Cloud
+// (https://api.boxlite.ai/v1) has no {prefix} segment; the open-source
+// reference server and the legacy dev host route under /{prefix}/.
 //
 // Lifecycle:
 //   POST   /{prefix}/boxes          create box (configured)
@@ -43,30 +45,40 @@ import (
 //   DELETE /{prefix}/boxes/{id}?force=true
 
 const (
-	// BoxLite Cloud dev environment — the only public endpoint verified
-	// end-to-end (OAuth + createBox + attach). The OpenAPI servers
-	// stanza advertises `https://api.boxlite.ai/v1`, but that host sits
-	// behind Cloudflare Access and rejects ordinary client_credentials
-	// with a 403 HTML wall. When BoxLite ships a publicly reachable
-	// prod endpoint, update this default — until then, operators on
-	// prod tenants must explicitly set their URL in the admin UI.
-	defaultBoxliteURL      = "https://api.dev.boxlite.ai/api/v1"
-	defaultBoxliteClientID = "default"
-	defaultBoxlitePrefix   = "default"
-	defaultBoxliteImage    = "thinkany/fastclaw-sandbox:latest"
+	// BoxLite Cloud (https://docs.boxlite.ai/cloud/quickstart). Cloud
+	// routes boxes at /v1/boxes with no path prefix.
+	defaultBoxliteURL = "https://api.boxlite.ai/v1"
+	// Cloud takes any public registry reference as the box image (short
+	// names resolve to Docker Hub); snapshots are disabled there.
+	defaultBoxliteImage = DefaultImage
+
+	// legacyBoxliteDevHost still routes under /{prefix}/boxes, so configs
+	// that pinned it keep their old implicit "default" prefix.
+	legacyBoxliteDevHost = "api.dev.boxlite.ai"
+	legacyBoxlitePrefix  = "default"
 )
+
+// resolveBoxlitePrefix returns the path prefix to put between the base
+// URL and /boxes. An explicit prefix always wins; otherwise only the
+// legacy dev host gets "default" — Cloud 404s on a prefixed path.
+func resolveBoxlitePrefix(baseURL, prefix string) string {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	if prefix != "" {
+		return prefix
+	}
+	if u, err := url.Parse(baseURL); err == nil && u.Hostname() == legacyBoxliteDevHost {
+		return legacyBoxlitePrefix
+	}
+	return ""
+}
 
 // BoxliteExecutor implements Executor against a remote Boxlite REST API.
 type BoxliteExecutor struct {
 	baseURL string // already trimmed of trailing slash
-	prefix  string
-	// clientID is the legacy OAuth2 client_id, retained on the struct so
-	// older config rows that set it don't break the constructor. Unused
-	// after the apikey-as-bearer switch.
-	clientID string
-	apiKey   string
-	image    string
-	timeout  time.Duration
+	prefix  string // "" for BoxLite Cloud
+	apiKey  string
+	image   string
+	timeout time.Duration
 
 	client *http.Client
 
@@ -82,15 +94,9 @@ type BoxliteExecutor struct {
 	sessionID string
 }
 
-func newBoxliteExecutor(ctx context.Context, baseURL, prefix, clientID, apiKey, image string, timeout time.Duration) (*BoxliteExecutor, error) {
+func newBoxliteExecutor(ctx context.Context, baseURL, prefix, apiKey, image string, timeout time.Duration) (*BoxliteExecutor, error) {
 	if baseURL == "" {
 		baseURL = defaultBoxliteURL
-	}
-	if prefix == "" {
-		prefix = defaultBoxlitePrefix
-	}
-	if clientID == "" {
-		clientID = defaultBoxliteClientID
 	}
 	if image == "" {
 		image = defaultBoxliteImage
@@ -107,13 +113,12 @@ func newBoxliteExecutor(ctx context.Context, baseURL, prefix, clientID, apiKey, 
 	// request level via context.WithTimeout — same pattern E2BExecutor
 	// settled on after the 60s-streaming-cut bug.
 	e := &BoxliteExecutor{
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		prefix:   prefix,
-		clientID: clientID,
-		apiKey:   apiKey,
-		image:    image,
-		timeout:  timeout,
-		client:   &http.Client{},
+		baseURL: strings.TrimRight(baseURL, "/"),
+		prefix:  resolveBoxlitePrefix(baseURL, prefix),
+		apiKey:  apiKey,
+		image:   image,
+		timeout: timeout,
+		client:  &http.Client{},
 	}
 
 	if err := e.createBox(ctx); err != nil {
@@ -138,16 +143,19 @@ func (e *BoxliteExecutor) authHeader(_ context.Context) (string, error) {
 }
 
 func (e *BoxliteExecutor) prefixPath(suffix string) string {
+	if e.prefix == "" {
+		return e.baseURL + suffix
+	}
 	return fmt.Sprintf("%s/%s%s", e.baseURL, e.prefix, suffix)
 }
 
 func (e *BoxliteExecutor) createBox(ctx context.Context) error {
+	// Only "image": BoxLite Cloud validates the body strictly and rejects
+	// unknown properties ("property auto_remove should not exist" took
+	// every sandbox down). Lifecycle is explicit DELETE in Close(), plus
+	// the server's own auto_stop for boxes we lose track of.
 	body, _ := json.Marshal(map[string]interface{}{
 		"image": e.image,
-		// auto_remove keeps the server from accumulating stopped
-		// boxes when our Close() racing the network drops the
-		// explicit DELETE — they self-collect when stopped.
-		"auto_remove": true,
 	})
 	createCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -167,14 +175,25 @@ func (e *BoxliteExecutor) createBox(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
 	var box struct {
 		BoxID string `json:"box_id"`
+		// 408 body: create now waits for the box to start, and a cold
+		// image pull outlasts that wait. The box exists and keeps
+		// starting; the response just stops waiting for it.
+		PendingID string `json:"boxId"`
 	}
-	if err := json.Unmarshal(respBody, &box); err != nil {
-		return fmt.Errorf("decode box: %w", err)
+	_ = json.Unmarshal(respBody, &box)
+	switch {
+	case resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK:
+	case resp.StatusCode == http.StatusRequestTimeout && box.PendingID != "":
+		box.BoxID = box.PendingID
+		slog.Info("boxlite box still preparing; waiting for it to run", "boxID", box.BoxID, "image", e.image)
+		if err := e.waitRunning(ctx, box.BoxID, 5*time.Minute); err != nil {
+			e.deleteBox(box.BoxID)
+			return err
+		}
+	default:
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 	if box.BoxID == "" {
 		return fmt.Errorf("empty box_id in response: %s", string(respBody))
@@ -184,6 +203,58 @@ func (e *BoxliteExecutor) createBox(ctx context.Context) error {
 	e.mu.Unlock()
 	slog.Info("boxlite box created", "boxID", box.BoxID, "image", e.image)
 	return nil
+}
+
+// boxlitePollInterval is how often waitRunning re-reads box status.
+var boxlitePollInterval = 3 * time.Second
+
+// waitRunning polls GET /boxes/{id} until the box reports "running".
+func (e *BoxliteExecutor) waitRunning(ctx context.Context, boxID string, limit time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	auth, _ := e.authHeader(ctx)
+	last := ""
+	for {
+		req, err := http.NewRequestWithContext(waitCtx, "GET", e.prefixPath("/boxes/"+boxID), nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", auth)
+		if resp, err := e.client.Do(req); err == nil {
+			var st struct {
+				Status string `json:"status"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&st)
+			resp.Body.Close()
+			last = st.Status
+			switch st.Status {
+			case "running":
+				return nil
+			case "stopped", "failed", "error":
+				return fmt.Errorf("boxlite box %s ended up %q while starting", boxID, st.Status)
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("boxlite box %s not running after %s (last status %q)", boxID, limit, last)
+		case <-time.After(boxlitePollInterval):
+		}
+	}
+}
+
+// deleteBox is a best-effort cleanup for a box we're abandoning.
+func (e *BoxliteExecutor) deleteBox(boxID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "DELETE", e.prefixPath("/boxes/"+boxID+"?force=true"), nil)
+	if err != nil {
+		return
+	}
+	auth, _ := e.authHeader(ctx)
+	req.Header.Set("Authorization", auth)
+	if resp, err := e.client.Do(req); err == nil {
+		resp.Body.Close()
+	}
 }
 
 func (e *BoxliteExecutor) startBox(ctx context.Context) error {
@@ -670,7 +741,11 @@ func (e *BoxliteExecutor) attachWebsocketURL(execID string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported scheme %q in boxlite URL", u.Scheme)
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/" + e.prefix + "/boxes/" + e.boxID + "/executions/" + execID + "/attach"
+	u.Path = strings.TrimRight(u.Path, "/")
+	if e.prefix != "" {
+		u.Path += "/" + e.prefix
+	}
+	u.Path += "/boxes/" + e.boxID + "/executions/" + execID + "/attach"
 	return u.String(), nil
 }
 
@@ -823,7 +898,6 @@ type BoxliteExecutorPool struct {
 	executors map[string]*BoxliteExecutor
 	baseURL   string
 	prefix    string
-	clientID  string
 	apiKey    string
 	image     string
 	home      string
@@ -836,17 +910,11 @@ type BoxliteExecutorPool struct {
 func (p *BoxliteExecutorPool) Backend() string { return "boxlite" }
 
 // NewBoxliteExecutorPool constructs a Boxlite-backed pool. Defaults match
-// the public Boxlite Cloud — operators can override URL/prefix/clientID
-// for self-hosted runners or staging environments.
-func NewBoxliteExecutorPool(baseURL, prefix, clientID, apiKey, image, home string, timeout time.Duration) *BoxliteExecutorPool {
+// the public Boxlite Cloud — operators can override URL/prefix for
+// self-hosted runners or staging environments.
+func NewBoxliteExecutorPool(baseURL, prefix, apiKey, image, home string, timeout time.Duration) *BoxliteExecutorPool {
 	if baseURL == "" {
 		baseURL = defaultBoxliteURL
-	}
-	if prefix == "" {
-		prefix = defaultBoxlitePrefix
-	}
-	if clientID == "" {
-		clientID = defaultBoxliteClientID
 	}
 	if image == "" {
 		image = defaultBoxliteImage
@@ -855,7 +923,6 @@ func NewBoxliteExecutorPool(baseURL, prefix, clientID, apiKey, image, home strin
 		executors: make(map[string]*BoxliteExecutor),
 		baseURL:   baseURL,
 		prefix:    prefix,
-		clientID:  clientID,
 		apiKey:    apiKey,
 		image:     image,
 		home:      home,
@@ -878,11 +945,11 @@ func (p *BoxliteExecutorPool) Get(ctx context.Context, agentID, projectID, sessi
 	if ex, ok := p.executors[key]; ok {
 		return ex, nil
 	}
-	ex, err := newBoxliteExecutor(ctx, p.baseURL, p.prefix, p.clientID, p.apiKey, p.image, p.timeout)
+	ex, err := newBoxliteExecutor(ctx, p.baseURL, p.prefix, p.apiKey, p.image, p.timeout)
 	if err != nil {
 		return nil, err
 	}
-	ex.SetHydrationSources(skillDirsForAgent(p.home, agentID), p.workspace, agentID, projectID, sessionID)
+	ex.SetHydrationSources(skillDirsForAgent(p.home, agentID, SkillOwnerFromContext(ctx)), p.workspace, agentID, projectID, sessionID)
 	if err := ex.Hydrate(ctx); err != nil {
 		_ = ex.Close()
 		return nil, fmt.Errorf("boxlite hydrate: %w", err)

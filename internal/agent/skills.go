@@ -122,6 +122,12 @@ type SkillsLoader struct {
 	// other agent they chat with. Empty disables this layer (legacy /
 	// single-user installs that pre-date per-user skills).
 	userID string
+	// ownerID is the account that owns the agent (agents.user_id). Its
+	// personal skills are the product's skills: an app's account (e.g. the
+	// one a product's agents all belong to) adds skills there and every
+	// chatter of its agents gets them. Empty, or the chatter themself,
+	// disables this layer.
+	ownerID string
 	// sandboxed is set when commands never run on this host (enforced
 	// sandbox deploys). The host's PATH then says nothing about a skill's
 	// required binaries (a slim server image has no python3 while the
@@ -166,6 +172,39 @@ func (sl *SkillsLoader) WithUserID(userID string) *SkillsLoader {
 	return sl
 }
 
+// WithOwnerID enables the agent owner's skill layer (the product's skills,
+// ~/.fastclaw/users/<owner>/skills). Precedence: chatter > agent > owner >
+// team > global.
+func (sl *SkillsLoader) WithOwnerID(ownerID string) *SkillsLoader {
+	sl.ownerID = ownerID
+	return sl
+}
+
+// ownerSkillsDir is the owner's skills dir, or "" when the layer is off.
+func (sl *SkillsLoader) ownerSkillsDir() string {
+	if sl.ownerID == "" || sl.ownerID == sl.userID || !SafeSkillOwnerID(sl.ownerID) {
+		return ""
+	}
+	base := fastclawBaseDir()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "users", sl.ownerID, "skills")
+}
+
+// SafeSkillOwnerID: a user id that is safe to join into a path.
+func SafeSkillOwnerID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // WithSandbox marks the agent's commands as running in the sandbox, so
 // skills aren't gated on binaries missing from this host.
 func (sl *SkillsLoader) WithSandbox(enforced bool) *SkillsLoader {
@@ -174,7 +213,7 @@ func (sl *SkillsLoader) WithSandbox(enforced bool) *SkillsLoader {
 }
 
 // LoadSkills discovers skills from all layers and returns them merged.
-// Precedence: agent workspace > user installed > managed > extra dirs.
+// Precedence: chatter > agent > owner (the product) > team > global > extra dirs.
 func (sl *SkillsLoader) LoadSkills() []Skill {
 	// Mirror object-store skills to the local filesystem so a skill
 	// uploaded to OSS (or installed on another replica) is visible here
@@ -199,6 +238,11 @@ func (sl *SkillsLoader) LoadSkills() []Skill {
 		// uses, isolated from other chatters. Lets utility skills the
 		// user sinks on agent A be available on agent B without
 		// polluting the agent owner's official skill set.
+		if ownerDir := sl.ownerSkillsDir(); ownerDir != "" {
+			if err := skills.HydrateSkillsDown(ctx, sl.workspaceStore, skills.UserSkillOwner(sl.ownerID), ownerDir); err != nil {
+				slog.Warn("owner skill hydrate failed", "owner", sl.ownerID, "error", err)
+			}
+		}
 		if userDir := sl.userSkillsDir(); userDir != "" {
 			owner := skills.UserSkillOwner(sl.userID)
 			if err := skills.HydrateSkillsDown(ctx, sl.workspaceStore, owner, userDir); err != nil {
@@ -263,23 +307,33 @@ func (sl *SkillsLoader) LoadSkills() []Skill {
 		}
 	}
 
-	// Layer 1.3: per-user skills (this chatter's personal bucket).
-	// Sits below agent (owner-curated) so an agent's official skill
-	// can override a user's same-named utility, but above team / host
-	// so the user's own skills always trump generic installs.
-	if userDir := sl.userSkillsDir(); userDir != "" {
-		for name, skill := range discoverSkillsEnhanced(userDir, "personal") {
+	// Layer 1.4: the agent owner's skills — the product's own.
+	if ownerDir := sl.ownerSkillsDir(); ownerDir != "" {
+		for name, skill := range discoverSkillsEnhanced(ownerDir, "owner") {
 			if !disabled[name] {
 				skillsMap[name] = skill
 			}
 		}
 	}
 
-	// Layer 1 (highest): agent workspace skills
+	// Layer 1.2: agent workspace skills
 	agentSkillsDir := filepath.Join(sl.agentDir, "skills")
 	for name, skill := range discoverSkillsEnhanced(agentSkillsDir, "agent") {
 		if !disabled[name] {
 			skillsMap[name] = skill
+		}
+	}
+
+	// Layer 1 (highest): the chatter's own skills. They apply to that
+	// person's conversations only, so letting them override the rest
+	// changes nothing for anyone else. Keys and the sandbox's /skills
+	// never come from this layer (see sandbox.skillDirsForAgent), so a
+	// same-named personal skill replaces only the instructions.
+	if userDir := sl.userSkillsDir(); userDir != "" {
+		for name, skill := range discoverSkillsEnhanced(userDir, "personal") {
+			if !disabled[name] {
+				skillsMap[name] = skill
+			}
 		}
 	}
 
@@ -408,7 +462,7 @@ func firstSentence(s string) string {
 const skillsDirective = `<skill_usage_rules>
 The skills listed below are pre-installed for this agent. Only the catalog is always in context. Before using a skill, call the "load_skill" tool with its name to load the full SKILL.md instructions, then follow those instructions exactly. If an always-loaded skill is included inline below, you may use those inline instructions directly.
 
-A skill's configured secrets (API keys such as FAL_KEY) are injected only into commands that run its scripts under /skills/<name>/, so ` + "`env`" + ` or ` + "`echo $KEY`" + ` in any other command never shows them. Don't check for them first: run the skill's script, and only if it reports a missing key, tell the user to configure it in the skill's settings.
+A skill's configured secrets (API keys such as FAL_KEY) are injected only into commands that run its scripts under /skills/<name>/, so ` + "`env`" + ` or ` + "`echo $KEY`" + ` in any other command never shows them. Run a skill's script by its full path ("python /skills/<name>/scripts/x.py", not cd and a relative path) or it gets no keys. Reading the skill's files is free and gets none. Don't check for the keys first: run the skill's script, and only if it reports a missing key, tell the user to configure it in the skill's settings.
 
 The sandbox image already has: python3 + pip, uv + uvx, node + npm + npx, the camoufox-cli anti-detect browser (run as ` + "`camoufox-cli open <url>`" + ` then ` + "`camoufox-cli snapshot -i`" + ` for refs; Camoufox/Firefox is pre-downloaded), git, curl, requests / pillow / beautifulsoup4 / lxml. DO NOT reinstall any of these — wasted tool calls and timeouts. If you see "command not found", check the spelling before reaching for npm/pip.
 
@@ -433,6 +487,21 @@ func (sl *SkillsLoader) SkillEnvVars(skillName string) map[string]string {
 	// agent just to keep the same defaults).
 	var entry config.SkillEntryCfg
 	var found bool
+	// A creator skill (uploaded for the agent by the person who made it)
+	// gets the keys its creator set for this agent, and nothing else: not
+	// the deployment's, whatever its name.
+	if sl.IsCreatorSkill(skillName) {
+		if agentMap, ok := sl.globalCfg.AgentEntries[sl.agentID]; ok && sl.agentID != "" {
+			if e, ok := agentMap[skillName]; ok && len(e.Env) > 0 {
+				env := make(map[string]string, len(e.Env))
+				for k, v := range e.Env {
+					env[k] = v
+				}
+				return env
+			}
+		}
+		return nil
+	}
 	if sl.agentID != "" {
 		if agentMap, ok := sl.globalCfg.AgentEntries[sl.agentID]; ok {
 			if e, ok := agentMap[skillName]; ok && (e.APIKey != "" || len(e.Env) > 0) {
@@ -477,6 +546,24 @@ func (sl *SkillsLoader) SkillEnvVars(skillName string) map[string]string {
 	return env
 }
 
+// CreatorSkillMarker marks a skill in an agent's own layer that the
+// agent's creator uploaded (setup handlers_creator_skills.go). Such a
+// skill is given only the keys its creator set.
+const CreatorSkillMarker = ".fastclaw-creator"
+
+// IsCreatorSkill reports whether the agent's own copy of name, the one its
+// sandbox runs, is a creator skill.
+func (sl *SkillsLoader) IsCreatorSkill(name string) bool {
+	if name == "" || strings.ContainsAny(name, "/\\") || name == "." || name == ".." || sl.agentDir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(sl.agentDir, "skills", name, CreatorSkillMarker))
+	return err == nil
+}
+
+// ManagedSkillsDir is the deployment's managed skills folder.
+func ManagedSkillsDir() string { return fastclawManagedDir() }
+
 // AllSkillDirs returns all skill directories in precedence order.
 func (sl *SkillsLoader) AllSkillDirs() []string {
 	return sl.allSkillDirs()
@@ -484,12 +571,15 @@ func (sl *SkillsLoader) AllSkillDirs() []string {
 
 func (sl *SkillsLoader) allSkillDirs() []string {
 	var dirs []string
-	dirs = append(dirs, filepath.Join(sl.agentDir, "skills"))
-	if sl.teamDir != "" {
-		dirs = append(dirs, filepath.Join(sl.teamDir, "skills"))
-	}
 	if userDir := sl.userSkillsDir(); userDir != "" {
 		dirs = append(dirs, userDir)
+	}
+	dirs = append(dirs, filepath.Join(sl.agentDir, "skills"))
+	if ownerDir := sl.ownerSkillsDir(); ownerDir != "" {
+		dirs = append(dirs, ownerDir)
+	}
+	if sl.teamDir != "" {
+		dirs = append(dirs, filepath.Join(sl.teamDir, "skills"))
 	}
 	dirs = append(dirs, filepath.Join(sl.homeDir, "skills"))
 	dirs = append(dirs, fastclawManagedDir())

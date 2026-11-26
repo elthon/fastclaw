@@ -56,7 +56,11 @@ func (s *Server) loadConfigForUserID(r *http.Request, uid string) (*config.Confi
 		Channels:  map[string]config.ChannelConfig{},
 	}
 	for _, ns := range settingNamespaces {
-		if err := scope.SettingInto(r.Context(), s.dataStore, ns.namespace, uid, "", ns.dst(cfg)); err != nil {
+		nsUID := uid
+		if ns.systemOnly {
+			nsUID = ""
+		}
+		if err := scope.SettingInto(r.Context(), s.dataStore, ns.namespace, nsUID, "", ns.dst(cfg)); err != nil {
 			return nil, err
 		}
 	}
@@ -162,6 +166,9 @@ func (s *Server) saveConfigForUserID(r *http.Request, cfg *config.Config, uid st
 		return errors.New("store not configured")
 	}
 	for _, ns := range settingNamespaces {
+		if ns.systemOnly && uid != "" {
+			continue
+		}
 		data := ns.collect(cfg)
 		if err := scope.SaveSetting(r.Context(), s.dataStore, uid, "", ns.namespace, data); err != nil {
 			return err
@@ -178,8 +185,9 @@ var settingNamespaces = []settingNamespace{
 		dst:     func(c *config.Config) interface{} { return &c.Agents.Defaults },
 		collect: func(c *config.Config) map[string]interface{} { return toMap(c.Agents.Defaults) }},
 	{namespace: "sandbox",
-		dst:     func(c *config.Config) interface{} { return &c.Sandbox },
-		collect: func(c *config.Config) map[string]interface{} { return toMap(c.Sandbox) }},
+		dst:        func(c *config.Config) interface{} { return &c.Sandbox },
+		collect:    func(c *config.Config) map[string]interface{} { return toMap(c.Sandbox) },
+		systemOnly: true},
 	{namespace: "objectstore",
 		dst:     func(c *config.Config) interface{} { return &c.ObjectStore },
 		collect: func(c *config.Config) map[string]interface{} { return toMap(c.ObjectStore) }},
@@ -239,6 +247,12 @@ type settingNamespace struct {
 	namespace string
 	dst       func(*config.Config) interface{}
 	collect   func(*config.Config) map[string]interface{}
+	// systemOnly namespaces are deployment-wide (the runtime reads only
+	// the system row). They are never written at, nor read from, a user
+	// scope: saving any user setting used to snapshot the system sandbox
+	// into that user's row, which then shadowed later admin changes in
+	// the settings UI (backend switched to boxlite, page still said e2b).
+	systemOnly bool
 }
 
 func toMap(v interface{}) map[string]interface{} {
@@ -727,14 +741,24 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			if !s.authorizeScope(w, r, scope.Agent, agentID, scopeWrite) {
 				return
 			}
-			// Resolve masked secrets back to the stored originals before
-			// persisting — same protection as the global entries path.
-			if existing, err := loadAgentSkillEntries(r.Context(), s.dataStore, agentID); err == nil {
-				for name, in := range entries {
-					entries[name] = mergeSkillEntry(existing[name], in)
-				}
+			// The body is a patch: the dashboard's configure dialog sends
+			// only the skill being edited. Start from the stored row so
+			// saving one skill doesn't wipe the agent's other skills'
+			// env, and resolve masked secrets back to the stored
+			// originals — same protection as the global entries path.
+			existing, err := loadAgentSkillEntries(r.Context(), s.dataStore, agentID)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+				return
 			}
-			if err := saveAgentSkillEntries(r.Context(), s.dataStore, agentID, entries); err != nil {
+			patched := make(map[string]config.SkillEntryCfg, len(existing)+len(entries))
+			for name, entry := range existing {
+				patched[name] = entry
+			}
+			for name, in := range entries {
+				patched[name] = mergeSkillEntry(existing[name], in)
+			}
+			if err := saveAgentSkillEntries(r.Context(), s.dataStore, agentID, patched); err != nil {
 				jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
@@ -1307,6 +1331,9 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	// return, and inner-scope cancel would tear down agentCtx before the
 	// continuation's events can reach this handler's safety-net check.
 	agentCtx = agent.ContextWithStream(agentCtx, nil, s.dataStore, hub, uid, agentID, streamSessionID)
+	// The person may hand work to their own linked computers
+	// (run_local_agent); approvals come back through this page.
+	agentCtx = agent.ContextWithLocalAgentsUser(agentCtx, uid)
 
 	agentDone := make(chan struct{})
 	go func() {

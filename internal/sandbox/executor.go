@@ -5,6 +5,13 @@ import (
 	"time"
 )
 
+// DefaultImage is the sandbox image used when none is configured. It is a
+// dated tag, not :latest — BoxLite Cloud caches images by reference and
+// never re-pulls a moved :latest, so a fixed image only reaches boxes
+// under a new tag. When publishing a new image (deploy/docker/sandbox/
+// build.sh), push a new dated tag and bump this.
+const DefaultImage = "thinkany/fastclaw-sandbox:20261112"
+
 // Executor abstracts a sandboxed execution environment for one user.
 // All agent tool calls (exec, read_file, write_file, list_dir) are routed
 // through this interface in cloud mode so that each user gets an isolated
@@ -47,6 +54,13 @@ type ExecutorPool interface {
 	// holding a pool handle don't have to lazily resolve an executor
 	// just to learn the provider name.
 	Backend() string
+}
+
+// LivenessReporter is an optional ExecutorPool capability: Live reports
+// whether a scope's sandbox is already running, so a caller can skip
+// work that would otherwise create one (LifecyclePool).
+type LivenessReporter interface {
+	Live(agentID, projectID, sessionID string) bool
 }
 
 // WorkspaceSnapshotter is an optional capability an Executor can implement

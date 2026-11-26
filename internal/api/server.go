@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
+	"github.com/fastclaw-ai/fastclaw/internal/agl"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
@@ -51,8 +52,11 @@ type Server struct {
 	// workspace holds conversation workspaces; /v1 returns the files an
 	// agent produces from it. Nil disables file return.
 	workspace workspace.Store
-	acpMu     sync.Mutex
-	acpRuns   map[string]*acpRunState
+	// aglHub links end users' own computers (/v1/machines, /agl). Nil
+	// leaves both off.
+	aglHub  *agl.Hub
+	acpMu   sync.Mutex
+	acpRuns map[string]*acpRunState
 }
 
 // NewServer creates a new API server. authResolver is mandatory — there is
@@ -83,10 +87,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleChatCompletions)))
 	}
 	if s.gatewayCfg == nil || s.gatewayCfg.HTTP.Endpoints.Agents.Enabled {
-		// Agent management for integrating apps. Agents created here
-		// belong to the api key's app, never to an
-		// end-user, so X-Fastclaw-End-User does not change what these
-		// endpoints see.
+		// Agent management for integrating apps. Agents belong to the
+		// api key's account (platform agents) or, when created for an
+		// end-user, to that end-user (private agents). A request naming
+		// an end-user sees the platform agents plus that end-user's
+		// private ones — see agentAccessible.
 		for pattern, h := range map[string]http.HandlerFunc{
 			"GET /v1/agents":                                         s.HandleListAgents,
 			"POST /v1/agents":                                        s.HandleCreateAgent,
@@ -118,6 +123,45 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetQuota)))
 	mux.HandleFunc("DELETE /v1/quota",
 		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleDeleteQuota)))
+	// Local agents over /v1 (local_agents): answer run_local_agent approvals.
+	mux.HandleFunc("GET /v1/local-agents/approval",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetLocalAgentApproval)))
+	mux.HandleFunc("POST /v1/local-agents/approval",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleLocalAgentDecision)))
+	// Usage metering + billing hook (docs/usage-metering.md): the
+	// account's usage events, and the hook asked before turns and costly
+	// tool calls.
+	mux.HandleFunc("GET /v1/usage/events",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleListUsageEvents)))
+	mux.HandleFunc("GET /v1/billing/hook",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetBillingHook)))
+	mux.HandleFunc("PUT /v1/billing/hook",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandlePutBillingHook)))
+	// The account's scheduler (docs/scheduler.md): trig keeps the cron
+	// jobs its API turns create and posts to its product when one is due.
+	mux.HandleFunc("GET /v1/scheduler",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetScheduler)))
+	mux.HandleFunc("PUT /v1/scheduler",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandlePutScheduler)))
+
+	// Machines linked through agl ("connect my computer") and the agl
+	// hub the machines dial into. See docs/agl-machines.md.
+	if s.aglHub != nil {
+		for pattern, h := range map[string]http.HandlerFunc{
+			"POST /v1/machines/pairing":                   s.HandleCreateMachinePairing,
+			"POST /v1/machines/pairing/status":            s.HandleMachinePairingStatus,
+			"GET /v1/machines":                            s.HandleListMachines,
+			"PATCH /v1/machines/{id}":                     s.HandleUpdateMachine,
+			"DELETE /v1/machines/{id}":                    s.HandleDeleteMachine,
+			"POST /v1/machines/{id}/agents/refresh":       s.HandleRefreshMachineAgents,
+			"POST /v1/machines/{id}/update":               s.HandleUpdateMachineAgl,
+			"GET /v1/machines/{id}/agents/{agent}/models": s.HandleMachineAgentModels,
+			"POST /v1/machines/{id}/agents/{agent}/test":  s.HandleTestMachineAgent,
+		} {
+			mux.HandleFunc(pattern, s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, h)))
+		}
+		s.aglHub.RegisterRoutes(mux)
+	}
 
 	// Agent Communication Protocol (ACP) 0.2. The protocol defines root
 	// paths such as /agents and /runs relative to a server base URL. FastClaw

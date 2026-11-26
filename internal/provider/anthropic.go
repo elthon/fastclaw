@@ -61,39 +61,34 @@ type anthropicRequest struct {
 // toAnthropicMessages converts provider Messages to Anthropic wire format.
 // Extracts the system message and returns the rest.
 func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
+	msgs = withoutRolelessMessages(msgs)
 	var system string
 	var out []anthropicMessage
 
 	// Anthropic rejects any tool_use whose tool_result doesn't appear
-	// in the immediately following message. The agent loop can produce
-	// this shape when loop detection / cap-reached synthesis injects a
-	// system or assistant message between the tool_use and the
-	// padOrphanToolResults pad. Reuse the openai-path scanner to flag
-	// orphan assistant tool_calls, then sweep the WHOLE message list
-	// for any tool replies whose tool_use we just decided to drop —
-	// the openai scanner only checks the immediate tool-run, which
-	// misses pad results that land after intervening non-tool messages.
+	// in the immediately following message. findOrphanToolCalls flags
+	// assistant tool_calls without a full result run right after them,
+	// and every tool message that isn't in such a run (including pads
+	// that landed after intervening messages). It works by position,
+	// not by id: ids can repeat in one history (recovered calls), and
+	// dropping every result that shares an orphan's id also dropped the
+	// real result of a later call with the same id.
 	// Session history stays untouched; this only affects wire build.
 	orphanAssistant, orphanTool := findOrphanToolCalls(msgs)
-	orphanIDs := map[string]bool{}
-	for i, m := range msgs {
-		if orphanAssistant[i] {
-			for _, id := range assistantToolCallIDs(m) {
-				orphanIDs[id] = true
-			}
-		}
-	}
-	if len(orphanIDs) > 0 {
-		for i, m := range msgs {
-			if m.Role == "tool" && orphanIDs[m.ToolCallID] {
-				orphanTool[i] = true
-			}
-		}
-	}
 
 	for i, m := range msgs {
 		if m.Role == "system" {
-			system = m.Content
+			// Anthropic takes one system string: join every system
+			// message in order. Keeping only the last one silently
+			// dropped the main prompt whenever the loop added a note
+			// (channel hints, connectors, local agents, the agent
+			// roster, the persistence reminder) after it.
+			if c := strings.TrimSpace(m.Content); c != "" {
+				if system != "" {
+					system += "\n\n"
+				}
+				system += m.Content
+			}
 			continue
 		}
 		if orphanTool[i] {
@@ -357,6 +352,9 @@ func thinkingBlockFor(m Message) map[string]interface{} {
 
 func (p *AnthropicProvider) buildRequest(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, stream bool) (*http.Request, error) {
 	system, anthropicMsgs := toAnthropicMessages(messages)
+	if isDeepSeekAnthropic(p.apiBase, model) {
+		anthropicMsgs = withEmptyThinking(anthropicMsgs)
+	}
 
 	if maxTokens <= 0 {
 		maxTokens = 4096
@@ -816,4 +814,49 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 	}
 
 	return result, nil
+}
+
+// isDeepSeekAnthropic reports whether requests go to DeepSeek's
+// Anthropic-compatible endpoint (or a DeepSeek model behind another base).
+func isDeepSeekAnthropic(apiBase, model string) bool {
+	return strings.Contains(strings.ToLower(apiBase), "deepseek") ||
+		strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+// withEmptyThinking gives every assistant message that has no thinking
+// block an empty one. DeepSeek's thinking mode answers 400 "The
+// `content[].thinking` in the thinking mode must be passed back to the
+// API" when a replayed assistant step has none, which happens whenever
+// the model skipped thinking for a step (often a tool call). An empty
+// block satisfies it. Never for real Anthropic: its thinking blocks
+// need a signature.
+func withEmptyThinking(msgs []anthropicMessage) []anthropicMessage {
+	empty := map[string]interface{}{"type": "thinking", "thinking": ""}
+	for i, m := range msgs {
+		if m.Role != "assistant" || len(m.Content) == 0 {
+			continue
+		}
+		var blocks []interface{}
+		if err := json.Unmarshal(m.Content, &blocks); err != nil {
+			var text string
+			if err := json.Unmarshal(m.Content, &text); err != nil {
+				continue
+			}
+			blocks = []interface{}{map[string]interface{}{"type": "text", "text": text}}
+		}
+		has := false
+		for _, b := range blocks {
+			if mp, ok := b.(map[string]interface{}); ok && mp["type"] == "thinking" {
+				has = true
+				break
+			}
+		}
+		if has {
+			continue
+		}
+		if raw, err := json.Marshal(append([]interface{}{empty}, blocks...)); err == nil {
+			msgs[i].Content = raw
+		}
+	}
+	return msgs
 }

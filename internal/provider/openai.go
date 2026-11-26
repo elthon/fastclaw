@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -114,6 +115,7 @@ func toAPIMessages(msgs []Message, model string) []json.RawMessage {
 // toAPIMessagesEcho is toAPIMessages with the reasoning_content echo
 // decided by the caller.
 func toAPIMessagesEcho(msgs []Message, echoReasoning bool) []json.RawMessage {
+	msgs = withoutRolelessMessages(msgs)
 	orphanAssistant, orphanTool := findOrphanToolCalls(msgs)
 	out := make([]json.RawMessage, 0, len(msgs))
 	for i, m := range msgs {
@@ -126,12 +128,13 @@ func toAPIMessagesEcho(msgs []Message, echoReasoning bool) []json.RawMessage {
 		// unless the cached message has orphan tool_calls, in which
 		// case rebuild it without them.
 		if m.Role == "assistant" && len(m.RawAssistant) > 0 && !orphanAssistant[i] {
-			raw := m.RawAssistant
-			if echoReasoning {
-				raw = withReasoningContent(raw)
+			if raw := replayAssistant(m.RawAssistant); raw != nil {
+				if echoReasoning {
+					raw = withReasoningContent(raw)
+				}
+				out = append(out, raw)
+				continue
 			}
-			out = append(out, raw)
-			continue
 		}
 
 		am := apiMessage{
@@ -158,6 +161,39 @@ func toAPIMessagesEcho(msgs []Message, echoReasoning bool) []json.RawMessage {
 		out = append(out, raw)
 	}
 	return out
+}
+
+// Drop roleless history entries before checking adjacent tool calls and results.
+func withoutRolelessMessages(msgs []Message) []Message {
+	for i, m := range msgs {
+		if strings.TrimSpace(m.Role) != "" {
+			continue
+		}
+		out := make([]Message, 0, len(msgs)-1)
+		out = append(out, msgs[:i]...)
+		for _, remaining := range msgs[i+1:] {
+			if strings.TrimSpace(remaining.Role) != "" {
+				out = append(out, remaining)
+			}
+		}
+		return out
+	}
+	return msgs
+}
+
+// The stored message identifies this as an assistant turn. Preserve its raw
+// fields, including any legacy tool calls stored only in the cached payload.
+func replayAssistant(raw json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return nil
+	}
+	if string(obj["role"]) == `"assistant"` {
+		return raw
+	}
+	obj["role"] = json.RawMessage(`"assistant"`)
+	repaired, _ := json.Marshal(obj)
+	return repaired
 }
 
 // needsReasoningEcho reports whether the upstream is (likely) a thinking-
@@ -211,9 +247,19 @@ func withReasoningContent(raw json.RawMessage) json.RawMessage {
 // strip. Both `m.ToolCalls` and tool_calls embedded in
 // `m.RawAssistant` are considered, since old sessions only stored
 // them in the raw JSON.
+//
+// It also flags tool messages the API rejects even when every tool_call
+// is answered: a second result for the same tool_call_id ("each
+// tool_use must have a single result"), a result for an id the
+// assistant didn't call, and a result with no assistant tool_calls
+// right before it. Overlapping turns on one session leave these behind
+// (one turn pads a "(stopped …)" result, another appends the real one),
+// and without this every later turn of that chat failed with a 400.
+// Of two results for one id, a real one wins over a stopped pad.
 func findOrphanToolCalls(msgs []Message) (orphanAssistant, orphanTool map[int]bool) {
 	orphanAssistant = map[int]bool{}
 	orphanTool = map[int]bool{}
+	answered := map[int]bool{} // tool messages in a run after tool_calls
 	for i, m := range msgs {
 		if m.Role != "assistant" {
 			continue
@@ -222,18 +268,35 @@ func findOrphanToolCalls(msgs []Message) (orphanAssistant, orphanTool map[int]bo
 		if len(want) == 0 {
 			continue
 		}
-		// Collect IDs from the run of tool messages immediately following.
-		got := map[string]bool{}
+		wantSet := map[string]bool{}
+		for _, id := range want {
+			wantSet[id] = true
+		}
+		// The run of tool messages immediately following: keep one
+		// result per called id, the first real one if there is one.
+		keep := map[string]int{}
 		j := i + 1
-		for j < len(msgs) && msgs[j].Role == "tool" {
-			if id := msgs[j].ToolCallID; id != "" {
-				got[id] = true
+		for ; j < len(msgs) && msgs[j].Role == "tool"; j++ {
+			answered[j] = true
+			id := msgs[j].ToolCallID
+			if !wantSet[id] {
+				orphanTool[j] = true
+				continue
 			}
-			j++
+			k, seen := keep[id]
+			switch {
+			case !seen:
+				keep[id] = j
+			case isStoppedPad(msgs[k]) && !isStoppedPad(msgs[j]):
+				orphanTool[k] = true
+				keep[id] = j
+			default:
+				orphanTool[j] = true
+			}
 		}
 		missing := false
 		for _, id := range want {
-			if !got[id] {
+			if _, ok := keep[id]; !ok {
 				missing = true
 				break
 			}
@@ -245,17 +308,22 @@ func findOrphanToolCalls(msgs []Message) (orphanAssistant, orphanTool map[int]bo
 		// Drop any tool messages that referenced this assistant's
 		// (now-removed) tool_calls so the API doesn't reject them as
 		// dangling tool replies.
-		wantSet := map[string]bool{}
-		for _, id := range want {
-			wantSet[id] = true
-		}
 		for k := i + 1; k < j; k++ {
-			if wantSet[msgs[k].ToolCallID] {
-				orphanTool[k] = true
-			}
+			orphanTool[k] = true
+		}
+	}
+	for i, m := range msgs {
+		if m.Role == "tool" && !answered[i] {
+			orphanTool[i] = true
 		}
 	}
 	return
+}
+
+// isStoppedPad reports whether a tool message is the placeholder the
+// agent loop appends for a tool that never returned.
+func isStoppedPad(m Message) bool {
+	return strings.HasPrefix(m.Content, "(stopped — ")
 }
 
 // assistantToolCallIDs extracts tool_call IDs from a stored assistant
@@ -429,12 +497,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, too
 				// tool_calls) followed by tool replies, and OpenAI
 				// 400s with "Messages with role 'tool' must be a
 				// response to a preceding message with 'tool_calls'".
-				var tcs []ToolCall
-				for i := 0; i < len(toolCalls); i++ {
-					if tc, ok := toolCalls[i]; ok {
-						tcs = append(tcs, *tc)
-					}
-				}
+				tcs := orderedToolCalls(toolCalls)
 				reasoning := reasoningBuilder.String()
 				rawMsg := apiMessage{
 					Role:             "assistant",
@@ -687,11 +750,7 @@ func (p *OpenAIProvider) parseSSE(reader io.Reader) (*Response, error) {
 		Usage:     usage,
 		Truncated: truncated,
 	}
-	for i := 0; i < len(toolCalls); i++ {
-		if tc, ok := toolCalls[i]; ok {
-			result.ToolCalls = append(result.ToolCalls, *tc)
-		}
-	}
+	result.ToolCalls = orderedToolCalls(toolCalls)
 
 	// Same leaked-XML recovery the Anthropic provider does — DeepSeek-flash
 	// served via api.deepseek.com (openai-chat compat, not the anthropic
@@ -742,6 +801,29 @@ func openaiUsageToProvider(u *sseUsage) Usage {
 		if out.InputTokens < 0 {
 			out.InputTokens = 0
 		}
+	}
+	return out
+}
+
+// orderedToolCalls returns streamed tool calls sorted by their delta
+// index. The index is not guaranteed to start at 0 or be contiguous:
+// OpenAI-compatible relays in front of Claude reuse the Anthropic
+// content-block index, so after a thinking block the first tool call
+// arrives as index 1. Walking 0..len-1 dropped the last call — and a
+// lone call entirely, which surfaced as "model returned an empty
+// response".
+func orderedToolCalls(m map[int]*ToolCall) []ToolCall {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	out := make([]ToolCall, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, *m[k])
 	}
 	return out
 }

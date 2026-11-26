@@ -448,6 +448,9 @@ func (s *Server) agentReadable(r *http.Request, rec *store.AgentRecord) bool {
 	if rec.UserID == uid {
 		return true
 	}
+	if s.foreignPrivateAgent(r, rec) {
+		return false
+	}
 	if ident.AuthMethod == "apikey" && ident.CanAccessAgent(rec.ID) {
 		return true
 	}
@@ -473,6 +476,9 @@ func (s *Server) callerOwnsAgent(r *http.Request, agentID string) bool {
 	if rec.UserID == uid || ident.Role == users.RoleSuperAdmin {
 		return true
 	}
+	if s.foreignPrivateAgent(r, rec) {
+		return false
+	}
 	if ident.AuthMethod == "apikey" && ident.CanAccessAgent(agentID) {
 		return true
 	}
@@ -491,8 +497,30 @@ func (s *Server) requireAgentReadable(w http.ResponseWriter, r *http.Request, ag
 	if s.agentReadable(r, rec) {
 		return true
 	}
+	if s.foreignPrivateAgent(r, rec) {
+		// Another end user's private agent doesn't exist for this caller.
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		return false
+	}
 	jsonResponse(w, http.StatusForbidden, map[string]any{"error": "not your agent"})
 	return false
+}
+
+// foreignPrivateAgent reports whether the request acts for one of an
+// integrating product's end users (api key + X-Fastclaw-End-User) and rec
+// is a private agent of a different end user. Such agents must look
+// nonexistent (404) to the caller — even to the product's admin key —
+// the same rule /v1 applies (api.agentAccessible).
+func (s *Server) foreignPrivateAgent(r *http.Request, rec *store.AgentRecord) bool {
+	ident, ok := auth.FromContext(r.Context())
+	if !ok || ident.AuthMethod != "apikey" || ident.EndUser == "" || rec == nil {
+		return false
+	}
+	if rec.UserID == ident.UserID || rec.UserID == ident.AccountID() {
+		return false
+	}
+	owner, err := s.dataStore.GetUser(r.Context(), rec.UserID)
+	return err == nil && owner != nil && owner.Role == users.RoleAppUser
 }
 
 func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
@@ -548,6 +576,15 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		// send {} to clear, or send the full desired map to replace.
 		MCPServers      map[string]config.MCPServerConfig `json:"mcpServers,omitempty"`
 		MCPServersReset bool                              `json:"mcpServersReset,omitempty"`
+		// End-user reach (store.AgentReachableByEndUser): which of the
+		// account's end users may reach this agent from another agent.
+		// nil = unchanged, "" = clear. Visibility: "public" | "private".
+		// Owner: the end user's X-Fastclaw-End-User value.
+		EndUserVisibility *string `json:"endUserVisibility,omitempty"`
+		EndUserOwner      *string `json:"endUserOwner,omitempty"`
+		// EndUserConnectors: every end user may use their own connected
+		// accounts on this agent (store.AgentCfgEndUserConnectors).
+		EndUserConnectors *bool `json:"endUserConnectors,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -602,6 +639,32 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			delete(rec.Config, "mcpServers")
 		} else {
 			rec.Config["mcpServers"] = req.MCPServers
+		}
+	}
+	if req.EndUserVisibility != nil {
+		v := strings.TrimSpace(*req.EndUserVisibility)
+		if v != "" && v != store.EndUserVisibilityPublic && v != store.EndUserVisibilityPrivate {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "endUserVisibility must be one of: public, private"})
+			return
+		}
+		setAgentConfigString(rec, store.AgentCfgEndUserVisibility, v)
+	}
+	if req.EndUserOwner != nil {
+		v := strings.TrimSpace(*req.EndUserOwner)
+		if len(v) > 256 {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "endUserOwner is too long"})
+			return
+		}
+		setAgentConfigString(rec, store.AgentCfgEndUserOwner, v)
+	}
+	if req.EndUserConnectors != nil {
+		if rec.Config == nil {
+			rec.Config = map[string]interface{}{}
+		}
+		if *req.EndUserConnectors {
+			rec.Config[store.AgentCfgEndUserConnectors] = true
+		} else {
+			delete(rec.Config, store.AgentCfgEndUserConnectors)
 		}
 	}
 	if err := s.dataStore.SaveAgent(r.Context(), rec); err != nil {
@@ -1758,4 +1821,19 @@ func (s *Server) handleListAgentRegisteredTools(w http.ResponseWriter, r *http.R
 		toolList = []tools.ToolInfo{}
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"tools": toolList})
+}
+
+// setAgentConfigString sets key in rec's config blob, or removes it when v
+// is empty.
+func setAgentConfigString(rec *store.AgentRecord, key, v string) {
+	if v == "" {
+		if rec.Config != nil {
+			delete(rec.Config, key)
+		}
+		return
+	}
+	if rec.Config == nil {
+		rec.Config = map[string]interface{}{}
+	}
+	rec.Config[key] = v
 }

@@ -16,8 +16,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,15 +28,19 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
 	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
+	"github.com/fastclaw-ai/fastclaw/internal/agl"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/cron"
+	"github.com/fastclaw-ai/fastclaw/internal/drain"
 	"github.com/fastclaw-ai/fastclaw/internal/plugin"
+	"github.com/fastclaw-ai/fastclaw/internal/redact"
 	"github.com/fastclaw-ai/fastclaw/internal/rediscoord"
 	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
+	"github.com/fastclaw-ai/fastclaw/internal/share"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/taskqueue"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
@@ -190,6 +196,7 @@ func buildToolChainFromResolved(resolved config.ResolvedAgent, category string) 
 		Registry:     toolProviderRegistry,
 		GetConfig: func(name string) toolproviders.ProviderConfig {
 			pc := providers[name]
+			redact.Register(pc.APIKey)
 			return toolproviders.ProviderConfig{
 				APIKey:   pc.APIKey,
 				Endpoint: pc.Endpoint,
@@ -238,8 +245,14 @@ type Gateway struct {
 	// SSE hub a user-typed POST /api/chat turn uses. Nil-safe: unset
 	// keeps the legacy bus.Outbound → WebChannel async-bubble path.
 	chatEvents *agent.EventHub
-	mu         sync.RWMutex
-	dedup      sync.Map
+	// aglBridge runs IM turns of runtime "agl" agents on the owner's
+	// linked computer instead of the LLM (agl.go). Nil = off.
+	aglBridge *agl.Bridge
+	// aglTools runs local_agents / run_local_agent for LLM agents and
+	// holds their chats' open permission requests.
+	aglTools *agl.Tools
+	mu       sync.RWMutex
+	dedup    sync.Map
 	// pairFails counts wrong /pair attempts per channel row id (see
 	// pairing.go); the outstanding code is burned once it hits the cap.
 	pairFails sync.Map
@@ -532,6 +545,48 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		}
 		chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
 		stopMsgTyping := chanMgr.StartMessageTyping(task.Message.Channel, task.AccountID, task.Message.ChatID, task.Message.MessageID)
+		// IM turns: what the model says alongside a tool call (a plan, a
+		// progress line) goes out right away, and a turn that has said
+		// nothing for progressPingAfter gets a "still working" line, so a
+		// long task isn't minutes of silence. Raw "calling X…" lines stay
+		// off (too noisy). Web chat streams events instead.
+		im := task.Message.Channel != "web" && chanMgr.Has(task.Message.Channel, task.AccountID)
+		turnStart := time.Now()
+		var lastSaid atomic.Int64
+		lastSaid.Store(turnStart.UnixNano())
+		var interimMedia atomic.Bool
+		pushInterim := func(text string, items []bus.MediaItem) {
+			if strings.TrimSpace(text) == "" && len(items) == 0 {
+				return
+			}
+			out := bus.OutboundMessage{
+				Channel:    task.Message.Channel,
+				AccountID:  task.AccountID,
+				AgentID:    task.AgentID,
+				ChatID:     task.Message.ChatID,
+				Text:       text,
+				ParseMode:  "Markdown",
+				MediaItems: items,
+				AllowSplit: ag.SplitReplies(),
+			}
+			select {
+			case mb.Outbound <- out:
+				lastSaid.Store(time.Now().UnixNano())
+			case <-ctx.Done():
+			}
+		}
+		if im {
+			ctx = agent.WithInterimSender(ctx, func(text string) {
+				t, items := splitMediaFromReply(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, text)
+				t, files := splitFilesFromReply(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, t)
+				items = append(items, files...)
+				if len(items) > 0 {
+					interimMedia.Store(true)
+				}
+				pushInterim(t, items)
+			})
+		}
+		zh := agent.PrefersChinese(task.Message.Text)
 		typingDone := make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
@@ -544,15 +599,12 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 					return
 				case <-ticker.C:
 					chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
+					if im && time.Since(time.Unix(0, lastSaid.Load())) >= progressPingAfter {
+						pushInterim(progressPing(zh, time.Since(turnStart)), nil)
+					}
 				}
 			}
 		}()
-
-		// IM channels show only the final reply — no per-tool_call
-		// progress messages. Users see a typing indicator (above)
-		// during the run; intermediate "calling X…" lines added too
-		// much noise on multi-tool turns. Web UI subscribes to chat
-		// events directly via HandleWebChatStream and is unaffected.
 
 		// Snapshot the workspace before the turn. The post-turn media
 		// fallback must only attach files created by this turn; sandbox
@@ -605,7 +657,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		// addition to the final output. Its final reply is authoritative and
 		// the system prompt requires the agent to link each final deliverable.
 		// Other channels retain the legacy safety net for compatibility.
-		if len(items) == 0 && task.Message.Channel != "wechat" {
+		if len(items) == 0 && task.Message.Channel != "wechat" && !interimMedia.Load() {
 			items = appendNewWorkspaceMedia(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, workspaceBefore, workspaceSnapshotOK, items)
 		}
 		// Web-streamed turns already delivered the reply via the hub.
@@ -698,12 +750,33 @@ func (g *Gateway) IsCloudMode() bool { return true }
 func (g *Gateway) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Hide our public egress IP from regular chatters' turns.
+	go redact.DiscoverEgressIP(ctx)
 
 	stopCh := make(chan os.Signal, 1)
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-stopCh
-		slog.Info("received signal, shutting down", "signal", sig)
+		// Finish the turns already running first (a rolling deploy must
+		// not cut them off); a second signal stops at once.
+		drain.Start()
+		timeout := drainTimeout()
+		slog.Info("received signal, draining running turns", "signal", sig, "active", drain.Active(), "timeout", timeout)
+		waitCtx, stopWaiting := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case sig := <-stopCh:
+				slog.Warn("second signal, not waiting for running turns", "signal", sig)
+				stopWaiting()
+			case <-waitCtx.Done():
+			}
+		}()
+		if drain.Wait(waitCtx, timeout) {
+			slog.Info("all turns finished, shutting down")
+		} else {
+			slog.Warn("shutting down with turns still running", "active", drain.Active())
+		}
+		stopWaiting()
 		cancel()
 	}()
 
@@ -724,26 +797,19 @@ func (g *Gateway) Run() error {
 		}
 	}()
 
-	var wg sync.WaitGroup
+	var wg workers
 	if err := g.bus.Start(ctx); err != nil {
 		return fmt.Errorf("start message bus: %w", err)
 	}
-	wg.Add(1)
-	go func() { defer wg.Done(); g.users.startEvictor(ctx) }()
-	wg.Add(1)
-	go func() { defer wg.Done(); g.cleanupDedup(ctx) }()
-	wg.Add(1)
-	go func() { defer wg.Done(); g.processInbound(ctx) }()
-	wg.Add(1)
-	go func() { defer wg.Done(); g.chanMgr.Start(ctx) }()
+	wg.Go("evictor", func() { g.users.startEvictor(ctx) })
+	wg.Go("dedup-cleanup", func() { g.cleanupDedup(ctx) })
+	wg.Go("inbound", func() { g.processInbound(ctx) })
+	wg.Go("channels", func() { g.chanMgr.Start(ctx) })
 	if g.scheduler != nil {
-		wg.Add(1)
-		go func() { defer wg.Done(); g.scheduler.Start(ctx) }()
+		wg.Go("scheduler", func() { g.scheduler.Start(ctx) })
 	}
 	if g.webhookSrv != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go("webhook-server", func() {
 			port := readSystemHooks(g.store).Port
 			if port == 0 {
 				port = 18954
@@ -752,7 +818,7 @@ func (g *Gateway) Run() error {
 			if err := g.webhookSrv.ListenAndServe(ctx, addr); err != nil {
 				slog.Error("webhook server error", "error", err)
 			}
-		}()
+		})
 	}
 	if g.pluginMgr != nil {
 		if err := g.pluginMgr.StartAll(ctx); err != nil {
@@ -765,7 +831,14 @@ func (g *Gateway) Run() error {
 		plugin.RegisterPluginProviders(ctx, g.pluginMgr, toolProviderRegistry)
 	}
 	slog.Info("gateway started")
-	wg.Wait()
+	<-ctx.Done()
+	// Every worker watches ctx, but a stuck one (a channel adapter blocked
+	// in a library call) must not keep the process alive: it would hold
+	// agl WebSockets and channel pollers until the pod is killed, so
+	// devices look offline to the new pod meanwhile.
+	if stuck := wg.Wait(shutdownGrace()); len(stuck) > 0 {
+		slog.Warn("workers did not stop in time, exiting anyway", "workers", stuck)
+	}
 	if g.taskQueue != nil {
 		g.taskQueue.Stop()
 	}
@@ -777,6 +850,72 @@ func (g *Gateway) Run() error {
 	}
 	slog.Info("gateway stopped")
 	return nil
+}
+
+// shutdownGrace bounds how long shutdown waits for the gateway's workers
+// after the turns have drained.
+func shutdownGrace() time.Duration { return 15 * time.Second }
+
+// workers is a WaitGroup that remembers which named workers are running,
+// so a shutdown that gives up can say what was stuck.
+type workers struct {
+	wg   sync.WaitGroup
+	mu   sync.Mutex
+	live map[string]int
+}
+
+func (w *workers) Go(name string, fn func()) {
+	w.mu.Lock()
+	if w.live == nil {
+		w.live = map[string]int{}
+	}
+	w.live[name]++
+	w.mu.Unlock()
+	w.wg.Add(1)
+	go func() {
+		defer func() {
+			w.mu.Lock()
+			if w.live[name]--; w.live[name] <= 0 {
+				delete(w.live, name)
+			}
+			w.mu.Unlock()
+			w.wg.Done()
+		}()
+		fn()
+	}()
+}
+
+// Wait waits up to d for every worker to return and lists the ones
+// still running (nil when all stopped).
+func (w *workers) Wait(d time.Duration) []string {
+	done := make(chan struct{})
+	go func() { w.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(d):
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	names := make([]string, 0, len(w.live))
+	for n := range w.live {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// drainTimeout is how long shutdown waits for running turns:
+// FASTCLAW_DRAIN_TIMEOUT (a Go duration, e.g. "10m"; "0" = don't wait),
+// default 10 minutes. Keep the pod's terminationGracePeriodSeconds above it.
+func drainTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("FASTCLAW_DRAIN_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+		slog.Warn("invalid FASTCLAW_DRAIN_TIMEOUT, using the default", "value", v)
+	}
+	return 10 * time.Minute
 }
 
 // makeStoreFirstAgentFileLoader returns a loader that reads per-agent
@@ -957,10 +1096,28 @@ func allChannelRows(st store.Store) ([]store.ConfigRecord, error) {
 // the chat body.
 var imgRefRegex = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
 
-// fileRefRegex intentionally accepts only /workspace links. Normal web links
-// remain in the message, and image syntax has already been removed by
-// splitMediaFromReply before this matcher runs.
-var fileRefRegex = regexp.MustCompile(`\[([^\]]*)\]\((/workspace/[^)]+)\)`)
+// fileRefRegex matches markdown links. isWorkspaceFileRef then keeps
+// only those pointing at a workspace file: /workspace/... or a bare
+// relative path with an extension ("report.pdf", "out/data.zip"). Web
+// links stay in the message, and image syntax has already been removed
+// by splitMediaFromReply before this matcher runs.
+//
+// Bare relative paths used to be ignored, so `[app.scripting](app.scripting)`
+// reached WeChat as text and the file was never sent.
+var fileRefRegex = regexp.MustCompile(`\[([^\]]*)\]\(([^)\s]+)\)`)
+
+func isWorkspaceFileRef(target string) bool {
+	if strings.HasPrefix(target, "/workspace/") {
+		return true
+	}
+	if strings.Contains(target, ":") || strings.HasPrefix(target, "/") ||
+		strings.HasPrefix(target, "#") || strings.HasPrefix(target, "?") ||
+		strings.HasPrefix(target, "//") || strings.HasPrefix(target, "www.") {
+		return false
+	}
+	ext := filepath.Ext(target)
+	return len(ext) >= 2 && len(ext) <= 16
+}
 
 // splitFilesFromReply resolves explicitly linked workspace documents into
 // outbound attachments and removes the raw markdown link from IM text.
@@ -975,16 +1132,29 @@ func splitFilesFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 	var items []bus.MediaItem
 	var out strings.Builder
 	cursor := 0
+	linked := false
 	for _, m := range matches {
 		path := reply[m[4]:m[5]]
+		if !isWorkspaceFileRef(path) {
+			continue
+		}
 		data, base, err := resolveWorkspaceBytes(ctx, ws, agentID, projectID, sessionID, path)
 		if err != nil {
 			slog.Warn("split file: workspace get failed", "path", path, "error", err)
 			continue
 		}
 		if len(data) > maxAttachmentBytes {
-			slog.Warn("split file: skipping oversize attachment",
-				"agent", agentID, "session", sessionID, "filename", base, "size", len(data), "cap", maxAttachmentBytes)
+			// Too big for the channel: hand over a download link instead.
+			link, lerr := share.Default().Create(ctx, data, base)
+			if lerr != nil {
+				slog.Warn("split file: oversize and no share link",
+					"agent", agentID, "session", sessionID, "filename", base, "size", len(data), "error", lerr)
+				continue
+			}
+			out.WriteString(reply[cursor:m[0]])
+			out.WriteString(base + ": " + link)
+			cursor = m[1]
+			linked = true
 			continue
 		}
 		items = append(items, bus.MediaItem{Filename: base, ContentType: mime.TypeByExtension(filepath.Ext(base)), Bytes: data})
@@ -994,7 +1164,7 @@ func splitFilesFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 			cursor++
 		}
 	}
-	if len(items) == 0 {
+	if len(items) == 0 && !linked {
 		return reply, nil
 	}
 	out.WriteString(reply[cursor:])
@@ -1009,7 +1179,7 @@ func splitFilesFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 // the gateway resolves against (sessions/<chatID>/). Turns that run
 // without a session scope — cron jobs, web-dashboard default scope,
 // and anything that shells out to a host tool whose cwd is the
-// agent-shared root (`exec`, the local-coding-agents hand-off) — drop
+// agent-shared root (`exec`) — drop
 // their files directly under <root>/<agent>/. Resolving only the
 // session scope therefore misses the file, and the image is silently
 // stripped from the reply with nothing sent to the IM channel.
@@ -1427,4 +1597,20 @@ func mimeExt(mime string) string {
 		return ".svg"
 	}
 	return ".bin"
+}
+
+// progressPingAfter is how long an IM turn may go without saying
+// anything before the person gets a "still working" line.
+const progressPingAfter = 3 * time.Minute
+
+// progressPing is the "still working" line for a turn running for d.
+func progressPing(zh bool, d time.Duration) string {
+	mins := int(d.Round(time.Minute) / time.Minute)
+	if mins < 1 {
+		mins = 1
+	}
+	if zh {
+		return fmt.Sprintf("还在处理，已经 %d 分钟了，做完马上告诉你。", mins)
+	}
+	return fmt.Sprintf("Still working on it (%d min so far). I'll reply as soon as it's done.", mins)
 }

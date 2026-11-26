@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/skills"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
+	"github.com/fastclaw-ai/fastclaw/internal/usermodels"
 	"github.com/fastclaw-ai/fastclaw/internal/users"
 	"github.com/fastclaw-ai/fastclaw/internal/workspace"
 )
@@ -95,6 +98,7 @@ func globalSkillsDirPath() (string, error) {
 // but no executor available" to the user. Pulling the pool up to
 // gateway scope makes the borrow path the default for every UserSpace.
 func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.ExecutorPool {
+	buildinfo.SetSandboxEnforceSetting(cfg.Enabled && cfg.Enforce)
 	if !cfg.Enabled {
 		return nil
 	}
@@ -131,7 +135,6 @@ func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.E
 		inner = sandbox.NewBoxliteExecutorPool(
 			cfg.BoxliteURL,
 			cfg.BoxlitePrefix,
-			cfg.BoxliteClientID,
 			secret,
 			snapshot,
 			home,
@@ -621,6 +624,9 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			}
 		}
 	}
+	if err := usermodels.Apply(ctx, st, sp.UserID, &rc); err != nil {
+		return err
+	}
 	ensureAgentHome(rc)
 	if ws != nil {
 		if err := skills.HydrateSkillsDown(ctx, ws, rc.ID, filepath.Join(rc.Home, "skills")); err != nil {
@@ -671,9 +677,15 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 		return fmt.Errorf("EnsureAgent: add agent: %w", err)
 	}
 	// Same per-agent tool chains (web_search, image_gen, …) the eager
-	// load path registers, so an on-demand agent has identical tools.
+	// load path registers, so an on-demand agent has identical tools —
+	// with the owner's tool settings when the owner's config applies (an
+	// app's end user runs the app account's image_gen, like its models).
 	if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
-		registerAgentToolChains(sp.Config, []*agent.Agent{ag})
+		owner := ""
+		if rec.UserID != sp.UserID && applyOwnerOverlays {
+			owner = rec.UserID
+		}
+		registerAgentToolChains(toolConfigFor(ctx, st, sp.Config, owner, rc.ID), []*agent.Agent{ag})
 	}
 	if sp.SandboxPool != nil {
 		if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
@@ -709,6 +721,77 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 		slog.Info("agent loaded on demand", "user", sp.UserID, "agent", rc.ID)
 	}
 	return nil
+}
+
+// toolConfigFor is base (system → space user, already merged) with the
+// tool settings of the agent's owner (owner != "": the space user runs an
+// agent whose owner's config applies) and then of the agent itself laid
+// over it, category by category and provider by provider — the same
+// precedence as models: the most specific layer wins. Base is returned
+// as-is when there is nothing to add; it is never modified.
+func toolConfigFor(ctx context.Context, st store.Store, base *config.Config, owner, agentID string) *config.Config {
+	if st == nil || base == nil {
+		return base
+	}
+	type layer struct{ uid, aid string }
+	var layers []layer
+	if owner != "" {
+		layers = append(layers, layer{owner, ""})
+	}
+	if agentID != "" {
+		layers = append(layers, layer{"", agentID})
+		if owner != "" {
+			layers = append(layers, layer{owner, agentID})
+		}
+	}
+	var providers map[string]config.ToolProviderCfg
+	var tools map[string]config.ToolCategoryCfg
+	for _, l := range layers {
+		var p map[string]config.ToolProviderCfg
+		if readToolRow(ctx, st, NSToolProviders, l.uid, l.aid, &p) && len(p) > 0 {
+			if providers == nil {
+				providers = maps.Clone(base.ToolProviders)
+				if providers == nil {
+					providers = map[string]config.ToolProviderCfg{}
+				}
+			}
+			maps.Copy(providers, p)
+		}
+		var t map[string]config.ToolCategoryCfg
+		if readToolRow(ctx, st, NSToolCategories, l.uid, l.aid, &t) && len(t) > 0 {
+			if tools == nil {
+				tools = maps.Clone(base.Tools)
+				if tools == nil {
+					tools = map[string]config.ToolCategoryCfg{}
+				}
+			}
+			maps.Copy(tools, t)
+		}
+	}
+	if providers == nil && tools == nil {
+		return base
+	}
+	cp := *base
+	if providers != nil {
+		cp.ToolProviders = providers
+	}
+	if tools != nil {
+		cp.Tools = tools
+	}
+	return &cp
+}
+
+// readToolRow reads one layer's own row of a tool namespace (not merged).
+func readToolRow(ctx context.Context, st store.Store, ns, uid, aid string, dst any) bool {
+	rec, err := st.GetConfigByName(ctx, store.KindSetting, uid, aid, ns)
+	if err != nil || rec == nil || len(rec.Data) == 0 {
+		return false
+	}
+	blob, err := json.Marshal(rec.Data)
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(blob, dst) == nil
 }
 
 // loadUserSpace builds a UserSpace by:
@@ -748,9 +831,10 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	}
 	// An app_user space runs agents owned by the app (the api key's owner
 	// account); remember the owner so EnsureAgent treats them as owned.
-	appOwner := ""
+	appOwner, appExternalID := "", ""
 	if u, uerr := st.GetUser(ctx, userID); uerr == nil && u != nil && u.Role == users.RoleAppUser {
 		appOwner = u.OwnerUserID
+		appExternalID = u.ExternalID
 	}
 
 	// Public agents owned by other users are NOT loaded eagerly here —
@@ -872,6 +956,9 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 				rc.Providers[k] = v
 			}
 		}
+		if err := usermodels.Apply(ctx, st, userID, rc); err != nil {
+			return nil, err
+		}
 		ensureAgentHome(*rc)
 		if ws != nil {
 			if err := skills.HydrateSkillsDown(
@@ -910,24 +997,10 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		agent.WithToolAvailability(func(_ context.Context, agentID string) (map[string]bool, error) {
 			return agentToolAvailability(cfg, agentID), nil
 		}),
-		// message_agent's lookup: another agent of this account by id or
-		// display name, loaded on demand (agents may be evicted when idle).
-		agent.WithAgentResolver(func(ctx context.Context, ref string) (*agent.Agent, error) {
-			if space == nil {
-				return nil, fmt.Errorf("user space is still loading")
-			}
-			id, err := resolveOwnedAgentRef(ctx, st, userID, ref)
-			if err != nil {
-				return nil, err
-			}
-			if err := space.EnsureOwnedAgent(ctx, st, mb, ws, id); err != nil {
-				return nil, err
-			}
-			if ag := space.Agents.AgentByID(id); ag != nil {
-				return ag, nil
-			}
-			return nil, fmt.Errorf("agent %q is not available", ref)
-		}),
+		// message_agent's lookup, scoped to this space's owner.
+		agent.WithAgentResolver(messageAgentResolver(func() *UserSpace { return space }, st, mb, ws, userID, appOwner, appExternalID)),
+		agent.WithAgentLister(messageAgentLister(st, userID, appOwner, appExternalID)),
+		agent.WithEndUserConnectors(endUserConnectorGate(st, userID, appOwner, appExternalID)),
 	}
 	if ws != nil {
 		managerOpts = append(managerOpts, agent.WithWorkspaceStore(ws))
@@ -947,7 +1020,9 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		agentMgr.ClearDefaultAgent()
 	}
 
-	registerAgentToolChains(cfg, agentMgr.All())
+	for _, ag := range agentMgr.All() {
+		registerAgentToolChains(toolConfigFor(ctx, st, cfg, "", ag.Name()), []*agent.Agent{ag})
+	}
 
 	pool := attachSandboxToAgents(systemSandboxPool, userID, resolved, agentMgr)
 
@@ -1445,22 +1520,127 @@ func backgroundAgents(ctx context.Context, st store.Store, userID string, bindin
 	return out
 }
 
-// resolveOwnedAgentRef maps a message_agent target — an agent id or a
-// case-insensitive display name — to the id of an agent owned by userID.
-func resolveOwnedAgentRef(ctx context.Context, st store.Store, userID, ref string) (string, error) {
+// messageAgentResolver is message_agent's lookup for the space of userID:
+// another agent by id or display name, loaded on demand (agents may be
+// evicted when idle).
+//
+// In a plain account space the target is owned by userID. In an end
+// user's (app_user, appOwner != "") space the caller is one of the end
+// user's own agents or one of the account's agents running for them, and
+// the target is one the end user may reach: the account's agents the
+// product marked public to its end users or as this end user's
+// (store.AgentReachableByEndUser, keyed by externalID, their
+// X-Fastclaw-End-User value), plus — for the end user's own agents only —
+// their other own agents. Never another end user's private agents, and an
+// account agent never reaches the end user's own private agents.
+func messageAgentResolver(space func() *UserSpace, st store.Store, mb *bus.MessageBus, ws workspace.Store, userID, appOwner, externalID string) agent.AgentResolver {
+	return func(ctx context.Context, callerOwner, ref string) (*agent.Agent, error) {
+		sp := space()
+		if sp == nil {
+			return nil, fmt.Errorf("user space is still loading")
+		}
+		if callerOwner != userID && (appOwner == "" || callerOwner != appOwner) {
+			return nil, fmt.Errorf("no agent named %q exists", ref)
+		}
+		id, err := resolveReachableAgentRef(ctx, st, userID, appOwner, externalID, callerOwner == userID, ref)
+		if err != nil {
+			return nil, err
+		}
+		if err := sp.EnsureOwnedAgent(ctx, st, mb, ws, id); err != nil {
+			return nil, err
+		}
+		if ag := sp.Agents.AgentByID(id); ag != nil {
+			return ag, nil
+		}
+		return nil, fmt.Errorf("agent %q is not available", ref)
+	}
+}
+
+// messageAgentLister is message_agent's roster for the space of userID:
+// what messageAgentResolver would resolve for a caller owned by
+// callerOwner, the end user's own agents first (their own private agents,
+// then the account's agents marked as theirs, then the public ones).
+func messageAgentLister(st store.Store, userID, appOwner, externalID string) agent.AgentLister {
+	return func(ctx context.Context, callerOwner string) ([]agent.AgentBrief, error) {
+		if st == nil {
+			return nil, nil
+		}
+		if callerOwner != userID && (appOwner == "" || callerOwner != appOwner) {
+			return nil, nil
+		}
+		recs, err := reachableAgents(ctx, st, userID, appOwner, externalID, callerOwner == userID)
+		if err != nil {
+			return nil, err
+		}
+		rank := func(rec *store.AgentRecord) int {
+			switch {
+			case rec.UserID == userID:
+				return 0
+			case externalID != "" && store.AgentEndUserOwner(rec) == externalID:
+				return 1
+			default:
+				return 2
+			}
+		}
+		sort.SliceStable(recs, func(i, j int) bool { return rank(&recs[i]) < rank(&recs[j]) })
+		out := make([]agent.AgentBrief, 0, len(recs))
+		for _, rec := range recs {
+			desc, _ := rec.Config["description"].(string)
+			out = append(out, agent.AgentBrief{ID: rec.ID, Name: rec.Name, Description: desc})
+		}
+		return out, nil
+	}
+}
+
+// reachableAgents lists the agents message_agent may reach in the space
+// of userID (see messageAgentResolver).
+// ownAgents: include userID's own agents (false for an account agent
+// calling from an end user's space).
+func reachableAgents(ctx context.Context, st store.Store, userID, appOwner, externalID string, ownAgents bool) ([]store.AgentRecord, error) {
+	var recs []store.AgentRecord
+	if ownAgents || appOwner == "" {
+		own, err := st.ListAgents(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		recs = own
+	}
+	if appOwner == "" {
+		return recs, nil
+	}
+	shared, err := st.ListAgents(ctx, appOwner)
+	if err != nil {
+		return nil, err
+	}
+	for i := range shared {
+		if store.AgentReachableByEndUser(&shared[i], externalID) {
+			recs = append(recs, shared[i])
+		}
+	}
+	return recs, nil
+}
+
+// resolveReachableAgentRef maps a message_agent target — an agent id or a
+// case-insensitive display name — to the id of an agent the space may
+// reach. The error for an unknown name lists the reachable ones, so the
+// model can retry with a real name instead of guessing.
+func resolveReachableAgentRef(ctx context.Context, st store.Store, userID, appOwner, externalID string, ownAgents bool, ref string) (string, error) {
 	if st == nil {
 		return "", fmt.Errorf("agent lookup unavailable")
 	}
-	if rec, err := st.GetAgent(ctx, ref); err == nil && rec != nil && rec.UserID == userID {
-		return rec.ID, nil
-	}
-	recs, err := st.ListAgents(ctx, userID)
+	recs, err := reachableAgents(ctx, st, userID, appOwner, externalID, ownAgents)
 	if err != nil {
 		return "", err
 	}
+	ref = strings.TrimSpace(ref)
+	for _, rec := range recs {
+		if rec.ID == ref {
+			return rec.ID, nil
+		}
+	}
 	match := ""
 	for _, rec := range recs {
-		if strings.EqualFold(strings.TrimSpace(rec.Name), strings.TrimSpace(ref)) {
+		if strings.EqualFold(strings.TrimSpace(rec.Name), ref) {
 			if match != "" {
 				return "", fmt.Errorf("more than one agent is named %q; use its id", ref)
 			}
@@ -1468,7 +1648,37 @@ func resolveOwnedAgentRef(ctx context.Context, st store.Store, userID, ref strin
 		}
 	}
 	if match == "" {
-		return "", fmt.Errorf("no agent named %q exists", ref)
+		names := make([]string, 0, len(recs))
+		for _, rec := range recs {
+			if len(names) == 30 {
+				break
+			}
+			names = append(names, rec.Name)
+		}
+		if len(names) == 0 {
+			return "", fmt.Errorf("no agent named %q exists, and there are no other agents to message", ref)
+		}
+		return "", fmt.Errorf("no agent named %q exists. Agents you can message: %s", ref, strings.Join(names, ", "))
 	}
 	return match, nil
+}
+
+// endUserConnectorGate lets an app's end user (this space: userID, known
+// to the app as externalID) use their own connected accounts — and the
+// custom MCP servers an agent offers, with their own sign-in — on any of
+// the app's agents (and on their own), in their own 1:1 chat. Whoever
+// made an agent picks what it offers; each person authorizes their own
+// accounts. Not on another account's agents. Nil outside an end user's
+// space.
+func endUserConnectorGate(st store.Store, userID, appOwner, externalID string) agent.EndUserConnectorGate {
+	if st == nil || appOwner == "" || strings.TrimSpace(externalID) == "" {
+		return nil
+	}
+	return func(ctx context.Context, agentID, chatterUID string) bool {
+		if chatterUID != userID || agentID == "" {
+			return false
+		}
+		rec, err := st.GetAgent(ctx, agentID)
+		return err == nil && rec != nil && (rec.UserID == appOwner || rec.UserID == userID)
+	}
 }

@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo, useLayoutEffect } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { ConnectorRequestCard } from "@/components/connector-request-card";
+import { applyLocalAgentEvent, LocalAgentRunCard, type LocalAgentRun } from "@/components/local-agent-card";
 import { beginChatRun, finishChatRun, stopChatRun, useChatRunStatus, type ChatRunStatus } from "@/lib/chat-runs";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Button } from "@/components/ui/button";
@@ -12,7 +13,7 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { createProject, deleteChatSession, deleteProject, fileUrl, getAgent, getAgentKnowledgeFile, getChangedFiles, getChatHistoryWithCursor, getChatSessions, getChatTodo, getMe, getScopePreview, getScopePreviewLogs, getFolderHistory, getSessionHistory, listAgentFiles, listProjects, renameChatSession, restoreFolderHistory, restoreSessionHistory, revealAgentWorkspace, saveSceneEdits, sendChatStream, steerChat, updateAgent, updateProject, uploadAgentFiles, getSkills, type AgentDetail, type ChatHistoryMessage, type ChatStreamEvent, type KnowledgeSource, type MeResponse, type PrivateSource, type ProjectEntry, type ScopePreview, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile, type WorkspaceHistoryEntry } from "@/lib/api";
+import { createProject, deleteChatSession, deleteProject, fileUrl, getAgent, getAgentKnowledgeFile, getChangedFiles, getChatHistoryWithCursor, getChatSessions, getChatTodo, getLocalAgentApproval, getMe, getScopePreview, getScopePreviewLogs, getFolderHistory, getSessionHistory, listAgentFiles, listProjects, renameChatSession, restoreFolderHistory, restoreSessionHistory, revealAgentWorkspace, saveSceneEdits, sendChatStream, steerChat, updateAgent, updateProject, uploadAgentFiles, getSkills, type AgentDetail, type ChatHistoryMessage, type ChatStreamEvent, type KnowledgeSource, type MeResponse, type PrivateSource, type ProjectEntry, type ScopePreview, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile, type WorkspaceHistoryEntry } from "@/lib/api";
 import { ArrowLeft, ArrowUp, BookOpen, Box, Brain, Check, ChevronDown, ChevronRight, ChevronUp, CircleAlert, CornerDownRight, CirclePause, Clock, Code2, Copy, Download, Eye, ExternalLink, File, FileCode, FileText, Film, Folder, FolderOpen, FolderPlus, FolderSearch, Globe, Globe2, IdCard, Image as ImageIcon, Link2, ListChecks, LoaderCircle, LockKeyhole, MoreHorizontal, Music, PanelLeftClose, PanelLeftOpen, Paperclip, Pencil, Plus, Puzzle, Radio, RefreshCw, RotateCcw, Settings, Share2, SlidersHorizontal, Sparkles, Square, SquarePen, Terminal, Trash2, Wand2, Wrench, X } from "lucide-react";
 import Link from "next/link";
 import { ChatMarkdown } from "@/components/chat-markdown";
@@ -174,6 +175,9 @@ interface ChatMessage {
   // "steer" echo. Used only to dedup against that echo (cleared on
   // match) — not rendered differently.
   pendingSteer?: boolean;
+  // Local error bubble for "no usable LLM provider" — renders a button
+  // that reopens the agent's model settings.
+  needsModelConfig?: boolean;
   // Assistant-side metadata (e.g. iteration-cap badge). Stamped from
   // either the live content event's `metadata` payload or the
   // ChatHistoryMessage.metadata on a refresh.
@@ -778,6 +782,9 @@ export function ChatScreen() {
     phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up";
     tools?: string[];
   }>(null);
+  // run_local_agent working on the person's computer: progress and, when
+  // it stops to ask, the approval buttons (LocalAgentRunCard).
+  const [localAgentRun, setLocalAgentRun] = useState<LocalAgentRun | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [filesSheetOpen, setFilesSheetOpen] = useState(false);
   const [botPanelOpen, setBotPanelOpen] = useState(false);
@@ -1341,8 +1348,15 @@ export function ChatScreen() {
                   ? tr("Configure an LLM provider before chatting.", "请先配置可用的模型服务商，再继续聊天。")
                   : tr("Error: {{error}}", "错误：{{error}}", { error: msg }),
                 timestamp: Date.now(),
+                needsModelConfig: needsModelConfiguration || undefined,
               },
             ]);
+            break;
+          }
+          case "local_agent": {
+            claim();
+            const d = data.data as ChatStreamEvent["data"];
+            setLocalAgentRun((prev) => applyLocalAgentEvent(prev, d));
             break;
           }
           case "subagent_progress": {
@@ -1435,6 +1449,22 @@ export function ChatScreen() {
       es.close();
     };
   }, [selectedAgent, sessionId, loadedSessionId, tr]);
+
+  // A page opened while run_local_agent waits for the person's approval
+  // (refresh, another tab) shows the buttons again.
+  useEffect(() => {
+    if (!selectedAgent || !sessionId || loadedSessionId !== sessionId) return;
+    let cancelled = false;
+    getLocalAgentApproval(selectedAgent, sessionId)
+      .then((p) => {
+        if (cancelled || !p.pending) return;
+        setLocalAgentRun((prev) => ({ ...(prev ?? {}), agent: p.agent || prev?.agent || "", machine: p.machine || prev?.machine || "", approval: p.title || "" }));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedAgent, sessionId, loadedSessionId]);
 
   // Reactively swap sessionId when the URL changes underneath us.
   // Three URL transitions matter, all handled by the same branch logic:
@@ -1655,6 +1685,7 @@ export function ChatScreen() {
     // Same for the subagent progress indicator — never carry it across
     // sessions; a fresh load means no in-flight delegate_task to track.
     setSubagentProgress(null);
+    setLocalAgentRun(null);
     setLlmRetryStatus(null);
     // Refresh todo.md alongside the history fetch. We don't gate the
     // rest of the load on it — a 404 (no todo.md yet) is the normal
@@ -1927,6 +1958,7 @@ export function ChatScreen() {
   const sendAttachments = setAttachments;
   const sendSending = setSending;
   const sendSubagentProgress = setSubagentProgress;
+  const sendLocalAgentRun = setLocalAgentRun;
   const handleSend = useCallback(async (overrideText?: string, force?: boolean) => {
     // overrideText lets caller post a message that didn't come from
     // the composer (e.g. the plan-approval button clicking "go"). When
@@ -1960,6 +1992,7 @@ export function ChatScreen() {
     const setAttachments: typeof sendAttachments = (value) => { sendAttachments((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
     const setSending: typeof sendSending = (value) => { sendSending((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
     const setSubagentProgress: typeof sendSubagentProgress = (value) => { sendSubagentProgress((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
+    const setLocalAgentRun: typeof sendLocalAgentRun = (value) => { sendLocalAgentRun((current) => isCurrent() ? (typeof value === "function" ? value(current) : value) : current); };
 
     const controller = beginChatRun(selectedAgent, sessionId);
     if (!controller) return;
@@ -2361,6 +2394,10 @@ export function ChatScreen() {
             });
             break;
           }
+          case "local_agent": {
+            setLocalAgentRun((prev) => applyLocalAgentEvent(prev, evt.data));
+            break;
+          }
           case "subagent_progress": {
             // Subagent emitted a heartbeat. Stored as a single
             // "current run state" since delegate_task is registered
@@ -2403,6 +2440,7 @@ export function ChatScreen() {
                   ? tr("Configure an LLM provider before chatting.", "请先配置可用的模型服务商，再继续聊天。")
                   : tr("Error: {{error}}", "错误：{{error}}", { error: msg }),
                 timestamp: Date.now(),
+                needsModelConfig: needsModelConfiguration || undefined,
               },
             ]);
             break;
@@ -2533,6 +2571,7 @@ export function ChatScreen() {
               role: "agent",
               content: errMsg,
               timestamp: Date.now(),
+              needsModelConfig: needsModelConfiguration || undefined,
             },
           ];
         });
@@ -2548,6 +2587,7 @@ export function ChatScreen() {
         abortRef.current = null;
         setSending(false);
         setSubagentProgress(null);
+        setLocalAgentRun(null);
         textareaRef.current?.focus();
       }
     }
@@ -3135,6 +3175,19 @@ export function ChatScreen() {
                           />
                         )
                       )}
+                      {msg.role === "agent" && msg.needsModelConfig && (
+                        <div className="mt-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => openAgentModelsSettings(selectedAgent)}
+                            className="h-8 gap-1.5"
+                          >
+                            <Settings className="h-3.5 w-3.5" />
+                            {tr("Configure models", "配置模型")}
+                          </Button>
+                        </div>
+                      )}
                       {msg.role === "agent" && msg.metadata?.iterationCapReached && (
                         <div className="mt-2 flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-900 dark:text-amber-200">
                           {msg.metadata.iterationStopReason === "loop" ? (
@@ -3269,6 +3322,15 @@ export function ChatScreen() {
               );
               }
             })()}
+
+            {!isConversationLoading && localAgentRun && selectedAgent && (
+              <LocalAgentRunCard
+                run={localAgentRun}
+                agentId={selectedAgent}
+                sessionId={sessionId}
+                onDecided={() => setLocalAgentRun((prev) => (prev ? { ...prev, approval: undefined } : prev))}
+              />
+            )}
 
             {!isConversationLoading && sending && (
               <div className="flex justify-start">

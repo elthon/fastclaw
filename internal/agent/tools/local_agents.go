@@ -1,0 +1,383 @@
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/fastclaw-ai/fastclaw/internal/agl"
+)
+
+// Tool names for dispatching work to the person's own computer.
+const (
+	LocalAgentsToolName   = "local_agents"
+	RunLocalAgentToolName = "run_local_agent"
+	SendLocalFileToolName = "send_local_file"
+)
+
+// LocalFileFetcher reads a file from the person's computer (*agl.Tools).
+type LocalFileFetcher interface {
+	Fetch(ctx context.Context, r agl.FetchRun) (agl.FetchedFile, error)
+}
+
+// SaveFileFunc stores fetched bytes in this turn's session workspace and
+// returns the /workspace-relative name.
+type SaveFileFunc func(ctx context.Context, f agl.FetchedFile) (string, error)
+
+// LoadFileFunc reads a file from this turn's session workspace by its
+// /workspace path (a file the person sent, or one made in this chat).
+type LoadFileFunc func(ctx context.Context, path string) (agl.ToolFile, error)
+
+// loadFiles reads the workspace files a tool call names.
+func loadFiles(ctx context.Context, load LoadFileFunc, paths []string) ([]agl.ToolFile, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	if load == nil {
+		return nil, &agl.ToolError{Msg: "Files can't be handed over from this chat."}
+	}
+	if len(paths) > agl.MaxPushFiles {
+		return nil, &agl.ToolError{Msg: fmt.Sprintf("At most %d files can be handed over with one task.", agl.MaxPushFiles)}
+	}
+	out := make([]agl.ToolFile, 0, len(paths))
+	for _, p := range paths {
+		f, err := load(ctx, p)
+		if err != nil {
+			return nil, &agl.ToolError{Msg: fmt.Sprintf("Could not read %s from the workspace: %v. Use the exact /workspace path of the file.", p, err)}
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// filesSchema is the "files" parameter of tools that hand files over.
+func filesSchema(desc string) map[string]any {
+	return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": desc}
+}
+
+// LocalAgentRunner is what the tools need from internal/agl (*agl.Tools).
+type LocalAgentRunner interface {
+	Machines(ctx context.Context, userID string) ([]agl.LocalMachine, error)
+	Run(ctx context.Context, r agl.ToolRun) (string, error)
+}
+
+// RegisterLocalAgents mounts local_agents and run_local_agent on one
+// turn's registry. The machines' owner (userID) and the chat are bound
+// here from the turn — the model only names agents and machines among
+// that person's own. Only for 1:1 IM turns of the person the chat
+// belongs to (see Agent.mountLocalAgents).
+//
+// notify is set for a web chat: progress and approvals go to it.
+//
+// load reads the files a task hands over ("files"); nil leaves the
+// parameter off.
+func RegisterLocalAgents(r *Registry, svc LocalAgentRunner, userID string, chat agl.ToolChat, notify func(agl.ToolNotice), load LoadFileFunc) {
+	t := &localAgentsTool{svc: svc, userID: userID, chat: chat, notify: notify, load: load}
+	approvals := "the person may be asked in this chat to approve actions (they reply 1/2/3)"
+	if notify != nil {
+		approvals = "the person may be asked in this chat to approve actions (buttons in the chat)"
+	}
+
+	r.RegisterFrom(LocalAgentsToolName,
+		"List the person's own linked computers (name, online) and the local agents available on each (claude, codex, gemini, …) with what each is good at (e.g. codex can generate images). "+
+			"Use it before run_local_agent when you are not sure which agent or computer to use.",
+		map[string]any{"type": "object", "properties": map[string]any{}},
+		t.list, SourceLocalAgent)
+
+	desc := strings.Join([]string{
+		"Run a task with a local agent (Claude Code, Codex, …) on the PERSON'S OWN computer, linked to this chat, and get its final answer back.",
+		"Use it when the request needs their computer (code, files or repositories there, commands, builds, tests) OR a capability you lack but one of their local agents has. Before saying you can't do something, check the agents' strengths (local_agents) and dispatch to one that can.",
+		"When computer_* tools are also offered, use those for quick look-ups and a command or two (list or search a folder, read a file, check a value), and this tool for substantial work: writing or fixing code, changes across a project, builds and tests, anything that needs planning, many steps or minutes. Also use it when a computer_* call isn't allowed there or the job turns out bigger than a few steps.",
+		"For pictures (draw, paint, generate an image) use generate_image, not this tool.",
+		"Pick the agent by its strengths, not just the first one: code/files/analysis → any (claude is a good default).",
+		"Do NOT use it for chit-chat, general knowledge or plain text you can write yourself.",
+		"Write \"task\" as a complete, self-contained instruction for the coding agent (it does not see this chat), in the person's language. Follow-ups in this chat continue the same local session, so you can refer to earlier work.",
+		"The coding agent can't see this chat or /workspace: when the task involves a photo or file the person sent here (or one you made), list it in \"files\". It is copied to their computer first and the task tells the agent where; never ask the person to save it there themselves.",
+		"The run can take minutes; " + approvals + ". Summarize the result for the person in your own words; do not paste huge outputs.",
+		"If it returns an error (computer offline, agent missing, timeout), tell the person plainly what happened and what they can do.",
+	}, "\n")
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"agent":   map[string]any{"type": "string", "description": `Coding agent id on the computer, e.g. "claude" or "codex" (see local_agents).`},
+			"task":    map[string]any{"type": "string", "description": "The full instruction for the coding agent."},
+			"machine": map[string]any{"type": "string", "description": "Computer name or id; omit to use the first online computer that has the agent."},
+			"cwd":     map[string]any{"type": "string", "description": `Working directory on the computer, e.g. "~/code/app"; omit for the computer's default.`},
+		},
+		"required": []string{"agent", "task"},
+	}
+	if load != nil {
+		schema["properties"].(map[string]any)["files"] = filesSchema(`Workspace files to hand to the coding agent, e.g. ["/workspace/image_3jk7l_0.jpg"]: photos or documents the person sent in this chat, or files you made.`)
+	}
+	r.RegisterSerialFrom(RunLocalAgentToolName, desc, schema, t.run, SourceLocalAgent)
+}
+
+// RegisterSendLocalFile mounts send_local_file: fetch a file a coding
+// agent produced on the person's computer into the workspace, so the
+// reply can show it (image) or attach it (document) in this chat.
+func RegisterSendLocalFile(r *Registry, svc LocalFileFetcher, save SaveFileFunc, userID string) {
+	t := &sendLocalFileTool{svc: svc, save: save, userID: userID}
+	r.RegisterSerialFrom(SendLocalFileToolName, strings.Join([]string{
+		"Fetch a file from the PERSON'S OWN computer (one a coding agent created or that they ask for) so you can show or send it in this chat.",
+		"Use it after run_local_agent made an image, chart, PDF or document the person wants to see: the chat can display images and attach files, the person can't open paths on their computer from here.",
+		"Allowed: png, jpg, gif, webp, pdf, docx, xlsx, pptx, txt, md, csv, zip, mp4, mp3 (max 20 MB), not files in hidden folders. SVG can't be shown: ask the coding agent to export a PNG first.",
+		"It returns a workspace path. To show an image, put ![](/workspace/<name>) in your reply; to attach any other file, put [<name>](/workspace/<name>). Don't describe the path to the person.",
+	}, "\n"), map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path":    map[string]any{"type": "string", "description": `File path on the computer, e.g. "~/Downloads/cat.png" (absolute, ~/…, or relative to the computer's default folder).`},
+			"machine": map[string]any{"type": "string", "description": "Computer name or id; omit for the first online computer."},
+		},
+		"required": []string{"path"},
+	}, t.run, SourceLocalAgent)
+}
+
+type sendLocalFileTool struct {
+	svc    LocalFileFetcher
+	save   SaveFileFunc
+	userID string
+}
+
+func (t *sendLocalFileTool) run(ctx context.Context, raw json.RawMessage) (string, error) {
+	var a struct {
+		Path    string `json:"path"`
+		Machine string `json:"machine"`
+	}
+	if err := json.Unmarshal(raw, &a); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+	f, err := t.svc.Fetch(ctx, agl.FetchRun{UserID: t.userID, Machine: a.Machine, Path: a.Path})
+	if err != nil {
+		var te *agl.ToolError
+		if errors.As(err, &te) {
+			return "", te
+		}
+		return "", fmt.Errorf("send_local_file: %w", err)
+	}
+	name, err := t.save(ctx, f)
+	if err != nil {
+		return "", fmt.Errorf("send_local_file: could not store %s: %w", f.Name, err)
+	}
+	ref := fmt.Sprintf("[%s](/workspace/%s)", name, name)
+	if f.IsImage() {
+		ref = fmt.Sprintf("![](/workspace/%s)", name)
+	}
+	blob, _ := json.Marshal(map[string]any{
+		"workspacePath": "/workspace/" + name,
+		"bytes":         len(f.Bytes),
+		"contentType":   f.ContentType,
+		"putInReply":    ref,
+	})
+	return string(blob), nil
+}
+
+type localAgentsTool struct {
+	svc    LocalAgentRunner
+	userID string
+	chat   agl.ToolChat
+	notify func(agl.ToolNotice)
+	load   LoadFileFunc
+}
+
+func (t *localAgentsTool) list(ctx context.Context, _ json.RawMessage) (string, error) {
+	machines, err := t.svc.Machines(ctx, t.userID)
+	if err != nil {
+		return "", fmt.Errorf("could not list the person's computers: %w", err)
+	}
+	type agentView struct {
+		ID           string   `json:"id"`
+		Name         string   `json:"name"`
+		Strengths    string   `json:"strengths,omitempty"`
+		Capabilities []string `json:"capabilities,omitempty"`
+	}
+	type machineView struct {
+		ID     string      `json:"id"`
+		Name   string      `json:"name"`
+		Online bool        `json:"online"`
+		Access string      `json:"access"`
+		Agents []agentView `json:"agents"`
+	}
+	out := make([]machineView, 0, len(machines))
+	for _, m := range machines {
+		v := machineView{ID: m.ID, Name: m.Name, Online: m.Online, Access: m.DefaultAccess, Agents: []agentView{}}
+		for _, a := range m.Agents {
+			v.Agents = append(v.Agents, agentView{ID: a.ID, Name: a.Name, Strengths: agl.AgentProfile(m, a), Capabilities: m.Capabilities(a)})
+		}
+		out = append(out, v)
+	}
+	blob, _ := json.Marshal(map[string]any{"computers": out})
+	return string(blob), nil
+}
+
+func (t *localAgentsTool) run(ctx context.Context, raw json.RawMessage) (string, error) {
+	var a struct {
+		Agent   string   `json:"agent"`
+		Task    string   `json:"task"`
+		Machine string   `json:"machine"`
+		Cwd     string   `json:"cwd"`
+		Files   []string `json:"files"`
+	}
+	if err := json.Unmarshal(raw, &a); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+	files, err := loadFiles(ctx, t.load, a.Files)
+	if err != nil {
+		return "", err
+	}
+	out, err := t.svc.Run(ctx, agl.ToolRun{UserID: t.userID, Chat: t.chat, Agent: a.Agent, Task: a.Task, Machine: a.Machine, Cwd: a.Cwd, Files: files, Notify: t.notify})
+	if err != nil {
+		var te *agl.ToolError
+		if errors.As(err, &te) {
+			return out, te
+		}
+		return out, fmt.Errorf("run_local_agent: %w", err)
+	}
+	return out, nil
+}
+
+// LocalAgentsNote is the one-line system hint for a turn that has the
+// tools: which computers and agents the person has.
+func LocalAgentsNote(machines []agl.LocalMachine) string {
+	var parts, strengths []string
+	seen := map[string]bool{}
+	for _, m := range machines {
+		state := "online"
+		if !m.Online {
+			state = "offline"
+		}
+		ids := make([]string, 0, len(m.Agents))
+		for _, a := range m.Agents {
+			ids = append(ids, a.ID)
+			if st := agl.AgentProfile(m, a); st != "" && !seen[a.ID] {
+				seen[a.ID] = true
+				strengths = append(strengths, a.ID+": "+st)
+			}
+		}
+		agents := strings.Join(ids, ", ")
+		if agents == "" {
+			agents = "agents not reported yet"
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s: %s)", m.Name, state, agents))
+	}
+	return "The person has linked their own computer(s): " + strings.Join(parts, "; ") +
+		". When a request needs substantial work on their computer (code, projects, repos, builds, multi-step jobs) or something you can't do yourself but a local agent can, use run_local_agent with the agent best suited; for any picture (draw, paint, generate an image) use an image tool (image_gen, or generate_image for Codex on their computer — see their descriptions), never run_local_agent. Answer everything else yourself. Never tell the person you can't do something a local agent here can do." +
+		" When the person asks for Codex, Claude Code or another coding agent by name, that means run_local_agent on their computer (generate_image for a picture) — never run those CLIs with exec." +
+		" Local agents can't see this chat: hand over photos or files the person sent with the \"files\" (run_local_agent) or \"images\" (generate_image) parameter, never ask the person to copy them over." +
+		" When the result is an image or file the person should see, fetch it with send_local_file and put it in your reply (ask for PNG instead of SVG)." +
+		strengthsNote(strengths)
+}
+
+func strengthsNote(strengths []string) string {
+	if len(strengths) == 0 {
+		return ""
+	}
+	return " Local agents' strengths — " + strings.Join(strengths, " | ")
+}
+
+// ComputerToolPrefix names the model tools over agl's built-in tools:
+// computer_read, computer_write, computer_edit, computer_exec.
+const ComputerToolPrefix = "computer_"
+
+// LocalBuiltinRunner is what the computer_* tools need (*agl.Tools).
+type LocalBuiltinRunner interface {
+	BuiltinTools(ctx context.Context, m agl.LocalMachine) []agl.BuiltinTool
+	CallBuiltin(ctx context.Context, c agl.BuiltinCall) (string, error)
+}
+
+var computerToolHints = map[string]string{
+	"read":  "Read a text file on the PERSON'S OWN computer.",
+	"write": "Create or overwrite a text file on the PERSON'S OWN computer. Only when the person asked for that change.",
+	"edit":  "Change a text file on the PERSON'S OWN computer by exact replacement. Only when the person asked for that change; read it first.",
+	"exec": "Run a shell command on the PERSON'S OWN computer (list, search, disk usage, move, archive, git, open apps, run scripts …). " +
+		"Only what the person asked for; never delete or overwrite things they didn't ask about. " +
+		"A start waits up to 15s; if status is still running, call again with action \"read\", the execution_id and the returned stdout_offset/stderr_offset until status is completed and has_more is false. " +
+		"Use action \"cancel\" to stop it. Something that will clearly run for minutes or needs many steps belongs to run_local_agent when the computer has a coding agent.",
+}
+
+// computerToolsCommon is appended to every computer_* description.
+const computerToolsCommon = "\nDirect and fast: for quick look-ups and small, well-defined steps. " +
+	"Reading, and commands that only read (ls, find, du, grep, git status …), run at once; writing files or other commands may first ask the person to approve in this chat, and the call waits for their answer. " +
+	"If they deny it, don't try another way to do the same thing. Hidden files and folders (names starting with \".\") are off limits for read/write/edit."
+
+// RegisterComputerTools mounts computer_<name> for each built-in tool the
+// person's agent-less computers offer (tools: name → agl's definition).
+// machine names the computer when there is more than one.
+func RegisterComputerTools(r *Registry, svc LocalBuiltinRunner, userID string, chat agl.ToolChat, notify func(agl.ToolNotice), tools map[string]agl.BuiltinTool, machines []string) {
+	for _, name := range []string{"read", "write", "edit", "exec"} {
+		bt, ok := tools[name]
+		if !ok {
+			continue
+		}
+		schema := cloneSchema(bt.InputSchema)
+		props, _ := schema["properties"].(map[string]any)
+		if props == nil {
+			props = map[string]any{}
+			schema["properties"] = props
+		}
+		if len(machines) > 1 {
+			props["machine"] = map[string]any{"type": "string", "description": "Computer name or id: one of " + strings.Join(machines, ", ") + "."}
+		}
+		desc := computerToolHints[name] + "\n" + bt.Description + computerToolsCommon
+		name := name
+		fn := func(ctx context.Context, raw json.RawMessage) (string, error) {
+			var a struct {
+				Machine string `json:"machine"`
+			}
+			_ = json.Unmarshal(raw, &a)
+			out, err := svc.CallBuiltin(ctx, agl.BuiltinCall{UserID: userID, Machine: a.Machine, Name: name, Args: raw, Chat: chat, Notify: notify})
+			if err != nil {
+				var te *agl.ToolError
+				if errors.As(err, &te) {
+					return "", te
+				}
+				return "", fmt.Errorf("%s%s: %w", ComputerToolPrefix, name, err)
+			}
+			return out, nil
+		}
+		if name == "read" {
+			r.RegisterFrom(ComputerToolPrefix+name, desc, schema, fn, SourceLocalAgent)
+		} else {
+			r.RegisterSerialFrom(ComputerToolPrefix+name, desc, schema, fn, SourceLocalAgent)
+		}
+	}
+}
+
+// cloneSchema deep-copies a JSON schema so per-turn edits don't touch the
+// cached definition.
+func cloneSchema(s map[string]any) map[string]any {
+	out := map[string]any{"type": "object"}
+	if s == nil {
+		return out
+	}
+	blob, err := json.Marshal(s)
+	if err != nil || json.Unmarshal(blob, &out) != nil {
+		return map[string]any{"type": "object"}
+	}
+	return out
+}
+
+// ComputerToolsNote is the system hint for a turn with computer_* tools:
+// on which computers they work, and how to choose between them and
+// run_local_agent. agentless names the computers among them with no
+// coding agent.
+func ComputerToolsNote(machines, agentless []string, tools map[string]agl.BuiltinTool) string {
+	var names []string
+	for _, n := range []string{"read", "write", "edit", "exec"} {
+		if _, ok := tools[n]; ok {
+			names = append(names, ComputerToolPrefix+n)
+		}
+	}
+	note := " On " + strings.Join(machines, ", ") + " you can also work directly with " + strings.Join(names, ", ") + "." +
+		" Choose per request, by how big the job is: quick look-ups and a step or two (list or search a folder, read a file, check disk space, one or two commands, a small edit the person asked for) → computer_*, which is faster;" +
+		" substantial work (writing or fixing code, changes across a project, builds and tests, anything that needs planning, many steps or minutes) → run_local_agent." +
+		" If a computer_* call isn't allowed there, or the job turns out bigger than a few steps, hand the whole task to run_local_agent instead of giving up."
+	if len(agentless) > 0 {
+		note += " " + strings.Join(agentless, ", ") + " has no coding agent installed, so run_local_agent won't work there: do the work yourself with computer_*, step by step."
+	}
+	if _, ok := tools["exec"]; !ok {
+		note += " Running commands with computer_exec isn't allowed from this chat (the link is read-only); use run_local_agent where there is a coding agent, otherwise tell the person that computer needs to be re-linked with more access."
+	}
+	return note
+}

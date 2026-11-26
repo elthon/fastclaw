@@ -12,6 +12,7 @@ import (
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
 	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
+	"github.com/fastclaw-ai/fastclaw/internal/billing"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
@@ -38,7 +39,7 @@ func providerForAgent(rc config.ResolvedAgent, shared provider.Provider) provide
 	parts := strings.SplitN(rc.Model, "/", 2)
 	if len(parts) == 2 {
 		if pc, ok := rc.Providers[parts[0]]; ok && pc.APIKey != "" {
-			return provider.NewProviderWithHeaders(pc.APIKey, pc.APIBase, pc.APIType, pc.CustomHeaders)
+			return provider.FromConfig(pc)
 		}
 	}
 	return shared
@@ -54,6 +55,7 @@ type managerOpts struct {
 	dataStore       store.Store
 	meter           usage.Meter
 	quotaStore      usage.QuotaStore
+	billing         *billing.Service
 	userID          string
 	globalSkillsCfg config.SkillsCfg
 	// toolAvailability answers "which tools would agent X have at
@@ -65,6 +67,13 @@ type managerOpts struct {
 	// agentResolver finds (loading on demand) another agent of the same
 	// account for message_agent. Nil leaves the tool unregistered.
 	agentResolver AgentResolver
+	// agentLister lists the agents message_agent may reach, for the
+	// per-turn roster. Nil: no roster.
+	agentLister AgentLister
+	// endUserConnectors says whether an end user's turn on an agent may
+	// use that end user's connected accounts (see EndUserConnectorGate).
+	// Nil: only the agent's own owner's web turns get them.
+	endUserConnectors EndUserConnectorGate
 	// onAgentChanged is invoked after in-chat provisioning mutates an
 	// agent, so a running gateway can reload rather than require a
 	// restart.
@@ -75,6 +84,18 @@ type managerOpts struct {
 // the same account by id or display name, loaded if it was evicted.
 func WithAgentResolver(fn AgentResolver) ManagerOption {
 	return func(o *managerOpts) { o.agentResolver = fn }
+}
+
+// WithAgentLister supplies the roster behind message_agent: the agents a
+// caller may reach (see AgentLister).
+func WithAgentLister(fn AgentLister) ManagerOption {
+	return func(o *managerOpts) { o.agentLister = fn }
+}
+
+// WithEndUserConnectors supplies the gate that lets an account's end
+// users use their own connected accounts on the agents that are theirs.
+func WithEndUserConnectors(fn EndUserConnectorGate) ManagerOption {
+	return func(o *managerOpts) { o.endUserConnectors = fn }
 }
 
 // WithToolAvailability supplies the capability probe behind check_agent.
@@ -127,6 +148,13 @@ func WithDataStore(st store.Store) ManagerOption {
 // to disable metering (tests, single-user dev runs).
 func WithMeter(m usage.Meter) ManagerOption {
 	return func(o *managerOpts) { o.meter = m }
+}
+
+// WithBilling installs usage metering and billing authorization
+// (docs/usage-metering.md) on every agent. Without it, agents with a data
+// store meter into that store.
+func WithBilling(svc *billing.Service) ManagerOption {
+	return func(o *managerOpts) { o.billing = svc }
 }
 
 // WithQuotaStore installs per-user billing quota enforcement on every
@@ -286,6 +314,7 @@ func (m *Manager) buildAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider
 		// lives only in OSS.
 		ag.ReloadWorkspaceFiles()
 	}
+	ag.endUserConnectors = m.opts.endUserConnectors
 	if m.opts.dataStore != nil {
 		// Cron tools need the relational store to persist scheduled
 		// jobs; the closure also reads channel/chatID off the registry
@@ -345,7 +374,7 @@ func (m *Manager) buildAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider
 		})
 		// Agent-to-agent private messages (message_agent), scoped to the
 		// same owner account as provisioning.
-		ag.registerMessageAgent(m.opts.agentResolver, ownerID)
+		ag.registerMessageAgent(m.opts.agentResolver, m.opts.agentLister, ownerID)
 		// install_skill / search_skills were written but never registered —
 		// the tools existed as dead code, which is why provisioning had to
 		// shell out to the CLI in the first place.
@@ -365,6 +394,10 @@ func (m *Manager) buildAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider
 	}
 	if m.opts.quotaStore != nil {
 		ag.SetQuotaStore(m.opts.quotaStore)
+	}
+	ag.billing = m.opts.billing
+	if ag.billing == nil && m.opts.dataStore != nil {
+		ag.billing = billing.NewService(m.opts.dataStore)
 	}
 	return ag
 }

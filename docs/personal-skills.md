@@ -1,0 +1,99 @@
+# Personal skills
+
+A person can add skills of their own. They live in that person's personal
+layer (`~/.fastclaw/users/<uid>/skills`, object-store owner `_user_<uid>`).
+The agent loop loads that layer for every turn the person chats in, with any
+agent (`SkillsLoader.WithUserID` with the chatter, `loop.go`
+`refreshSkillsFromStore`). So a personal skill is usable only in that
+person's own conversations. This includes a product's end users: with
+`X-Fastclaw-End-User`, the caller is their app_user, the same id their turns
+run as.
+
+## API
+
+These are the console's skill routes with `?scope=user`. The caller is the
+signed-in user or the end user a product acts for (an api key with
+`X-Fastclaw-End-User`). Channel accounts are refused. The checks, limits
+and error codes below apply to end users' uploads; console users keep the
+console's upload.
+
+| Route | |
+|---|---|
+| `GET /api/skills?scope=user` | `[{name,description,type,envSpec?,source}]`: the caller's skills merged with the product's and the global ones, one per name (see below). End users get no `location`. |
+| `POST /api/skills/upload?scope=user` | multipart `file`: a `.zip` holding a skill, or a bare `SKILL.md`. Re-uploading a name replaces that skill whole. For end users: `{skill, replaced}`, with the checks and limits below. |
+| `DELETE /api/skills/{name}?scope=user` | the caller's own only |
+
+Errors are `{code, detail?}`, where `code` is one of:
+
+- `invalid_file`, `too_large`, `too_many_files`, `no_skill_md`
+- `multiple_skills` (two SKILL.md files at the same, shallowest depth)
+- `invalid_frontmatter` (SKILL.md needs frontmatter with a `description`)
+- `invalid_name` (frontmatter `name` or the folder: `[a-z0-9][a-z0-9_-]{0,47}`)
+- `file_not_allowed` (a path leaving the skill folder, or a symlink; `detail` names it)
+- `too_many`, `not_found`
+
+## Layers
+
+A conversation's skills come from, highest first:
+
+1. **chatter**: the person chatting (`users/<chatter>/skills`)
+2. **agent**: the agent's own (`agents/<id>/agent/skills`)
+3. **owner**: the account that owns the agent, `agents.user_id`
+   (`users/<owner>/skills`). For a product whose agents all belong to one
+   account (an app's api-key owner), these are the product's skills: add
+   a skill there and every chatter of its agents gets it.
+4. **team**, then **global** (`$FASTCLAW_HOME/skills`), then extra dirs.
+
+The same name in a higher layer replaces the lower one. `GET
+/api/skills?scope=user` lists the chain for the caller: `mine` > `product` (the
+api key's owner, for end users) > `system`. Agent skills depend on the
+agent and aren't listed.
+
+The sandbox's `/skills` holds the agent's, the owner's and the global
+skills (first wins), never a chatter's: anything under `/skills` may be
+given a skill's configured keys. So a chatter's skill can take any name,
+including a global one; it replaces only the instructions their own
+conversations see, and the keyed script that runs is still the
+deployment's.
+
+## What an upload holds
+
+The skill is the folder of the shallowest `SKILL.md` in the zip: the zip's
+root, a wrapping folder (a GitHub "Download ZIP"), or any subfolder. That
+folder is kept whole (references, templates, images, scripts, dotfiles),
+and everything outside it is left out. `.git/`, `__MACOSX/`, `.DS_Store`
+and `._*` are skipped. Paths that leave the folder and symlinks are
+refused. SKILL.md must be UTF-8 and 256 KB at most. The limits are 200
+files, 10 MB in all (uncompressed), and 20 skills per person.
+
+A chatter's skill files don't reach the sandbox, so its scripts and
+templates can be read but not run there. Skills that need to run code
+belong in the owner (product) layer.
+
+When `load_skill` loads a personal skill, `{baseDir}` becomes
+`skills/<name>`, which `read_file` routes to the person's own folder. It
+also lists the skill's other files.
+
+## Creator skills
+
+A product can let the person who made an agent add skills to it. These
+are agent-layer skills (every chatter of the agent gets them, and their
+scripts run in the chatter's sandbox), uploaded through routes only the
+agent's owner (the product) may call. The product checks that the caller
+is the agent's creator.
+
+| Route | |
+|---|---|
+| `POST /api/agents/{id}/skills/upload` | multipart `file`, checked like a personal skill. `{skill, replaced, envSpec?}`. `name_taken` (409) for a name the owner (product), the deployment or a bundled skill has, or an agent skill the creator didn't upload. 20 per agent. |
+| `GET /api/agents/{id}/skills/{name}/env` | `{envSpec, env}`, every value masked |
+| `PUT /api/agents/{id}/skills/{name}/env` | `{env: {NAME: value}}` replaces the skill's keys; a masked value keeps the stored one. Names are `[A-Z_][A-Z0-9_]*`, not `PATH`, `HOME`, `LD_*`, `PYTHON*`, `NODE_*` and similar. |
+
+`GET /api/agents/{id}/skills` marks them `creator: true`, and `DELETE
+/api/agents/{id}/skills/{name}` also drops their keys.
+
+A creator skill carries `.fastclaw-creator` in its folder. Its scripts
+get exactly the keys its creator set (the agent's `skills.entries` row),
+never the deployment's or the product's, whatever its name. Keys reach the
+script's process only (`skill_keyed.go`), but someone with root in the
+same sandbox who rewrites the script first could still read them: give a
+skill keys with spending limits.

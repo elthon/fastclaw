@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
+	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/connectors"
 )
 
@@ -31,6 +33,12 @@ import (
 //   POST   /api/connector-requests/{id}/recheck   "I've finished"
 //   POST   /api/connector-requests/{id}/cancel    declined on the card
 //   POST   /api/connector-requests/confirm        {providerSessionId}: the return page
+//   GET    /api/connectors-config                 the caller's own Connany (Console → Tools)
+//   PUT    /api/connectors-config                 {url, apiKey}: checked, saved, used at once
+//   DELETE /api/connectors-config                 back to the deployment's service
+//
+// The caller's own Connany key, when saved, holds their accounts instead
+// of the deployment's (connectors.For).
 
 func (s *Server) registerConnectorRoutes(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
 	connectors.SetWaker(s.wakeConnectorChat)
@@ -46,6 +54,9 @@ func (s *Server) registerConnectorRoutes(mux *http.ServeMux, auth func(http.Hand
 	mux.HandleFunc("GET /api/connector-requests/{id}", auth(s.handleConnectorRequestStatus))
 	mux.HandleFunc("POST /api/connector-requests/{id}/recheck", auth(s.handleConnectorRequestRecheck))
 	mux.HandleFunc("POST /api/connector-requests/{id}/cancel", auth(s.handleConnectorRequestCancel))
+	mux.HandleFunc("GET /api/connectors-config", auth(s.handleGetUserConnectorsConfig))
+	mux.HandleFunc("PUT /api/connectors-config", auth(s.handleSaveUserConnectorsConfig))
+	mux.HandleFunc("DELETE /api/connectors-config", auth(s.handleClearUserConnectorsConfig))
 	// System → Tools → Connectors (super admin): where Connany is.
 	mux.HandleFunc("GET /api/admin/connectors-config", s.requireSuperAdmin(s.handleGetConnectorsConfig))
 	mux.HandleFunc("PUT /api/admin/connectors-config", s.requireSuperAdmin(s.handleSaveConnectorsConfig))
@@ -152,19 +163,107 @@ func (s *Server) handleClearConnectorsConfig(w http.ResponseWriter, r *http.Requ
 	jsonResponse(w, http.StatusOK, s.connectorsConfigView(r.Context()))
 }
 
-// connectorCaller resolves the service and the caller, or writes the error.
+// connectorCaller resolves the caller and their service (their own
+// Connany, else the deployment's), or writes the error.
 func (s *Server) connectorCaller(w http.ResponseWriter, r *http.Request) (*connectors.Service, string, bool) {
-	svc := connectors.Get()
-	if svc == nil {
-		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "connectors are not configured", "code": "not_configured"})
-		return nil, "", false
-	}
 	uid := s.effectiveUserID(r)
 	if uid == "" {
 		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized", "code": "unauthorized"})
 		return nil, "", false
 	}
+	svc := connectors.For(r.Context(), uid)
+	if svc == nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "connectors are not configured", "code": "not_configured"})
+		return nil, "", false
+	}
 	return svc, uid, true
+}
+
+// userConnectorsConfigView is the caller's own Connany form state. The key
+// itself never leaves the server. source: which service holds their
+// accounts — "user" (theirs), "system" (the deployment's) or "".
+func (s *Server) userConnectorsConfigView(ctx context.Context, uid string) map[string]any {
+	_, source := connectors.ForWithSource(ctx, uid)
+	view := map[string]any{"source": source, "systemAvailable": connectors.Get() != nil, "url": "", "apiKeySet": false, "apiKeyHint": ""}
+	if s.dataStore != nil {
+		if own, ok, err := connectors.LoadUserSettings(ctx, s.dataStore, uid); err == nil && ok {
+			view["url"] = own.URL
+			view["apiKeySet"] = own.APIKey != ""
+			view["apiKeyHint"] = keyHint(own.APIKey)
+		}
+	}
+	return view
+}
+
+func (s *Server) handleGetUserConnectorsConfig(w http.ResponseWriter, r *http.Request) {
+	uid := s.effectiveUserID(r)
+	if uid == "" {
+		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized", "code": "unauthorized"})
+		return
+	}
+	jsonResponse(w, http.StatusOK, s.userConnectorsConfigView(r.Context(), uid))
+}
+
+// handleSaveUserConnectorsConfig checks the caller's own Connany address
+// and key (public HTTPS only), saves them and uses them at once. An empty
+// key keeps the one already saved.
+func (s *Server) handleSaveUserConnectorsConfig(w http.ResponseWriter, r *http.Request) {
+	uid := s.effectiveUserID(r)
+	if uid == "" {
+		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized", "code": "unauthorized"})
+		return
+	}
+	if s.dataStore == nil {
+		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "no data store", "code": "service_unavailable"})
+		return
+	}
+	var req struct {
+		URL    string `json:"url"`
+		APIKey string `json:"apiKey"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		connectorError(w, &connectors.Error{Code: "invalid_request"})
+		return
+	}
+	url := strings.TrimRight(strings.TrimSpace(req.URL), "/")
+	key := strings.TrimSpace(req.APIKey)
+	if key == "" {
+		if own, ok, _ := connectors.LoadUserSettings(r.Context(), s.dataStore, uid); ok {
+			key = own.APIKey
+		}
+	}
+	if url == "" || key == "" || len(url) > 500 || len(key) > 500 {
+		connectorError(w, &connectors.Error{Code: "invalid_request"})
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := connectors.ProbePublic(probeCtx, url, key); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": connectors.Code(err), "code": connectors.Code(err)})
+		return
+	}
+	if err := connectors.SaveUserSettings(r.Context(), s.dataStore, uid, connectors.Settings{URL: url, APIKey: key}); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, s.userConnectorsConfigView(r.Context(), uid))
+}
+
+func (s *Server) handleClearUserConnectorsConfig(w http.ResponseWriter, r *http.Request) {
+	uid := s.effectiveUserID(r)
+	if uid == "" {
+		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized", "code": "unauthorized"})
+		return
+	}
+	if s.dataStore == nil {
+		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "no data store"})
+		return
+	}
+	if err := connectors.ClearUserSettings(r.Context(), s.dataStore, uid); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, s.userConnectorsConfigView(r.Context(), uid))
 }
 
 // connectorError answers with a closed code the UI words in the reader's
@@ -200,9 +299,9 @@ func connectorLang(raw string) string {
 }
 
 func (s *Server) handleConnectorCatalog(w http.ResponseWriter, r *http.Request) {
-	svc := connectors.Get()
+	svc, source := connectors.ForWithSource(r.Context(), s.effectiveUserID(r))
 	if svc == nil {
-		jsonResponse(w, http.StatusOK, map[string]any{"configured": false, "categories": []any{}, "connectors": []any{}})
+		jsonResponse(w, http.StatusOK, map[string]any{"configured": false, "source": "", "categories": []any{}, "connectors": []any{}})
 		return
 	}
 	cats, list, err := svc.Catalog(r.Context(), connectorLang(r.URL.Query().Get("lang")), r.URL.Query().Get("fresh") == "1")
@@ -221,7 +320,7 @@ func (s *Server) handleConnectorCatalog(w http.ResponseWriter, r *http.Request) 
 	if cats == nil {
 		cats = []connectors.Category{}
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"configured": true, "categories": cats, "connectors": out})
+	jsonResponse(w, http.StatusOK, map[string]any{"configured": true, "source": source, "categories": cats, "connectors": out})
 }
 
 func (s *Server) handleConnectorAvatar(w http.ResponseWriter, r *http.Request) {
@@ -357,10 +456,24 @@ func (s *Server) handleConnectorAuthorize(w http.ResponseWriter, r *http.Request
 		Connector   string `json:"connector"`
 		ReconnectID string `json:"reconnectId"`
 		AccessID    string `json:"accessId"`
+		// ReturnURL: where the person lands after authorizing. Only an
+		// app's backend acting for its end user (api key +
+		// X-Fastclaw-End-User) may set it — the page is the app's own,
+		// which then confirms through this API. Default: our done page.
+		ReturnURL string `json:"returnUrl"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		connectorError(w, &connectors.Error{Code: "invalid_request"})
 		return
+	}
+	returnURL := requestBaseURL(r) + "/connectors/done/"
+	if req.ReturnURL != "" {
+		ident, _ := auth.FromContext(r.Context())
+		if ident.EndUser == "" || !validReturnURL(req.ReturnURL) {
+			connectorError(w, &connectors.Error{Code: "invalid_request"})
+			return
+		}
+		returnURL = req.ReturnURL
 	}
 	set := 0
 	for _, v := range []string{req.RequestID, req.Connector, req.ReconnectID, req.AccessID} {
@@ -374,12 +487,32 @@ func (s *Server) handleConnectorAuthorize(w http.ResponseWriter, r *http.Request
 	}
 	link, view, err := svc.Open(r.Context(), uid, connectors.OpenTarget{
 		RequestID: req.RequestID, Connector: req.Connector, ReconnectID: req.ReconnectID, AccessID: req.AccessID,
-	}, requestBaseURL(r)+"/connectors/done/")
+	}, returnURL)
 	if err != nil {
 		connectorError(w, err)
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"url": link, "request": view})
+}
+
+// validReturnURL: https (or http on localhost), no credentials or
+// fragment — what the connector service accepts as a return page.
+func validReturnURL(raw string) bool {
+	if len(raw) > 2048 {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		h := u.Hostname()
+		return h == "localhost" || h == "127.0.0.1" || h == "::1"
+	}
+	return false
 }
 
 func (s *Server) handleConnectorRequestStatus(w http.ResponseWriter, r *http.Request) {

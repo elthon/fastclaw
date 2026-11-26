@@ -28,6 +28,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { useLocale } from "@/components/locale-provider";
+import Link from "next/link";
 import {
   checkConnectorAccount,
   ConnectorApiError,
@@ -44,8 +45,12 @@ import { connectorErrorText, openConnectorAuthorization } from "@/lib/connectors
 
 const CHANGED_KEY = "fastclaw:connectors-changed";
 
+// Console → Connectors: the platforms and the person's accounts. Which
+// Connany holds them (their own key or this site's) is set in
+// Console → Tools → Connectors.
 export function ConnectorsSettingsPage() {
   const { tr, locale } = useLocale();
+  const wrap = "mx-auto max-w-5xl p-6";
   const [catalog, setCatalog] = React.useState<ConnectorCatalog | null>(null);
   const [accounts, setAccounts] = React.useState<ConnectorAccount[]>([]);
   const [error, setError] = React.useState("");
@@ -104,7 +109,7 @@ export function ConnectorsSettingsPage() {
 
   if (!catalog) {
     return (
-      <div className="mx-auto flex max-w-5xl items-center gap-2 p-6 text-sm text-muted-foreground">
+      <div className={`${wrap} flex items-center gap-2 text-sm text-muted-foreground`}>
         {error || (
           <>
             <Loader2 className="size-4 animate-spin" />
@@ -116,10 +121,14 @@ export function ConnectorsSettingsPage() {
   }
   if (!catalog.configured) {
     return (
-      <div className="mx-auto max-w-5xl p-6">
+      <div className={wrap}>
         <Header />
         <p className="mt-6 text-sm text-muted-foreground">
-          {tr("Connectors are not available on this server yet.", "当前服务器尚未开放连接器。")}
+          {tr("No connector service is set up yet. ", "目前还没有可用的连接服务。")}
+          <Link href="/console/tools/" className="text-foreground underline underline-offset-4">
+            {tr("Add your own Connany key in Tools → Connectors", "去「工具 → 连接器」填写你自己的 Connany Key")}
+          </Link>
+          {tr(".", "。")}
         </p>
       </div>
     );
@@ -131,7 +140,7 @@ export function ConnectorsSettingsPage() {
   const ordered = [...shown].sort((a, b) => Number(byConnector(b.name).length > 0) - Number(byConnector(a.name).length > 0));
 
   return (
-    <div className="mx-auto max-w-5xl p-6">
+    <div className={wrap}>
       <Header />
       {catalog.categories.length > 1 && (
         <div className="mt-5 flex flex-wrap gap-1.5">

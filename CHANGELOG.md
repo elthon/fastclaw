@@ -5,6 +5,272 @@ action on upgrade — read those notes before deploying.
 
 ## [Unreleased]
 
+### Fixed — knowledge file names in Chinese and other scripts
+
+Uploading a knowledge file named in Chinese (or any non-Latin script)
+no longer turns the name into dashes (`客户手册.md` was stored as
+`----.md`). Letters and digits from every script are kept; long names
+are cut on a character boundary and keep their extension. Files
+uploaded before this fix keep their dashed names: delete and re-upload
+them (re-uploading without deleting matches the old copy by content and
+keeps its name).
+
+### Added — tool settings per account (Console → Tools)
+
+Console → Tools now has every tool category System → Tools has (web
+search, page reading, image generation, speech). A user's own providers
+and chain for a category win over the deployment's, category by category
+and provider by provider; categories they don't set keep the system's.
+`GET/PUT /api/my-tools` read and replace only the caller's own layer:
+keys are never returned (`apiKeySet`), an empty `apiKey` keeps the saved
+one, and an endpoint must be public https unless it is the deployment's
+own address for that provider. Agents now resolve tools system → space
+user → **the agent's owner** (when the owner's config applies, as for
+models) → the agent: an app account's image_gen reaches its end users.
+
+### Changed — image_gen stores pictures in the chat's workspace
+
+image_gen saves each picture to `/workspace/picture-….png` and returns
+`putInReply` (`![](/workspace/…)`) instead of provider URLs or inline
+base64, so a picture costs the model a short path rather than megabytes
+of context, and API replies return it in `files`. New parameters:
+`aspect` (`square` / `portrait` / `landscape`, mapped per provider) and
+`images` (reference pictures by workspace path — fal with an image-to-
+image model or the `edit_model` option, OpenAI gpt-image via
+/images/edits). Metering counts the pictures actually returned.
+
+### Added — tool steps on the API stream carry their input and output
+
+On a streamed `/v1/chat/completions` turn, a tool's `running` chunk now
+carries the call's `arguments` (JSON string) and its `done` chunk the
+tool's `result`, each cut to 4 KB (`"truncated": true` when cut), so an
+integration can show what each step did. Clients that read only `id`,
+`name` and `status` are unaffected.
+
+### Changed — skill layers: chatter > agent > owner > global
+
+The account that owns an agent (`agents.user_id`) now has its personal
+skills loaded into every conversation with that agent, between the
+agent's own and the global ones: a product whose agents belong to one
+account adds its skills there. They are also pushed to the sandbox's
+`/skills` (agent > owner > global), so their scripts run. A chatter's own
+skills now rank above the agent's (they affect only that person) and may
+take any name, global ones included; they still never reach `/skills` or
+any keys. `GET /api/skills?scope=user` returns the merged chain, each
+with a `source` (`mine`, `product`, `system`); `name_reserved` is gone.
+The console's own-skills view lists only `mine`.
+
+### Added — personal skills for end users (`/api/skills?scope=user`)
+
+Anyone signed in, including a product's end users (`X-Fastclaw-End-User`),
+can upload skills of their own through the console's routes with
+`?scope=user` (`GET /api/skills`, `POST /api/skills/upload`,
+`DELETE /api/skills/{name}`). A skill lands in their personal layer, so
+it is used in their own conversations only, with any agent. An upload is
+the folder of the zip's shallowest SKILL.md, kept whole (templates, images
+and scripts included; `.git/` and OS clutter skipped). Its files don't
+reach the sandbox yet, so scripts can be read but not run. The
+limits are 20 skills, 200 files and 10 MB each, and global skill names are
+reserved. `load_skill` points a personal skill's files at `skills/<name>/…`,
+which `read_file` reaches. See docs/personal-skills.md.
+
+### Security — a skill's keys reach only its own script
+
+In the sandbox, a skill's configured keys (`skills.entries` env such as
+`REPLICATE_API_TOKEN`) were exported in front of the whole command the
+model wrote, so a chatter could have them printed
+(`python /skills/<skill>/x.py; printenv …`). Now a command that gets keys
+must run the skill's script alone (`<python|node|bash|sh> /skills/<name>/<script> args`,
+optionally fed by `echo '<text>' |`), and only that process gets them
+(`K=v cmd`). Anything else is refused with what to change. Commands that
+get no keys run as before.
+
+This raises the bar; it can't stop a chatter with root in the sandbox who
+rewrites the script first. Keys a chatter must never see belong to skills
+that run outside the chatter's sandbox, or to server-side tools.
+
+### Changed — custom MCP sign-ins live in their own table
+
+An OAuth custom MCP server keeps its client on the row and the adder's
+tokens in the new table `user_mcp_tokens` (moved there at boot). The list
+shows `signIn` (`ok`/`broken`/`none`) instead of `needsReauth`. When a
+sign-in stops working, the agent sends the person a new sign-in link in
+their chat if the product names its redirect URI as the turn param
+`__fastclawMCPRedirectURI`; `oauth/finish` with the account's own key and
+no end user finishes it for the end user who started it.
+
+An app's end users may now use their own connected accounts on **any** of
+the app's agents in their 1:1 chats, not only their own and the ones marked
+`endUserConnectors` (which no longer matters).
+
+### Added — OAuth for custom MCP servers
+
+A custom MCP server that asks for OAuth (401 with a `resource_metadata`
+challenge, MCP authorization spec) is now added through the authorization
+code flow: `POST /api/mcp-servers` answers `oauth_required`, then
+`POST /api/mcp-servers/oauth/start` (dynamic client registration + PKCE,
+the caller's `redirectUri`) and `POST /api/mcp-servers/oauth/finish`
+(`{state, code}`). Tokens are kept with the server and refreshed; a server
+whose refresh is refused shows `needsReauth`. Adds the column
+`user_mcp_servers.oauth` and the table `user_mcp_oauth_pending` at boot.
+
+### Added — custom MCP servers per person
+
+People can add their own Streamable HTTP MCP servers (`GET/POST
+/api/mcp-servers`, `PATCH`/`DELETE /api/mcp-servers/{id}`, end users included).
+A server is checked as MCP before it is saved, belongs only to the person
+who added it, and is offered to their own turns as the `custom_mcp` tool,
+on the same turns as their connected accounts. Tools the server doesn't
+mark read-only run only after the person approves them in the chat. New
+table `user_mcp_servers` is created at boot. See `docs/connectors.md`.
+
+### Added — macOS privacy prompts name the product, not agl
+
+`POST /v1/machines/pairing` takes an optional `appName` (the product's
+display name), stored per product hub scope. Commands from `computer_exec`
+and local agent sessions on those computers pass it to agl as `app_name`,
+so macOS asks "WeClaw wants to access Downloads" instead of "agl …",
+also on computers linked earlier. New install commands carry
+`--app-name` when the name is one word. File reads through agl's daemon
+(`computer_read`, `send_local_file`) are still attributed to agl.
+
+### Changed — agents pick direct computer tools or the local coding agent
+
+`computer_read/write/edit/exec` (agl's built-in tools) are now mounted on
+every linked computer with agl ≥ 0.3.14, not only those without a coding
+agent. The model chooses per request: quick look-ups and a command or two
+run directly, substantial or multi-step work goes to `run_local_agent`,
+and a call the link doesn't allow is handed to the coding agent. With agl
+≥ 0.3.15, writes and commands that aren't read-only are approved by the
+person in the chat (1/2/3 or the web card) instead of being refused, so
+the default `ask` link can do more than read. See `docs/agl-machines.md`.
+
+### Added — force the sandbox from the admin UI
+
+Admin → Tools → Runtime → Sandbox has a "强制在沙盒执行" toggle
+(`sandbox.enforce`): every exec runs in the sandbox, never on the host.
+It takes effect on save, no restart. Same effect as
+`FASTCLAW_SANDBOX_ENFORCE=1`, which (like hosted deploys) still enforces
+regardless of the toggle.
+
+### Fixed — BoxLite sandboxes failed to start
+
+BoxLite Cloud started rejecting the `auto_remove` create field, so every
+box failed with `property auto_remove should not exist`. A cold image
+pull that outlasts BoxLite's start wait (HTTP 408) is now waited out
+instead of failing.
+
+### Fixed — cropped browser screenshots in the sandbox image
+
+`camoufox-cli screenshot` captured only the top-left 1280×720 of pages
+laid out at the fingerprinted window width. Fixed in the sandbox image,
+now published as `thinkany/fastclaw-sandbox:20261112` and used by default.
+BoxLite Cloud never re-pulls a moved `:latest`, so the default is now a
+dated tag; if Admin → Tools → Runtime pins `thinkany/fastclaw-sandbox`
+(or `:latest`), clear the field or set the dated tag.
+
+### Fixed — sandbox settings page showed stale values
+
+The sandbox is deployment-wide but was also copied into users' own
+settings whenever they saved anything, and those copies shadowed the
+system value on the settings page. It is now system-only, and clearing an
+optional field (image, URL) on the page actually clears it.
+
+### Added — connectors for a product's end users
+
+A product calling FastClaw for its end users (`X-Fastclaw-End-User`) can
+let each of them connect their own Notion, GitHub, … accounts. The accounts
+are theirs alone and usable on the agents marked as theirs
+(`endUserOwner`), never on the product's public agents. End users run on
+the product account's own Connany key, else the deployment's. In an IM
+chat (`__fastclawConnectorsURL` turn param), the agent sends a one-time
+authorization link instead of a connect card; the platform returns the
+person to `__fastclawConnectorsReturnURL`. `POST
+/api/connector-authorizations` takes `returnUrl` for end users. See
+`docs/connectors.md` and the agent-integration skill.
+
+### Added — agl download mirror
+
+`FASTCLAW_AGL_RELEASE_URL` points `/agl/download` at a mirror of agl's
+release assets, for computers that can't reach GitHub.
+
+### Fixed — tool-call markup in streamed replies
+
+A model that writes its tool calls as text (DeepSeek-style `<｜DSML｜ …>`)
+no longer streams that markup: API callers relaying the stream (e.g. into
+WeChat) showed it as a message, and the web chat until the round ended.
+
+### Added — bring your own Connany key
+
+Console → Tools → Connectors takes a person's own Connany address and
+project key (public HTTPS only, checked before saving). Their accounts and
+agents use it before the deployment's connector service, so connectors work
+for them even when the deployment configured none. See
+`docs/connectors.md`.
+
+### Added — Console → Tools
+
+A new Console → Tools page (below Connectors), laid out like Admin → Tools,
+holds a person's own tool settings: used first, with the deployment's tools
+as the fallback. Its first entry is which Connany holds their connector
+accounts; the accounts themselves stay in Console → Connectors.
+
+### Added — one-click agl updates
+
+Console → Devices marks a computer whose agl is behind the newest release
+(looked up hourly) and updates it with one click (`POST
+/v1/machines/{id}/update`); a running task is never ended, the update waits
+until the computer is idle. Needs agl 0.3.5 on the computer: older ones
+show `agl update` to run there once.
+
+### Added — connect your own computer (agl)
+
+Console → Devices links a person's own Mac or Linux computer with
+[agl](https://github.com/thinkany-ai/agl): one install command, then the
+agents they chat with — in the web chat or a 1:1 IM chat — can hand tasks
+to the coding agents on it (Claude Code, Codex, Gemini, Kimi, Grok, …)
+with `run_local_agent`, and bring files back with `send_local_file`. When
+the coding agent asks to run a command or edit a file, the web chat shows
+Allow / Allow for this session / Deny buttons (IM chats reply 1/2/3).
+Per computer: whether agents may use it, the permissions runs start with
+and the default folder; per local agent: on/off, model and reasoning
+effort, and a test run. Integrating products get the same through
+`/v1/machines` with `X-Fastclaw-End-User`. Only the computer's owner can
+see or use it. See `docs/agl-machines.md`.
+
+### Removed — `local-coding-agents` skill
+
+The bundled skill that ran the gateway host's `codex` / `claude` CLIs with
+`exec` is gone; its unmodified installed copies are deleted on startup (an
+edited copy is kept). On a self-hosted install, link the host itself in
+Console → Devices to keep using its coding agents.
+
+### Changed — BoxLite defaults to BoxLite Cloud
+
+The BoxLite sandbox now defaults to `https://api.boxlite.ai/v1` with no
+path prefix, and its image is optional (`thinkany/fastclaw-sandbox:latest`
+when empty; any public registry image works). A URL set to the old
+`api.dev.boxlite.ai` host keeps its `default` prefix. The unused
+`FASTCLAW_SANDBOX_BOXLITE_CLIENT_ID` setting was removed.
+
+### Added — per-turn cost in USD
+
+Each model call is now costed at the unit price of the model it actually
+ran on (USD per 1M tokens: input, output, cache read, cache write).
+`/v1/chat/completions` reports the turn's total as `usage.cost_usd` on the
+non-streaming response and the final stream chunk, and
+`GET /api/admin/usage/events` carries `cost_usd` on every event (a new
+`token_usage_log.cost_usd` column, added on upgrade). When any call's model
+has no price the cost is `null` — unknown, never 0; rows from before the
+upgrade read as `null` too. Set prices per model in Console → Models →
+provider; well-known Anthropic and OpenAI models fall back to built-in list
+prices when left blank, and a price you enter always wins. FastClaw still
+only reports cost — it doesn't hold balances or convert to credits.
+
+Context compaction, sub-agent (`delegate_task`) calls, memory extraction
+and skill learning are now metered too; before, only the main loop's calls
+were recorded.
+
 ### Changed — API streams the turn as it runs
 
 `stream: true` on `/v1/chat/completions` now runs the same agent loop as the

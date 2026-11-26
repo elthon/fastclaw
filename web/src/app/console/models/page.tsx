@@ -42,10 +42,12 @@ import {
   updateProvider,
   deleteProvider,
   type ModelEntry,
+  type ModelCost,
   type ProviderRow,
 } from "@/lib/api";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { useLocale } from "@/components/locale-provider";
+import { ModelPriceFields } from "@/components/model-price-fields";
 
 // Keep these maps in sync with onboard's ProviderStep so the two flows
 // look and behave identically — same preset set, same labels, same
@@ -476,6 +478,7 @@ export default function ModelsPage({ scope = "user" }: { scope?: "auto" | "user"
       else if (field === "reasoning") m.reasoning = value as boolean;
       else if (field === "contextWindow") m.contextWindow = Number(value) || 0;
       else if (field === "maxTokens") m.maxTokens = Number(value) || 0;
+      else if (field === "cost") m.cost = value as ModelCost;
       updated[index] = m;
       return updated;
     });
@@ -570,6 +573,8 @@ export default function ModelsPage({ scope = "user" }: { scope?: "auto" | "user"
   const handleDeleteProvider = async (row: ProviderEntry) => {
     setSaving(true);
     try {
+      // The server also clears any default model that pointed at this
+      // provider, so the refetch below picks up the cleaned value.
       await deleteProvider(row.id);
       flashSaved();
     } finally {
@@ -703,6 +708,12 @@ export default function ModelsPage({ scope = "user" }: { scope?: "auto" | "user"
         const fallbackSource = inAgentContext && agentShares && agentScopeModel
           ? "agent"
           : "system";
+        // "<provider>/<modelId>" whose provider isn't configured any more
+        // (e.g. removed outside this page) — flag it instead of showing
+        // the stale value as if it worked.
+        const activeModel = model.trim();
+        const activeProvider = activeModel.includes("/") ? activeModel.split("/")[0] : "";
+        const providerMissing = !inheriting && !!activeProvider && !providers.some((p) => p.name === activeProvider);
         return (
       <div className="rounded-lg border border-border bg-card p-5">
         <div className="flex items-center justify-between gap-2 mb-3">
@@ -754,6 +765,11 @@ export default function ModelsPage({ scope = "user" }: { scope?: "auto" | "user"
             placeholder={inheriting && effectiveFallback ? tr("Inherit ({{model}})", "继承（{{model}}）", { model: effectiveFallback }) : tr("e.g. openai/gpt-4o", "例如 openai/gpt-4o")}
             className="font-mono text-sm max-w-md"
           />
+        )}
+        {providerMissing && (
+          <p className="text-xs text-destructive mt-2">
+            {tr("Provider \"{{name}}\" is not configured — agents can't use this model.", "服务商「{{name}}」不存在，Agent 无法使用该模型。", { name: activeProvider })}
+          </p>
         )}
         <p className="text-xs text-muted-foreground mt-2">
           {isSystemScope ? (
@@ -1140,6 +1156,10 @@ export default function ModelsPage({ scope = "user" }: { scope?: "auto" | "user"
                       />
                     </div>
                   </div>
+                  <ModelPriceFields
+                    cost={m.cost}
+                    onChange={(cost) => handleUpdateModel(idx, "cost", cost)}
+                  />
                 </div>
                 );
               })}

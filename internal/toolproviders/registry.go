@@ -63,6 +63,17 @@ type ProviderConfig struct {
 type Response struct {
 	Text string
 	Raw  any
+	// Images (image_gen): the pictures themselves, so the tool can store
+	// them in the chat's workspace and hand the model a short path
+	// instead of a URL or base64 data.
+	Images []Image
+}
+
+// Image is one generated picture: its bytes, or a URL to fetch them from.
+type Image struct {
+	URL         string
+	Data        []byte
+	ContentType string
 }
 
 // Registry holds all registered Provider implementations, keyed by
@@ -163,6 +174,7 @@ func (c *Chain) Execute(ctx context.Context, args map[string]any) (Response, err
 		return Response{}, fmt.Errorf("no providers configured for %q", c.Category)
 	}
 	var errs []error
+	authorized := false
 	for i, ref := range c.Order {
 		name, model := parseRef(ref)
 		p := c.Registry.Get(c.Category, name)
@@ -182,8 +194,17 @@ func (c *Chain) Execute(ctx context.Context, args map[string]any) (Response, err
 			}
 			continue
 		}
+		if !authorized {
+			// Costly categories ask the account's billing hook once, before
+			// the first provider actually runs.
+			authorized = true
+			if err := authorizeCall(ctx, c.Category, name, model, args); err != nil {
+				return Response{}, err
+			}
+		}
 		resp, err := p.Execute(ctx, Request{Args: args, Config: cfg})
 		if err == nil && !isEmpty(resp) {
+			meterCall(ctx, c.Category, name, model, args, resp)
 			return resp, nil
 		}
 		if err == nil {
@@ -209,7 +230,9 @@ func parseRef(ref string) (name, model string) {
 	return ref, ""
 }
 
-func isEmpty(r Response) bool { return strings.TrimSpace(r.Text) == "" && r.Raw == nil }
+func isEmpty(r Response) bool {
+	return strings.TrimSpace(r.Text) == "" && r.Raw == nil && len(r.Images) == 0
+}
 
 // ---------- Error classification ----------
 

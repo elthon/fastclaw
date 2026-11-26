@@ -185,7 +185,11 @@ type PrefsCfg struct {
 // per-backend field is empty (migration path for configs predating the
 // split).
 type SandboxCfg struct {
-	Enabled         bool   `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// Enforce makes the sandbox a hard boundary on self-hosted installs:
+	// every exec runs inside it, instead of the host being the default
+	// and the sandbox an opt-in per call. Hosted deploys always enforce.
+	Enforce         bool   `json:"enforce,omitempty"`
 	Image           string `json:"image,omitempty"`
 	DockerImage     string `json:"dockerImage,omitempty"`
 	E2BTemplate     string `json:"e2bTemplate,omitempty"`
@@ -198,15 +202,14 @@ type SandboxCfg struct {
 	// BoxliteURL is the full base URL (default https://api.boxlite.ai/v1);
 	// BoxliteKey is the apikey sent as `Authorization: Bearer <key>`
 	// directly (no OAuth exchange — that path was removed upstream).
-	// ClientID is retained for back-compat with older config rows but
-	// no longer wired to anything. Prefix defaults to "default" when
-	// empty so the minimum config is just (URL, Key).
-	BoxliteURL      string `json:"boxliteUrl,omitempty"`
-	BoxliteClientID string `json:"boxliteClientId,omitempty"`
-	BoxliteKey      string `json:"boxliteKey,omitempty"`
-	BoxlitePrefix   string `json:"boxlitePrefix,omitempty"`
-	Network         string `json:"network,omitempty"`
-	IdleTTLSec      int    `json:"idleTTLSec,omitempty"`
+	// URL defaults to BoxLite Cloud (https://api.boxlite.ai/v1), which
+	// takes no Prefix; set Prefix only for self-hosted servers that route
+	// under /{prefix}/boxes. The minimum config is just Key.
+	BoxliteURL    string `json:"boxliteUrl,omitempty"`
+	BoxliteKey    string `json:"boxliteKey,omitempty"`
+	BoxlitePrefix string `json:"boxlitePrefix,omitempty"`
+	Network       string `json:"network,omitempty"`
+	IdleTTLSec    int    `json:"idleTTLSec,omitempty"`
 }
 
 // GatewayAuth is now a thin shell — the authoritative auth state lives in
@@ -335,6 +338,7 @@ type ModelEntry struct {
 // the JSON shape inside agents.config and as the resolved per-(scope, name)
 // view assembled by the providers resolver.
 type ProviderConfig struct {
+	BYOK          bool              `json:"-"` // runtime only; never accepted from provider JSON
 	APIKey        string            `json:"apiKey"`
 	APIBase       string            `json:"apiBase"`
 	APIType       string            `json:"apiType,omitempty"`
@@ -910,17 +914,6 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 		if fileCfg.AutoPersist != nil {
 			v := *fileCfg.AutoPersist
 			resolved.AutoPersist = &v
-		}
-	}
-
-	// Chatbot mode: cap tool iterations at a lower default (5) unless
-	// the operator explicitly set a value on the agent entry. Chatbots
-	// are conversational — 20 tool rounds burns tokens and makes the
-	// user wait too long.
-	if resolved.PromptMode == PromptModeChatbot && entry.MaxToolIterations == 0 {
-		const chatbotDefaultIter = 5
-		if resolved.MaxToolIterations == 0 || resolved.MaxToolIterations > chatbotDefaultIter {
-			resolved.MaxToolIterations = chatbotDefaultIter
 		}
 	}
 

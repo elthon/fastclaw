@@ -7,22 +7,26 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
+	"github.com/fastclaw-ai/fastclaw/internal/agl"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
-// Agents created through /v1 belong to the app — the account that owns
-// the api key. The runtime never records which of the app's end-users an
-// agent "belongs to"; apps keep that relationship themselves, optionally
-// mirrored into `metadata` for filtering.
+// Agents created through /v1 belong either to the account that owns the
+// api key (platform agents, every end-user may chat with them) or to one
+// of its end-users' app_users (private agents, agents.user_id = the
+// app_user). A request naming an end-user reaches the account's platform
+// agents and that end-user's private agents, never another end-user's;
+// the account's key without an end-user manages every private agent.
 
 const (
 	maxMetadataKeys     = 16
@@ -54,10 +58,55 @@ var v1SystemFiles = map[string]bool{
 // an out-of-scope agent exists.
 var errAgentNotFound = errors.New("agent not found")
 
-// appAgent loads agentID and verifies the caller's app may use it: the
-// agent must be owned by the app (Identity.AppID) and pass the api key's
-// agent ACL. Platform-admin keys are scoped to their own app here too —
-// /v1 is the app API, not the admin API.
+// errPrivateAgentNeedsOwner is returned when the account's key, without an
+// end-user, tries to chat with a private agent: its conversations belong
+// in the owner's namespace, so the caller must name the owner.
+var errPrivateAgentNeedsOwner = errors.New("this agent is private to one of your end-users; send their id as `user` or X-Fastclaw-End-User to chat with it")
+
+const (
+	agentOwnerAccount = "account"
+	agentOwnerEndUser = "end_user"
+
+	maxExternalRefLen = 255
+)
+
+// agentAccessible reports whether the caller may use rec over /v1:
+//
+//   - platform agent (owned by the account): the api key's agent ACL;
+//   - private agent, request names an end-user: only that end-user's own;
+//   - private agent, no end-user: any private agent of the account's
+//     app_users, for the account's user/admin keys.
+//
+// Agent-scoped keys never reach private agents. Platform-admin keys are
+// scoped to their own account here too — /v1 is the app API.
+func (s *Server) agentAccessible(r *http.Request, ident auth.Identity, rec *store.AgentRecord) bool {
+	if rec == nil || rec.UserID == "" {
+		return false
+	}
+	if rec.UserID == ident.AccountID() {
+		return ident.CanAccessAgent(rec.ID)
+	}
+	if ident.AuthMethod != "apikey" || ident.APIKeyType == users.APIKeyTypeAgent {
+		return false
+	}
+	if ident.EndUser != "" {
+		return rec.UserID == ident.UserID
+	}
+	return s.privateOwnerOf(r, ident.AccountID(), rec.UserID) != ""
+}
+
+// privateOwnerOf returns the end-user's external id when ownerID is an
+// app_user of accountID, "" otherwise.
+func (s *Server) privateOwnerOf(r *http.Request, accountID, ownerID string) string {
+	u, err := s.store.GetUser(r.Context(), ownerID)
+	if err != nil || u == nil || u.Role != users.RoleAppUser || u.OwnerUserID != accountID || u.ExternalID == "" {
+		return ""
+	}
+	return u.ExternalID
+}
+
+// appAgent loads agentID and verifies the caller may use it (see
+// agentAccessible). Anything else is errAgentNotFound.
 func (s *Server) appAgent(r *http.Request, agentID string) (*store.AgentRecord, error) {
 	ident, ok := auth.FromContext(r.Context())
 	if !ok {
@@ -74,7 +123,7 @@ func (s *Server) appAgent(r *http.Request, agentID string) (*store.AgentRecord, 
 	if err != nil || rec == nil {
 		return nil, errAgentNotFound
 	}
-	if rec.UserID != ident.AccountID() || !ident.CanAccessAgent(rec.ID) {
+	if !s.agentAccessible(r, ident, rec) {
 		return nil, errAgentNotFound
 	}
 	return rec, nil
@@ -89,8 +138,9 @@ func (s *Server) appAgent(r *http.Request, agentID string) (*store.AgentRecord, 
 //
 // The agent runs in the caller's data namespace: the app's own space,
 // or — when the request names an end-user — that end-user's app_user
-// space, so sessions and personal memory stay per end-user while the
-// agent itself is the app's.
+// space, so sessions and personal memory stay per end-user. A private
+// agent only runs in its owner's space: without an end-user the call is
+// refused with errPrivateAgentNeedsOwner.
 func (s *Server) resolveChatAgent(r *http.Request, agentID string) (*agent.Agent, error) {
 	ident, ok := auth.FromContext(r.Context())
 	if !ok {
@@ -122,8 +172,12 @@ func (s *Server) resolveChatAgent(r *http.Request, agentID string) (*agent.Agent
 		}
 		agentID = def.Name()
 	} else if s.store != nil {
-		if _, err := s.appAgent(r, agentID); err != nil {
+		rec, err := s.appAgent(r, agentID)
+		if err != nil {
 			return nil, err
+		}
+		if rec.UserID != ident.AccountID() && rec.UserID != nsUser {
+			return nil, errPrivateAgentNeedsOwner
 		}
 	} else if ag := space.Agents.AgentByID(agentID); ag == nil || !ident.CanAccessAgent(agentID) {
 		// No store (unit tests): only agents already in the space count.
@@ -179,6 +233,23 @@ type createAgentRequest struct {
 	Instructions string            `json:"instructions,omitempty"`
 	Model        string            `json:"model,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
+	// User names the end-user (like X-Fastclaw-End-User; the body wins).
+	// Naming one here makes the agent private to that end-user unless
+	// Owner says "account".
+	User string `json:"user,omitempty"`
+	// Owner is "account" (platform agent) or "end_user" (private agent of
+	// the request's end-user). Empty: "end_user" when User is set,
+	// otherwise "account" — the header alone never makes an agent private,
+	// so callers that always send it keep creating platform agents.
+	Owner string `json:"owner,omitempty"`
+	// ExternalRef is an idempotency key, unique per owner: creating again
+	// with the same ref returns the existing agent unchanged.
+	ExternalRef string `json:"external_ref,omitempty"`
+	// Runtime "agl" runs the agent's turns on the owner's own computer
+	// (docs/agl-machines.md) instead of an LLM; only for private agents.
+	// RuntimeConfig is {machineId, aglAgent, cwd, access}.
+	Runtime       string                 `json:"runtime,omitempty"`
+	RuntimeConfig map[string]interface{} `json:"runtimeConfig,omitempty"`
 }
 
 type updateAgentRequest struct {
@@ -189,6 +260,65 @@ type updateAgentRequest struct {
 	// Metadata is merged into the existing map. A key set to null or ""
 	// is removed.
 	Metadata map[string]*string `json:"metadata,omitempty"`
+	// RuntimeConfig is merged into a runtime "agl" agent's config (keys
+	// present replace), then validated like on create.
+	RuntimeConfig map[string]interface{} `json:"runtimeConfig,omitempty"`
+	// EndUserVisibility / EndUserOwner: which of the account's end users
+	// may reach this agent from another agent (message_agent); see
+	// store.AgentReachableByEndUser. "" clears. Account callers only.
+	EndUserVisibility *string `json:"endUserVisibility,omitempty"`
+	EndUserOwner      *string `json:"endUserOwner,omitempty"`
+	// EndUserConnectors: every end user may use their own connected
+	// accounts on this agent (store.AgentCfgEndUserConnectors).
+	EndUserConnectors *bool `json:"endUserConnectors,omitempty"`
+}
+
+// mergeRuntimeConfig applies patch onto base. Every value must be a
+// string (or null, which clears it).
+func mergeRuntimeConfig(base agl.RuntimeConfig, patch map[string]interface{}) (agl.RuntimeConfig, error) {
+	for k, v := range patch {
+		var str string
+		switch t := v.(type) {
+		case nil:
+		case string:
+			str = t
+		default:
+			return base, fmt.Errorf("runtimeConfig.%s must be a string", k)
+		}
+		switch k {
+		case "machineId":
+			base.MachineID = str
+		case "aglAgent":
+			base.AglAgent = str
+		case "cwd":
+			base.Cwd = str
+		case "access":
+			base.Access = str
+		default:
+			return base, fmt.Errorf("unknown runtimeConfig field %q", k)
+		}
+	}
+	return base, nil
+}
+
+// validateAglRuntime checks rc for an agent owned by ownerID, writing the
+// error response and returning false when it fails.
+func (s *Server) validateAglRuntime(w http.ResponseWriter, r *http.Request, ownerID string, rc *agl.RuntimeConfig) bool {
+	ms := s.machineStore()
+	if ms == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, errTypeServer, codeNotConfigured, "machines are not enabled on this server")
+		return false
+	}
+	if err := agl.ValidateRuntimeConfig(r.Context(), ms, ownerID, rc); err != nil {
+		var ve *agl.ValidationError
+		if errors.As(err, &ve) {
+			writeBadRequest(w, err.Error())
+		} else {
+			writeServerError(w, err)
+		}
+		return false
+	}
+	return true
 }
 
 // HandleCreateAgent handles POST /v1/agents.
@@ -215,15 +345,96 @@ func (s *Server) HandleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeBadRequest(w, err.Error())
 		return
 	}
-	owner := ident.AccountID()
-	ctx := r.Context()
-	if u, err := s.store.GetUser(ctx, owner); err == nil && u != nil && u.AgentQuota >= 0 {
-		owned, err := s.store.ListAgentIDs(ctx, owner)
+	req.ExternalRef = strings.TrimSpace(req.ExternalRef)
+	if utf8.RuneCountInString(req.ExternalRef) > maxExternalRefLen {
+		writeBadRequest(w, fmt.Sprintf("external_ref exceeds %d characters", maxExternalRefLen))
+		return
+	}
+	req.User = strings.TrimSpace(req.User)
+	switch req.Owner {
+	case "":
+		if req.User != "" {
+			req.Owner = agentOwnerEndUser
+		} else {
+			req.Owner = agentOwnerAccount
+		}
+	case agentOwnerAccount, agentOwnerEndUser:
+	default:
+		writeBadRequest(w, `owner must be "account" or "end_user"`)
+		return
+	}
+	if req.User != "" {
+		if s.authResolver == nil || ident.AuthMethod != "apikey" {
+			writeBadRequest(w, "user requires api key authentication")
+			return
+		}
+		next, err := s.authResolver.SwitchToAppUser(r.Context(), ident, req.User)
 		if err != nil {
 			writeServerError(w, err)
 			return
 		}
-		if int64(len(owned)) >= u.AgentQuota {
+		ident = next
+		r = r.WithContext(auth.WithIdentity(r.Context(), ident))
+	}
+	owner := ident.AccountID()
+	if req.Owner == agentOwnerEndUser {
+		if ident.EndUser == "" || ident.AppUserID == "" {
+			writeBadRequest(w, `owner "end_user" requires an end-user: send user or X-Fastclaw-End-User`)
+			return
+		}
+		owner = ident.UserID
+	}
+	var runtimeCfg *agl.RuntimeConfig
+	switch strings.TrimSpace(req.Runtime) {
+	case "":
+		if req.RuntimeConfig != nil {
+			writeBadRequest(w, `runtimeConfig requires runtime "agl"`)
+			return
+		}
+	case agl.Runtime:
+		// An agl agent drives one person's computer: always private.
+		if req.Owner != agentOwnerEndUser {
+			writeBadRequest(w, `runtime "agl" requires owner "end_user"`)
+			return
+		}
+		rc, err := mergeRuntimeConfig(agl.RuntimeConfig{}, req.RuntimeConfig)
+		if err != nil {
+			writeBadRequest(w, err.Error())
+			return
+		}
+		if !s.validateAglRuntime(w, r, owner, &rc) {
+			return
+		}
+		runtimeCfg = &rc
+	default:
+		writeBadRequest(w, `runtime must be "agl" or omitted`)
+		return
+	}
+	ctx := r.Context()
+	existing := func() *store.AgentRecord {
+		if req.ExternalRef == "" {
+			return nil
+		}
+		rec, err := s.store.GetAgentByExternalRef(ctx, owner, req.ExternalRef)
+		if err != nil {
+			return nil
+		}
+		return rec
+	}
+	if rec := existing(); rec != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, rec, nil), "created": false})
+		return
+	}
+	// The account's quota covers its platform agents and every private
+	// agent of its end-users.
+	account := ident.AccountID()
+	if u, err := s.store.GetUser(ctx, account); err == nil && u != nil && u.AgentQuota >= 0 {
+		n, err := s.store.CountAccountAgents(ctx, account)
+		if err != nil {
+			writeServerError(w, err)
+			return
+		}
+		if n >= u.AgentQuota {
 			writeAPIError(w, http.StatusForbidden, errTypePermission, codeAgentQuotaExceeded,
 				fmt.Sprintf("agent quota reached (%d)", u.AgentQuota))
 			return
@@ -234,14 +445,25 @@ func (s *Server) HandleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, err)
 		return
 	}
-	rec := &store.AgentRecord{ID: id, UserID: owner, Name: req.Name, Config: map[string]interface{}{}}
+	rec := &store.AgentRecord{ID: id, UserID: owner, Name: req.Name, ExternalRef: req.ExternalRef, Config: map[string]interface{}{}}
 	if d := strings.TrimSpace(req.Description); d != "" {
 		rec.Config["description"] = d
 	}
 	if len(req.Metadata) > 0 {
 		rec.Config["metadata"] = metadataToConfig(req.Metadata)
 	}
-	if err := s.store.SaveAgent(ctx, rec); err != nil {
+	if runtimeCfg != nil {
+		rec.Config["runtime"] = agl.Runtime
+		rec.Config["runtimeConfig"] = runtimeCfg.Map()
+	}
+	if err := s.store.CreateAgent(ctx, rec); err != nil {
+		// A concurrent create with the same external_ref won the insert.
+		if errors.Is(err, store.ErrConflict) {
+			if prev := existing(); prev != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, prev, nil), "created": false})
+				return
+			}
+		}
 		writeServerError(w, err)
 		return
 	}
@@ -257,22 +479,27 @@ func (s *Server) HandleCreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Reload the app's space so consoles listing loaded agents see the
-	// new one. On-demand spaces reload only their pinned agents.
+	// Reload the owner's space (the account's, or the end-user's for a
+	// private agent) so it picks up the new agent.
 	s.invalidateUser(owner)
 	if fresh, err := s.store.GetAgent(ctx, id); err == nil && fresh != nil {
 		rec = fresh
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, rec)})
+	writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, rec, nil), "created": true})
 }
 
 // HandleListAgents handles GET /v1/agents.
 //
-// Lists the app's agents straight from the database — independent of
-// which agents happen to be loaded — newest first.
+// Lists agents straight from the database — independent of which agents
+// happen to be loaded — newest first.
 //
 // Query params:
 //
+//	owner       account | end_user | all. With an end-user the default is
+//	            all (platform agents + that end-user's private agents) and
+//	            end_user means only theirs. Without one the default is
+//	            account (platform agents, as before) and end_user lists
+//	            every private agent of the account's end-users.
 //	limit       page size (1–100). Omit to get every agent in one page
 //	            (the pre-pagination behavior).
 //	cursor      `next_cursor` from the previous page
@@ -294,14 +521,45 @@ func (s *Server) HandleListAgents(w http.ResponseWriter, r *http.Request) {
 		limit = min(n, maxAgentPageSize)
 	}
 	filter := metadataFilter(q)
-	recs, err := s.store.ListAgents(r.Context(), ident.AccountID())
-	if err != nil {
-		writeServerError(w, err)
+	ownerFilter := q.Get("owner")
+	if ownerFilter == "" {
+		ownerFilter = agentOwnerAccount
+		if ident.EndUser != "" {
+			ownerFilter = "all"
+		}
+	}
+	if ownerFilter != agentOwnerAccount && ownerFilter != agentOwnerEndUser && ownerFilter != "all" {
+		writeBadRequest(w, `owner must be "account", "end_user" or "all"`)
 		return
+	}
+	var recs []store.AgentRecord
+	if ownerFilter != agentOwnerEndUser {
+		platform, err := s.store.ListAgents(r.Context(), ident.AccountID())
+		if err != nil {
+			writeServerError(w, err)
+			return
+		}
+		recs = append(recs, platform...)
+	}
+	// Private agents: never for agent-scoped keys or non-key callers.
+	if ownerFilter != agentOwnerAccount && ident.AuthMethod == "apikey" && ident.APIKeyType != users.APIKeyTypeAgent {
+		var private []store.AgentRecord
+		var err error
+		if ident.EndUser != "" {
+			private, err = s.store.ListAgents(r.Context(), ident.UserID)
+		} else {
+			private, err = s.store.ListAccountPrivateAgents(r.Context(), ident.AccountID())
+		}
+		if err != nil {
+			writeServerError(w, err)
+			return
+		}
+		recs = append(recs, private...)
+		sort.SliceStable(recs, func(i, j int) bool { return recs[i].CreatedAt.After(recs[j].CreatedAt) })
 	}
 	matched := make([]store.AgentRecord, 0, len(recs))
 	for _, rec := range recs {
-		if !ident.CanAccessAgent(rec.ID) || !metadataMatches(agentMetadata(&rec), filter) {
+		if !s.agentAccessible(r, ident, &rec) || !metadataMatches(agentMetadata(&rec), filter) {
 			continue
 		}
 		matched = append(matched, rec)
@@ -326,8 +584,9 @@ func (s *Server) HandleListAgents(w http.ResponseWriter, r *http.Request) {
 		hasMore = true
 	}
 	out := make([]map[string]any, 0, len(matched))
+	endUsers := map[string]string{}
 	for i := range matched {
-		out = append(out, s.agentView(r, &matched[i]))
+		out = append(out, s.agentView(r, &matched[i], endUsers))
 	}
 	resp := map[string]any{"agents": out, "has_more": hasMore}
 	if hasMore {
@@ -346,7 +605,7 @@ func (s *Server) HandleGetAgent(w http.ResponseWriter, r *http.Request) {
 		writeAgentNotFound(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, rec)})
+	writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, rec, nil)})
 }
 
 // HandleUpdateAgent handles PATCH /v1/agents/{id}.
@@ -406,6 +665,51 @@ func (s *Server) HandleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			rec.Config["metadata"] = metadataToConfig(md)
 		}
 	}
+	if req.RuntimeConfig != nil {
+		if !agl.IsAglAgent(rec) {
+			writeBadRequest(w, `runtimeConfig requires runtime "agl"`)
+			return
+		}
+		rc, err := mergeRuntimeConfig(agl.RuntimeConfigOf(rec.Config), req.RuntimeConfig)
+		if err != nil {
+			writeBadRequest(w, err.Error())
+			return
+		}
+		if !s.validateAglRuntime(w, r, rec.UserID, &rc) {
+			return
+		}
+		rec.Config["runtimeConfig"] = rc.Map()
+	}
+	if req.EndUserVisibility != nil || req.EndUserOwner != nil || req.EndUserConnectors != nil {
+		// Set by the account for its own agents, never by an end user.
+		if ident.Role == users.RoleAppUser || rec.UserID != ident.UserID {
+			writeBadRequest(w, "endUserVisibility / endUserOwner / endUserConnectors are set by the account on its own agents, without an end user")
+			return
+		}
+		if req.EndUserConnectors != nil {
+			if *req.EndUserConnectors {
+				rec.Config[store.AgentCfgEndUserConnectors] = true
+			} else {
+				delete(rec.Config, store.AgentCfgEndUserConnectors)
+			}
+		}
+		if req.EndUserVisibility != nil {
+			v := strings.TrimSpace(*req.EndUserVisibility)
+			if v != "" && v != store.EndUserVisibilityPublic && v != store.EndUserVisibilityPrivate {
+				writeBadRequest(w, "endUserVisibility must be one of: public, private")
+				return
+			}
+			setConfigString(rec.Config, store.AgentCfgEndUserVisibility, v)
+		}
+		if req.EndUserOwner != nil {
+			v := strings.TrimSpace(*req.EndUserOwner)
+			if len(v) > 256 {
+				writeBadRequest(w, "endUserOwner is too long")
+				return
+			}
+			setConfigString(rec.Config, store.AgentCfgEndUserOwner, v)
+		}
+	}
 	ctx := r.Context()
 	if err := s.store.SaveAgent(ctx, rec); err != nil {
 		writeServerError(w, err)
@@ -433,7 +737,7 @@ func (s *Server) HandleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if fresh, err := s.store.GetAgent(ctx, rec.ID); err == nil && fresh != nil {
 		rec = fresh
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, rec)})
+	writeJSON(w, http.StatusOK, map[string]any{"agent": s.agentView(r, rec, nil)})
 }
 
 // HandleDeleteAgent handles DELETE /v1/agents/{id}. A missing agent is a
@@ -516,11 +820,12 @@ func (s *Server) requireAgentAPI(w http.ResponseWriter, r *http.Request) (auth.I
 	return ident, true
 }
 
-// agentView renders an agent for /v1 responses.
-func (s *Server) agentView(r *http.Request, rec *store.AgentRecord) map[string]any {
+// agentView renders an agent for /v1 responses. endUsers caches the
+// owner → end-user lookups across a list (nil for a single agent).
+func (s *Server) agentView(r *http.Request, rec *store.AgentRecord, endUsers map[string]string) map[string]any {
 	desc, _ := rec.Config["description"].(string)
 	md := agentMetadata(rec)
-	return map[string]any{
+	view := map[string]any{
 		"id":           rec.ID,
 		"display_name": rec.Name,
 		// name is the agent id, as /v1/agents has always returned it.
@@ -529,9 +834,33 @@ func (s *Server) agentView(r *http.Request, rec *store.AgentRecord) map[string]a
 		"description": desc,
 		"model":       s.agentModel(r, rec.ID),
 		"metadata":    md,
+		"owner":       agentOwnerAccount,
 		"created_at":  rec.CreatedAt.UTC().Format(time.RFC3339),
 		"updated_at":  rec.UpdatedAt.UTC().Format(time.RFC3339),
 	}
+	if rec.ExternalRef != "" {
+		view["external_ref"] = rec.ExternalRef
+	}
+	if agl.IsAglAgent(rec) {
+		view["runtime"] = agl.Runtime
+		view["runtimeConfig"] = agl.RuntimeConfigOf(rec.Config).Map()
+	}
+	ident, _ := auth.FromContext(r.Context())
+	if rec.UserID != ident.AccountID() {
+		view["owner"] = agentOwnerEndUser
+		if ident.EndUser != "" && rec.UserID == ident.UserID {
+			view["end_user"] = ident.EndUser
+		} else if eu, ok := endUsers[rec.UserID]; ok {
+			view["end_user"] = eu
+		} else {
+			eu := s.privateOwnerOf(r, ident.AccountID(), rec.UserID)
+			if endUsers != nil {
+				endUsers[rec.UserID] = eu
+			}
+			view["end_user"] = eu
+		}
+	}
+	return view
 }
 
 // agentModel returns the agent's own model override ("" = app default).
@@ -668,4 +997,13 @@ func newAgentID() (string, error) {
 		return "", err
 	}
 	return "agt_" + hex.EncodeToString(buf[:]), nil
+}
+
+// setConfigString sets key in cfg, or removes it when v is empty.
+func setConfigString(cfg map[string]interface{}, key, v string) {
+	if v == "" {
+		delete(cfg, key)
+		return
+	}
+	cfg[key] = v
 }

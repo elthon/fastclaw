@@ -83,9 +83,25 @@ other.
 
 ## 4. Scenario B — manage agents
 
-Agents created with the API belong to the key's FastClaw account. FastClaw
-does not record which of your users an agent is for — keep that mapping in
-your database (and mirror it into `metadata` if you want to filter by it).
+An agent belongs either to the key's FastClaw account or to one of your
+users:
+
+| | Platform agent | Private agent |
+|---|---|---|
+| Owner | The account | One end-user (your user id, see `user` in section 5) |
+| Create with | No end-user (or `"owner": "account"`) | `"user": "<your user id>"` in the body, or `"owner": "end_user"` with the `X-Fastclaw-End-User` header |
+| Who may chat | Every end-user of the account; each gets private history and memory | Its owner only |
+| Reached by requests naming end-user X | Yes | Only when X is the owner; any other end-user gets `404 agent_not_found` |
+| Talks to (agent-to-agent messages, groups) | The account's other platform agents | Only its owner's other private agents |
+
+Make an agent private when your user edits it themselves, it acts for them
+outside a chat (schedules, IM), or it must work with their other agents.
+Otherwise keep users on a platform agent: their data is already separate.
+FastClaw enforces who owns a private agent; you still decide which of your
+users may use which platform agent.
+
+The header alone never makes an agent private, so a backend that sends
+`X-Fastclaw-End-User` on every call keeps creating platform agents.
 
 ### Create — `POST /v1/agents`
 
@@ -111,12 +127,27 @@ curl -s "$FASTCLAW_BASE_URL/v1/agents" \
   characters, values ≤ 512. Stored and filterable, never used for
   authorization.
 - Show `display_name` to people. `name` equals `id` (kept for old clients).
+- `user` + `owner` choose the owner (table above). `owner` is `"account"` or
+  `"end_user"`; with `user` set it defaults to `"end_user"`.
+  `"owner": "end_user"` without an end-user is `400`.
+- `external_ref` (≤ 255 characters, unique per owner) makes create
+  idempotent: creating again with the same ref returns the existing agent,
+  unchanged, with `"created": false` — even when two requests race. Use it to
+  create a user's agent lazily on first use, e.g. `myapp:bot:<user id>`.
+- Every agent view carries `owner` (`"account"` | `"end_user"`), and
+  `end_user` (your user id) on private agents, plus `external_ref` when set.
 
 ### List — `GET /v1/agents`
 
 Newest first. Query: `limit` (1–100; omit for all), `cursor` (the previous
 page's `next_cursor`), `metadata[key]=value` filters (ANDed; also
-`metadata.key=value`).
+`metadata.key=value`), `owner`:
+
+- With an end-user (`X-Fastclaw-End-User`): the platform agents plus that
+  user's private agents by default; `owner=end_user` lists only theirs,
+  `owner=account` only the platform agents.
+- Without one: the platform agents by default; `owner=end_user` lists every
+  private agent of all your users, `owner=all` both.
 
 ```bash
 curl -s "$FASTCLAW_BASE_URL/v1/agents?limit=20&metadata%5Bapp_user%5D=user-123" \
@@ -131,6 +162,16 @@ Any of `name`, `description`, `instructions`, `model`, `metadata`; omitted
 fields are unchanged. `model: ""` clears the override. `metadata` merges; a key
 set to `null` or `""` is removed.
 
+Account callers (no end user) can also set who among their end users may
+reach one of their agents from another agent (`message_agent`, e.g. "ask 小微
+to tell me a joke" while chatting with another agent):
+`endUserVisibility: "public"` (every end user) or `"private"`, and
+`endUserOwner: "<the end user's X-Fastclaw-End-User value>"` (that end user,
+e.g. a draft only its creator may use). `""` clears either. Neither set: no
+end user reaches the agent that way, so mark your published agents `public`
+and each user's own agents with `endUserOwner`. An end user's own private
+agents are never reachable from the account's agents.
+
 ### Identity files — `PUT /v1/agents/{id}/system-files/{name}`
 
 Body `{"content": "..."}`. `name` is one of `SOUL.md`, `IDENTITY.md`,
@@ -142,8 +183,14 @@ Body `{"content": "..."}`. `name` is one of `SOUL.md`, `IDENTITY.md`,
 A second delete returns `404 agent_not_found`; treat it as "already deleted".
 Also remove your own mapping.
 
+Read, update, identity files and delete work on a private agent with the
+owner's `X-Fastclaw-End-User`, or with no end-user at all: the account's key
+manages every private agent (support, migrations). Another end-user gets
+`404 agent_not_found`.
+
 Agent keys may also read and update (PATCH, identity files) the agents granted
-to them; only user keys create and delete.
+to them; only user keys create and delete. Agent keys never reach private
+agents.
 
 ## 5. Chat (both scenarios) — `POST /v1/chat/completions`
 
@@ -164,7 +211,9 @@ curl -sN "$FASTCLAW_BASE_URL/v1/chat/completions" \
 - **`agent_id`** (or header `X-Fastclaw-Agent-ID`; the body wins) picks the
   agent and is strict: an agent the key may not use is `404 agent_not_found`
   — never a different agent. Omitted, FastClaw uses the key's only agent (or
-  the account's only agent).
+  the account's only agent). A private agent only chats with its owner as
+  `user`; without an end-user the call is `400 invalid_request`, with another
+  end-user `404 agent_not_found`.
 - **`X-Fastclaw-Session-Key`** selects the conversation history. Always send
   it, deterministic per conversation and prefixed with your app:
   `myapp:<conversation>[:<topic>]`. Omitted, every call starts a new session.
@@ -191,16 +240,23 @@ curl -sN "$FASTCLAW_BASE_URL/v1/chat/completions" \
 Streaming returns OpenAI SSE chunks
 (`data: {"choices":[{"delta":{"content":"..."}}]}` … `data: [DONE]`);
 non-streaming returns an OpenAI `chat.completion` (`choices[0].message.content`).
-The request's `model` field doesn't change the agent's model — the agent's
-configuration decides it.
+The request's `model` (`<provider>/<model>`) runs this turn on that model
+when the agent can reach its provider — a provider configured for the
+account or the agent. Anything else (a bare name such as `gpt-4o`, which
+OpenAI SDKs require, or an unknown provider) is ignored and the agent's own
+model answers. The response's `model` names the model that actually ran.
+To change an agent's model for every turn, `PATCH` it instead.
 
 A stream follows the turn as it runs: the agent's text arrives while it is
 written, including what it says between steps, and each tool call is
 reported on a chunk with an empty delta, once when it starts and once when
 it finishes:
-`data: {"choices":[{"delta":{}}],"tool":{"id":"call_1","name":"exec","status":"running"}}`
+`data: {"choices":[{"delta":{}}],"tool":{"id":"call_1","name":"exec","status":"running","arguments":"{\"command\":\"ls\"}"}}`
 (`status` then `done`). `name` is the agent's tool (`exec`, `load_skill`,
 `read_file`, …), so show it as a progress step in your own words. The
+`running` step carries the call's `arguments` (a JSON string) and the
+`done` step its `result` (text), each cut to 4 KB with `"truncated": true`
+when cut; show them only on request, as the agent's raw work. The
 streamed text adds up to the non-streaming reply; separate messages in a
 reply are joined by a blank line.
 
@@ -217,8 +273,15 @@ model call the agent made for this turn, tool loops included:
 `prompt_tokens` / `completion_tokens` / `total_tokens` as in OpenAI
 (`prompt_tokens` includes cached input, also in
 `prompt_tokens_details.cached_tokens`), plus `input_tokens` (uncached),
-`cache_read_tokens`, `cache_creation_tokens` and `model_calls`. Use it to
-attribute cost to your users per turn.
+`cache_read_tokens`, `cache_creation_tokens` and `model_calls`, and
+`cost_usd`: what the turn cost in USD, each model call priced at the unit
+price of the model it actually ran on (a turn can call several — a
+per-request `model`, context compaction, sub-agents). `cost_usd` is always
+present; it is `null` when any call's model has no price set — treat that
+as unknown, never as 0. FastClaw reports cost only: what you charge your
+users (credits, markup, plans) is up to you. Background work that finishes
+after the reply (memory extraction, skill learning) isn't in the turn's
+`usage`; it shows up as its own usage events.
 
 API conversations are never trusted with the FastClaw host: the agent's
 tools (shell, scripts) run in FastClaw's sandbox. If the FastClaw operator
@@ -256,6 +319,60 @@ on the final chunk, the one with `finish_reason`). Files the reply links as
 - Don't rely on the agent to put files anywhere else: FastClaw instructs it
   not to upload your users' files to third-party services.
 
+### Local agents (the end user's own computer)
+
+When your end user linked a computer (agl; `/v1/machines`), the agent can
+hand work to the coding agents on it (Codex, Claude Code, …). Opt in per
+turn: send `"local_agents": true` with `"stream": true`, as the end user
+(`X-Fastclaw-End-User`) and with an explicit `x-fastclaw-session-key`.
+Updates arrive as chunks with an empty delta and a top-level
+`local_agent` object:
+
+- `{"kind":"progress","agent","machine","text"}` — what it's doing (show it);
+- `{"kind":"approval","agent","machine","text":"<what it asks to do>"}` —
+  ask your user, then answer with `POST /v1/local-agents/approval`
+  `{"agent_id","session_key","decision":"allow"|"allow_session"|"deny"}`
+  (same end user header; `GET …/approval?agent_id=&session_key=` shows the
+  open request). Unanswered requests are denied after a timeout;
+- `{"kind":"approval_resolved","decision"}` and `{"kind":"done"}`.
+
+The turn's stream stays open while it waits for the decision.
+
+### Connectors (the end user's own third-party accounts)
+
+When the server has connectors configured (Notion, GitHub, …), your end
+user can connect their own accounts and use them **on the agents marked
+as theirs** (`endUserOwner`), never on your public agents. Every call is
+as the end user (`X-Fastclaw-End-User`); the accounts are theirs alone.
+
+- `GET /api/connectors?lang=zh-CN` — platforms; `GET /api/connector-accounts`
+  — their accounts; `DELETE /api/connector-accounts/{id}` — disconnect.
+- Connect: `POST /api/connector-authorizations`
+  `{"connector":"notion","returnUrl":"https://your.app/connections"}` (or
+  `{"reconnectId":…}` / `{"accessId":…}`) → `{url, request}`. Open `url` in
+  the browser at once (one use, 15 minutes; never log it). The person comes
+  back to `returnUrl` with `connany_session_id`: post it to
+  `POST /api/connector-requests/confirm` `{"providerSessionId":…}`, or poll
+  `POST /api/connector-requests/{request.id}/recheck`.
+- In chat, send `"params": {"__fastclawConnectorsURL": "https://your.app/connections",
+  "__fastclawConnectorsReturnURL": "https://your.app/connections/done"}` on
+  `/v1/chat/completions`: when an account is missing, the agent sends the
+  person a one-time authorization link (the platform's own page) in the chat
+  instead of a connect button. Afterwards the platform sends them to the
+  return URL (default: the connections page), which should work without
+  signing in, since they open it in their IM's browser; confirm there when
+  they happen to be signed in. The account is usable on their next message
+  either way. If a link can't be minted, the agent sends the connections page
+  with `?connector=<name>`.
+- Changes (create, edit, clear, delete on the platform) are offered only in
+  a turn that can ask your user: `"local_agents": true` with `"stream": true`
+  and an explicit `x-fastclaw-session-key`, as above. Each write arrives as a
+  `local_agent` chunk `{"kind":"approval","agent":"Notion","text":"<platform,
+  account, tool and input>"}` and is answered exactly like a local agent's
+  (`POST /v1/local-agents/approval`); it runs only on `allow` /
+  `allow_session` (the latter: that tool on that account, for the rest of the
+  session). Without such a turn the agent gets read-only tools.
+
 ## 6. Usage and quotas
 
 - `GET /v1/usage` — per-day token usage. Query: `days` (1–90, default 30),
@@ -265,6 +382,32 @@ on the final chunk, the one with `finish_reason`). Files the reply links as
 - `PUT|GET|DELETE /v1/quota` — monthly token / request limits for an end-user
   (`user_id` from `POST /v1/users` with `{"external_id": "<your user id>"}`).
 
+### Metering and billing authorization (when your app charges per use)
+
+FastClaw meters, your app prices. Full contract: `docs/usage-metering.md` in
+the FastClaw repo. In short:
+
+- `GET /v1/usage/events?after=<id>&limit=<n>` (account API key) — every
+  billable thing your account and its end users caused, oldest first: `kind`
+  `llm` (tokens), `image`, `tts`, `search`, `fetch`, `sandbox`, `local_agent`
+  (`units` + `unit`), with `end_user`, `agent_id`, `session_key`, `channel`
+  and `turn_id`. Store `next_after` as your cursor in the same transaction as
+  the debits it caused. Events appear a few seconds after the work.
+- The final chunk of a streamed chat (and a non-streamed response) carries
+  `turn_id`, so you can link a reply to its events.
+- `PUT /v1/billing/hook` `{"url": "https://…", "secret": "<≥ 32 chars>"}`
+  (`{"url": ""}` removes it; `GET` returns `{"url", "secret_set"}`). FastClaw
+  then POSTs `{"id","stage":"turn"|"tool","kind","provider","model",
+  "estimate"?,"end_user","agent_id","session_key","channel","turn_id"}` with
+  `X-Fastclaw-Signature: t=<unix>,v1=<hex hmac-sha256(secret, t + "." + body)>`
+  before every agent turn and before `image_gen`, `tts` and sandbox commands.
+  Answer `200 {"allow": true}` or `{"allow": false, "message": "…"}` within
+  5 s. Verify the signature and reject an old `t`. A refused `/v1` turn is a
+  `402 payment_required` carrying your message; on other channels your
+  message is the reply; a refused tool returns it to the model. If the hook
+  is unreachable, FastClaw allows the work (unless the deployment sets
+  `FASTCLAW_BILLING_HOOK_FAIL_CLOSED=true`).
+
 ## 7. Errors
 
 Every `/v1` error is `{"error": {"type", "code", "message"}}`. Branch on
@@ -272,12 +415,12 @@ Every `/v1` error is `{"error": {"type", "code", "message"}}`. Branch on
 
 | Status | `code` | Meaning |
 |---|---|---|
-| 400 | `invalid_request` | Bad body, missing messages, metadata over limits, bad cursor. |
+| 400 | `invalid_request` | Bad body, missing messages, metadata over limits, bad cursor, a private agent chatted with without its owner as `user`. |
 | 401 | `unauthorized` | Missing or invalid API key. |
 | 403 | `forbidden` | The key may not do this (e.g. an agent key creating agents). |
 | 403 | `agent_quota_exceeded` | The account reached its agent quota. |
-| 404 | `agent_not_found` | No such agent for this key. |
-| 402 | `payment_required` | The FastClaw account is on billing hold (its balance ran out). Tell your user the service is paused; retrying won't help until it's topped up. |
+| 404 | `agent_not_found` | No such agent for this key — or another end-user's private agent. |
+| 402 | `payment_required` | The FastClaw account is on billing hold (its balance ran out), or your billing hook refused the turn (`message` is the hook's). Tell your user the service is paused; retrying won't help until it's topped up. |
 | 404 | `project_not_found` | Unknown `project_id`. |
 | 429 | `rate_limited` | Slow down and retry with backoff. |
 | 503 | `not_configured` | That feature isn't enabled on this FastClaw. |
@@ -292,6 +435,8 @@ Every `/v1` error is `{"error": {"type", "code", "message"}}`. Branch on
 - [ ] The app checks the user's access to an agent before every call.
 - [ ] Deterministic `X-Fastclaw-Session-Key` per conversation; `user` set when
       a user's history must stay private.
+- [ ] Per-user agents created as private agents (`user` on create) with an
+      `external_ref`, and chatted with as their owner.
 - [ ] Streaming parsed as SSE; errors handled by `error.code`.
 - [ ] Produced files taken from `files` (download `url` or `return_files: "inline"`).
 - [ ] No FastClaw key or URL in client-side code.

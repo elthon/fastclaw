@@ -88,6 +88,12 @@ type InboundMessage struct {
 	// agent-loop side to decide whether the turn should fire downstream
 	// reactions that are only valid for genuine user input.
 	Source string
+	// ChatReply marks an API turn whose caller shows the reply in a chat
+	// app (POST /v1/chat/completions with reply_format "chat"): the turn
+	// gets the same reply-format hint as an IM channel, and the reply
+	// keeps SplitMessageMarker between its messages for the caller to
+	// send as separate bubbles.
+	ChatReply bool
 	// SharedIdentity is set by the gateway when the channel has
 	// shared_identity enabled. The agent loop uses this to resolve
 	// sessions by owner identity instead of by channel triple, so
@@ -100,6 +106,12 @@ type InboundMessage struct {
 	// it with "the channel's binder owns this agent" to decide whether
 	// the turn may touch the host.
 	FromChannelOwner bool
+	// MachineUserID is set by the gateway on a 1:1 IM turn from the
+	// person the channel belongs to: the Fastclaw user whose own linked
+	// computers (agl machines) this turn's LLM agent may dispatch work to
+	// with run_local_agent. Empty everywhere else (groups, shared
+	// sessions, web, cron, other senders). See docs/agl-machines.md.
+	MachineUserID string
 }
 
 // SessionTriple returns the (channel, accountID, chatID) used for session

@@ -21,9 +21,11 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/drain"
 	"github.com/fastclaw-ai/fastclaw/internal/push"
 	"github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/session"
+	"github.com/fastclaw-ai/fastclaw/internal/share"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/taskqueue"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
@@ -245,7 +247,18 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /livez", healthz)
-	mux.HandleFunc("GET /readyz", healthz)
+	// Share links (internal/share): public, unguessable, expiring.
+	mux.HandleFunc("GET /f/{token}/{name}", share.ServeDefault)
+	// Not ready while draining: the load balancer stops routing new
+	// requests here; turns already running finish.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if drain.Draining() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("draining"))
+			return
+		}
+		healthz(w, r)
+	})
 
 	auth := s.authMiddleware
 	opt := s.optionalAuth
@@ -285,6 +298,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/chat", auth(s.handleChat))
 	mux.HandleFunc("POST /api/chat/stream", auth(s.handleChatStream))
 	mux.HandleFunc("POST /api/chat/stop", auth(s.handleChatStop))
+	mux.HandleFunc("GET /api/chat/local-agent-approval", auth(s.handleLocalAgentApproval))
+	mux.HandleFunc("POST /api/chat/local-agent-approval", auth(s.handleLocalAgentDecision))
 	mux.HandleFunc("POST /api/chat/team/stream", auth(s.handleTeamChatStream))
 	mux.HandleFunc("POST /api/chat/team/run", auth(s.handleTeamChatRun))
 	mux.HandleFunc("GET /api/chat/team/topics", auth(s.handleTeamTopics))
@@ -307,6 +322,11 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /api/chat/subscribe", auth(s.handleChatSubscribe))
 	// The caller's own connected third-party accounts (handlers_connectors.go).
 	s.registerConnectorRoutes(mux, auth)
+	s.registerMyToolsRoutes(mux, auth)
+	s.registerMCPServerRoutes(mux, auth)
+	mux.HandleFunc("GET /api/my-models", auth(s.handleUserModels))
+	mux.HandleFunc("PUT /api/my-models", auth(s.handleUserModels))
+	mux.HandleFunc("POST /api/my-models/test", auth(s.handleTestUserModel))
 
 	// Agents
 	mux.HandleFunc("GET /api/agents", auth(s.handleListAgents))
@@ -423,6 +443,11 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("DELETE /api/skills/{name}", auth(s.handleDeleteSkill))
 	mux.HandleFunc("GET /api/agents/{id}/skills", auth(s.handleListAgentSkills))
 	mux.HandleFunc("DELETE /api/agents/{id}/skills/{name}", auth(s.handleDeleteAgentSkill))
+	// Creator skills: an agent's skills uploaded for its chatters, with
+	// their own keys (handlers_creator_skills.go).
+	mux.HandleFunc("POST /api/agents/{id}/skills/upload", auth(s.handleUploadCreatorSkill))
+	mux.HandleFunc("GET /api/agents/{id}/skills/{name}/env", auth(s.handleGetCreatorSkillEnv))
+	mux.HandleFunc("PUT /api/agents/{id}/skills/{name}/env", auth(s.handlePutCreatorSkillEnv))
 
 	// Plugins (super_admin only).
 	mux.HandleFunc("GET /api/plugins", admin(s.handleListPlugins))
@@ -637,8 +662,9 @@ func legacyConsoleRedirect(path string, query url.Values) (string, bool) {
 	switch {
 	case trimmed == "overview":
 		target = "/console/"
-	case trimmed == "tools" || trimmed == "console/tools":
+	case trimmed == "tools":
 		// Deployment-wide tool config lives in the super_admin's /admin.
+		// (/console/tools is the user's own Tools page now.)
 		target = "/admin/tools/"
 	case len(parts) == 1 && consoleTopLevel[trimmed]:
 		target = "/console/" + trimmed + "/"

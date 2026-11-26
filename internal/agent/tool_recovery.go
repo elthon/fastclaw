@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
 )
@@ -90,10 +93,11 @@ func scrubLeakedToolCallContent(content string) string {
 //	  <parameter name="timeout" string="false">15</parameter>
 //	</invoke>
 //
-// Returned tool calls have synthetic IDs (`recovered_…`) so the
-// downstream tool_result message can be paired with the original
-// assistant message — IDs the model itself proposed would collide with
-// real OpenAI-style IDs from later turns.
+// Returned tool calls have synthetic IDs (`recovered_<random>_<n>`) so
+// the downstream tool_result message can be paired with the original
+// assistant message. They are unique per recovery: IDs the model itself
+// proposed would collide with real OpenAI-style IDs from later turns,
+// and a fixed `recovered_0` repeated across rounds of one session.
 //
 // The second return is the original content with every matched invoke
 // (and any optional <tool_calls>/<function_calls>/<DSML> wrapper) block
@@ -131,6 +135,7 @@ func recoverToolCallsFromContent(content string) ([]provider.ToolCall, string) {
 		return nil, scrubbed
 	}
 	calls := make([]provider.ToolCall, 0, len(matches))
+	batch := recoveredBatchID()
 	for i, m := range matches {
 		// m: [whole-lo, whole-hi, name-lo, name-hi, body-lo, body-hi]
 		name := normalized[m[2]:m[3]]
@@ -145,7 +150,7 @@ func recoverToolCallsFromContent(content string) ([]provider.ToolCall, string) {
 			continue
 		}
 		calls = append(calls, provider.ToolCall{
-			ID:   fmt.Sprintf("recovered_%d", i),
+			ID:   fmt.Sprintf("recovered_%s_%d", batch, i),
 			Type: "function",
 			Function: provider.FunctionCall{
 				Name:      name,
@@ -167,6 +172,14 @@ func recoverToolCallsFromContent(content string) ([]provider.ToolCall, string) {
 	stripped := stripRE.ReplaceAllString(normalized, "")
 	stripped = strings.TrimSpace(stripped)
 	return calls, stripped
+}
+
+// recoveredBatchID is a short random tag that keeps recovered tool-call
+// IDs unique across rounds of one session.
+func recoveredBatchID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // invokeRE pulls one <invoke name="..."> ... </invoke> block at a time.
@@ -265,4 +278,72 @@ func parseInvokeParameters(body string) map[string]any {
 		out[name] = raw
 	}
 	return out
+}
+
+// markupStartRE finds where tool-call markup begins in streamed text:
+// leaked special tokens (`<｜`, `< |`) or a bare XML call wrapper.
+var markupStartRE = regexp.MustCompile(`<\s*(?:[|｜]|DSML|invoke\s+name=|function_calls|tool_calls)`)
+
+// markupWords are what a held-back `<…` tail may still turn into.
+var markupWords = []string{"DSML", "invoke name=", "function_calls", "tool_calls"}
+
+// deltaGate keeps tool-call markup out of the live text stream. Some
+// models (DeepSeek-style) write their calls as text; maybeRecoverToolCalls
+// turns them back into calls, but only once the response is complete, and
+// streamed deltas can't be taken back: a product relaying them into a chat
+// would show the markup. From the first sign of markup on, the rest of the
+// round is withheld; the cleaned text, if any, arrives in the round's
+// final content.
+type deltaGate struct {
+	pending string
+	blocked bool
+}
+
+// Push takes a delta and returns the text safe to send now.
+func (g *deltaGate) Push(s string) string {
+	if g.blocked {
+		return ""
+	}
+	buf := g.pending + s
+	g.pending = ""
+	if loc := markupStartRE.FindStringIndex(buf); loc != nil {
+		g.blocked = true
+		return buf[:loc[0]]
+	}
+	if i := strings.LastIndex(buf, "<"); i >= 0 && mayBecomeMarkup(buf[i:]) {
+		g.pending = buf[i:]
+		return buf[:i]
+	}
+	return buf
+}
+
+// Flush returns what is still held when the stream ends cleanly.
+func (g *deltaGate) Flush() string {
+	if g.blocked {
+		return ""
+	}
+	out := g.pending
+	g.pending = ""
+	return out
+}
+
+// Blocked reports whether markup was seen (and the rest withheld).
+func (g *deltaGate) Blocked() bool { return g.blocked }
+
+// mayBecomeMarkup: tail starts with "<" and later deltas could still
+// complete it into markup.
+func mayBecomeMarkup(tail string) bool {
+	if len(tail) > 32 || strings.ContainsAny(tail[1:], "<>") {
+		return false
+	}
+	rest := strings.TrimLeft(tail[1:], " \t\r\n")
+	if rest == "" || !utf8.ValidString(rest) {
+		return true // a split multi-byte rune (｜) may be on its way
+	}
+	for _, w := range markupWords {
+		if strings.HasPrefix(w, rest) {
+			return true
+		}
+	}
+	return false
 }

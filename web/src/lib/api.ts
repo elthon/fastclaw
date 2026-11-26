@@ -145,6 +145,8 @@ export interface SkillInfo {
   location: string;
   type: string;
   envSpec?: SkillEnvSpec[];
+  /** scope "user" lists: the layer it comes from (mine, product, system). */
+  source?: "mine" | "product" | "system";
 }
 
 export interface SkillEntryCfg {
@@ -237,6 +239,8 @@ export interface ConfigResponse {
   storage: { type: string; dsn?: string };
   sandbox?: {
     enabled: boolean;
+    // Self-hosted: make the sandbox a hard boundary (every exec inside it).
+    enforce?: boolean;
     backend?: string;
     // Legacy single-slot image field; read-only fallback. The per-
     // backend fields below are authoritative when set so switching
@@ -247,7 +251,6 @@ export interface ConfigResponse {
     boxliteSnapshot?: string;
     e2bKey?: string;
     boxliteUrl?: string;
-    boxliteClientId?: string;
     boxliteKey?: string;
     boxlitePrefix?: string;
   };
@@ -421,7 +424,6 @@ export interface OnboardRequest {
   sandboxImage?: string;
   sandboxE2BKey?: string;
   sandboxBoxliteUrl?: string;
-  sandboxBoxliteClientId?: string;
   sandboxBoxliteKey?: string;
   sandboxBoxlitePrefix?: string;
 }
@@ -1221,6 +1223,7 @@ export interface ChatStreamEvent {
     | "error"
     | "done"
     | "subagent_progress"
+    | "local_agent"
     | "status";
   // Per-session monotonic sequence assigned by chat_events. Lets the
   // chat page dedupe events arriving on both the active POST stream
@@ -1253,6 +1256,13 @@ export interface ChatStreamEvent {
     // failed and the backend is retrying it.
     attempt?: number;
     maxAttempts?: number;
+    // local_agent payload: run_local_agent on the person's computer.
+    kind?: "progress" | "approval" | "approval_resolved" | "done";
+    agent?: string;
+    machine?: string;
+    text?: string;
+    decision?: string;
+    error?: string;
   };
 }
 
@@ -1707,8 +1717,9 @@ export async function deleteAgent(id: string) {
 }
 
 // Skills
-// getSkills lists the global skills, or with scope "user" the caller's
-// own skills (loaded in all their conversations).
+// getSkills lists the global skills, or with scope "user" the skills the
+// caller's conversations use: their own (source "mine"), then the
+// product's and the global ones, one per name.
 export async function getSkills(scope?: "user"): Promise<SkillInfo[]> {
   const res = await apiFetch(scope === "user" ? "/api/skills?scope=user" : "/api/skills");
   return res.json();
@@ -1853,6 +1864,36 @@ export async function saveTools(payload: {
   tools: Record<string, ToolCategorySettings>;
 }): Promise<{ ok: boolean; error?: string }> {
   const res = await apiFetch("/api/tools", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return res.json();
+}
+
+/** Console → Tools: the caller's own tool layer. Keys are never returned
+ *  (apiKeySet says one is saved); `inherited` is what the deployment
+ *  provides per category (its chain only). */
+export interface MyToolsConfig {
+  categories: ToolCategoryCatalog[];
+  toolProviders: Record<string, { apiKeySet: boolean; endpoint?: string; options?: Record<string, string> }>;
+  tools: Record<string, ToolCategorySettings>;
+  inherited: Record<string, { chain: string[] }>;
+}
+
+export async function getMyTools(): Promise<MyToolsConfig> {
+  const res = await apiFetch("/api/my-tools");
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+/** Replaces the caller's own layer. A category left out of `tools` uses
+ *  the deployment's again; an empty apiKey keeps the saved one. */
+export async function saveMyTools(payload: {
+  toolProviders: Record<string, ToolProviderSettings>;
+  tools: Record<string, ToolCategorySettings>;
+}): Promise<{ ok: boolean; error?: string }> {
+  const res = await apiFetch("/api/my-tools", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -2600,6 +2641,9 @@ export interface ConnectorInfo {
 
 export interface ConnectorCatalog {
   configured: boolean;
+  /** Which Connany holds the caller's accounts: their own key, the
+   *  deployment's, or none. */
+  source?: "" | "user" | "system";
   categories: { name: string; title: string }[];
   connectors: ConnectorInfo[];
 }
@@ -2718,4 +2762,180 @@ export function saveConnectorsConfig(url: string, apiKey: string) {
 
 export function clearConnectorsConfig() {
   return connectorJSON<ConnectorsConfig>("/api/admin/connectors-config", jsonInit("DELETE"));
+}
+
+/** Console → Tools → Connectors: the caller's own Connany project key,
+ *  used for their accounts before the deployment's. The key never comes
+ *  back — only whether one is set and its last characters. */
+export interface MyConnectorsConfig {
+  source: "" | "user" | "system";
+  systemAvailable: boolean;
+  url: string;
+  apiKeySet: boolean;
+  apiKeyHint: string;
+}
+
+export function getMyConnectorsConfig() {
+  return connectorJSON<MyConnectorsConfig>("/api/connectors-config");
+}
+
+/** Validates against Connany (public https only), saves and uses it at
+ *  once. An empty apiKey keeps the one already set. */
+export function saveMyConnectorsConfig(url: string, apiKey: string) {
+  return connectorJSON<MyConnectorsConfig>("/api/connectors-config", jsonInit("PUT", { url, apiKey }));
+}
+
+/** Back to the deployment's connector service. */
+export function clearMyConnectorsConfig() {
+  return connectorJSON<MyConnectorsConfig>("/api/connectors-config", jsonInit("DELETE"));
+}
+
+// ── Devices: the person's own computers linked through agl ────────────
+// (internal/api/machines.go). Agents hand work to the coding agents on
+// them (Claude Code, Codex, …) with run_local_agent.
+
+export interface MachineAgent {
+  id: string;
+  name: string;
+  available: boolean;
+  // ready | desktop-only | not-found (as agl reports it)
+  status: string;
+  path: string;
+  version: string;
+  features: string[];
+  installCommand: string;
+  guide: string;
+  // The owner's choices: whether agents may use it, and the model /
+  // reasoning effort its sessions start with ("" = its own default).
+  enabled: boolean;
+  model: string;
+  effort: string;
+}
+
+export interface MachineAgentModel {
+  id: string;
+  name?: string;
+  description?: string;
+  default?: boolean;
+  efforts?: string[];
+}
+
+export type MachineAccess = "read_only" | "ask" | "edit" | "full";
+
+export interface Machine {
+  id: string;
+  name: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  version: string;
+  online: boolean;
+  lastSeenAt: string | null;
+  createdAt: string | null;
+  agents: MachineAgent[];
+  // agl updates: the newest release ("" while unknown), whether this
+  // computer is behind it, and whether its agl takes a one-click update
+  // (agl ≥ 0.3.5; older ones need `agl update` on the computer).
+  latestVersion: string;
+  updateAvailable: boolean;
+  remoteUpdate: boolean;
+  allowAgents: boolean;
+  defaultAccess: MachineAccess;
+  defaultCwd: string;
+}
+
+export interface MachinePairing {
+  code: string;
+  installCommand: string;
+  expiresAt: string;
+}
+
+async function machineJSON<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await apiFetch(path, init);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((body as { error?: string }).error || `HTTP ${res.status}`);
+  return body as T;
+}
+
+const machineInit = (method: string, body?: unknown): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
+
+export async function listMachines(): Promise<Machine[]> {
+  return (await machineJSON<{ machines: Machine[] }>("/v1/machines")).machines;
+}
+
+export function createMachinePairing(): Promise<MachinePairing> {
+  return machineJSON<MachinePairing>("/v1/machines/pairing", machineInit("POST", {}));
+}
+
+export function getMachinePairingStatus(code: string) {
+  return machineJSON<{ status: "pending" | "connected" | "expired"; machineId?: string }>(
+    "/v1/machines/pairing/status",
+    machineInit("POST", { code }),
+  );
+}
+
+export interface MachinePatch {
+  name?: string;
+  allowAgents?: boolean;
+  defaultAccess?: MachineAccess;
+  defaultCwd?: string;
+  agents?: Record<string, { enabled?: boolean; model?: string; effort?: string }>;
+}
+
+export function updateMachine(id: string, patch: MachinePatch) {
+  return machineJSON<Machine>(`/v1/machines/${encodeURIComponent(id)}`, machineInit("PATCH", patch));
+}
+
+export function deleteMachine(id: string) {
+  return machineJSON<{ ok: boolean }>(`/v1/machines/${encodeURIComponent(id)}`, machineInit("DELETE"));
+}
+
+// Update the computer's agl to the newest release. Never ends a running
+// task: {updated:false, busy} while one runs.
+export function updateMachineAgl(id: string) {
+  return machineJSON<{ updated: boolean; current: string; latest: string; busy?: number }>(
+    `/v1/machines/${encodeURIComponent(id)}/update`,
+    machineInit("POST", {}),
+  );
+}
+
+// Re-detect the computer's local agents now.
+export function refreshMachineAgents(id: string) {
+  return machineJSON<Machine>(`/v1/machines/${encodeURIComponent(id)}/agents/refresh`, machineInit("POST", {}));
+}
+
+export async function getMachineAgentModels(id: string, agent: string): Promise<MachineAgentModel[]> {
+  const r = await machineJSON<{ models: MachineAgentModel[] }>(
+    `/v1/machines/${encodeURIComponent(id)}/agents/${encodeURIComponent(agent)}/models`,
+  );
+  return r.models;
+}
+
+// Runs the agent read-only with a one-line prompt (uses a little of its quota).
+export function testMachineAgent(id: string, agent: string, opts: { model?: string; effort?: string }) {
+  return machineJSON<{ durationMs: number; reply: string; model?: string }>(
+    `/v1/machines/${encodeURIComponent(id)}/agents/${encodeURIComponent(agent)}/test`,
+    machineInit("POST", opts),
+  );
+}
+
+// A web chat's run_local_agent waiting for the person's approval.
+export interface LocalAgentApproval {
+  pending: boolean;
+  agent?: string;
+  machine?: string;
+  title?: string;
+}
+
+export function getLocalAgentApproval(agentId: string, sessionId: string) {
+  const q = new URLSearchParams({ agentId, sessionId });
+  return machineJSON<LocalAgentApproval>(`/api/chat/local-agent-approval?${q}`);
+}
+
+export function decideLocalAgentApproval(agentId: string, sessionId: string, decision: "allow" | "allow_session" | "deny") {
+  return machineJSON<{ ok: boolean }>("/api/chat/local-agent-approval", machineInit("POST", { agentId, sessionId, decision }));
 }
